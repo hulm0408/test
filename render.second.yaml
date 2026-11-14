@@ -39,4 +39,4 @@ services:
       - key: VAULT_ENCRYPTION_KEY
         sync: false
       - key: GITHUB_VAULT_BRANCH
-        value: bot-vault-2
+        value: bot-vault-bot2 # INSTANCE_LABEL=bot2 se derive hota hai (same convention har jagah)

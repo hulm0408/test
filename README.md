@@ -438,9 +438,73 @@ Chhota summary:
   label khali rakhne se UI bilkul pehle jaisi rehti hai.
 - **Har instance ka apna token aur apna Telegram account** — ek token/ek
   session do jagah = 409 Conflict / session revoke.
-- Cloud vault ka branch alag: `GITHUB_VAULT_BRANCH=bot-vault-2`.
+- Cloud vault ka branch alag: `GITHUB_VAULT_BRANCH=bot-vault-bot2` (khali
+  chhodne par bot khud `INSTANCE_LABEL` se derive kar leta hai).
 - **Vercel par ye bot nahi chalega** (long polling, Chrome, disk) — Render
   ke 750 free hours account-wise hote hain, isliye doosra Render account.
+
+## 💾 Linked database — "data bahut loss ho raha" ka asli fix
+
+Bot ka DB ek JSON file hai: `data/db.json`. Ye file Render ke **free** disk
+par **ephemeral** hai, aur GitHub Actions runner par har run me **fresh**.
+Matlab: har restart/redeploy par saved accounts, bot settings, number-ledger
+(7-day cooldown) aur Firebase source list — sab chala jate hain.
+
+Isi liye DB ko ek **durable linked database** se bind karna zaroori hai.
+Bot ab 3 me se koi ek driver use karta hai (priority order):
+
+| Driver | Env | Kahan se milega |
+|---|---|---|
+| **KV** (recommended) | `KV_REST_URL` + `KV_REST_TOKEN` | Vercel → Storage → KV (ya Upstash) |
+| **http** | `DB_STORE_URL` (+ `DB_STORE_TOKEN`) | koi bhi JSON document endpoint |
+| **vault** | `GITHUB_VAULT_TOKEN` + `VAULT_ENCRYPTION_KEY` | GitHub repo (koi extra service nahi) |
+
+```env
+# GitHub vault (sabse aasaan — koi naya account banane ki zaroorat nahi)
+GITHUB_VAULT_TOKEN=<classic PAT — "repo" scope>
+VAULT_ENCRYPTION_KEY=<32+ chars ka random string>   # SAME value har instance me
+```
+
+### Isse kya badla (aur data kyun nahi jayega)
+
+* **Push hamesha remote ke saath MERGE hota hai** — pehle push sirf
+  number-ledger merge karta tha, baaki sab overwrite. Iska matlab: ek
+  fresh/empty db (naya deploy, disk nahi) jo pehli baar push karta tha →
+  **remote ka poora DB wipe**. Ab remote ka account/ledger/order kabhi
+  delete nahi hota. (`db-payload.js` — merge rules.)
+* **Har instance ka apna branch** — `INSTANCE_LABEL=bot2` → `bot-vault-bot2`.
+  Pehle sab ka default `bot-vault` tha, matlab bot2 ka push MAIN ke accounts
+  wipe kar deta tha.
+* **Hydrate timeout par khaali db par aage nahi** — pehle 12s me remote na
+  aaya to bot khaali db par chalta tha aur pehli push se wipe ho jata tha.
+* **Push fail = data loss nahi** — snapshot `data/db-outbox.json` me bachta
+  hai aur har 60s retry hota hai.
+* **409/422 (concurrent push) par dobara merge karke retry** — pehle update
+  chup-chaap drop ho jata tha.
+* **Encryption fail-closed** — `VAULT_ENCRYPTION_KEY` ke bina accounts
+  (cookies/tokens) plaintext me kabhi nahi likhe jaate.
+
+### Check karo ki link kaam kar raha hai
+
+```bash
+npm run doctor                # report: local DB + linked DB + verdict
+npm run doctor -- --verify    # + live write/read-back probe
+npm run doctor -- --push      # + apna local db remote me push (merge ke saath)
+```
+
+Bot ke andar bhi same status dikhta hai — **`/diag` → `💾 Database`**:
+
+```
+💾 Database: ✅ vault · github bot-vault · last push 12s pehle
+```
+
+Agar `⚠️ LINKED NAHI` dikhe to data abhi bhi sirf local file me hai —
+restart par chala jayega. Upar doctor exact env batata hai.
+
+> 🔐 **Encryption key** (`VAULT_ENCRYPTION_KEY`) hi linked DB ki chaabi hai —
+> accounts me cookies/tokens hote hain. **SAME value** har instance me daalo,
+> warna ek instance doosre ka data decrypt nahi kar paayega. Value kahin
+> note kar lo (Render → Environment me rakho).
 
 ## ⚙️ Settings — user ki azadi (env chhedni ki zaroorat nahi)
 
@@ -700,7 +764,10 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `proxy-pool.js` | **Proxy pool** — lane reservations, IP rotation, per-proxy WAF token + cooldown |
 | `swiggy-bridge.js` | Swiggy automation + WAF token injection + **lane-local proxy routing** |
 | `store.js` + `vault-sync.js` | Session DB (`data/db.json`) + cloud vault |
+| `db-link.js` + `db-payload.js` | 💾 **Linked database** — durable store (KV/http/vault) + merge rules (data loss rok) |
+| `scripts/db-doctor.mjs` | 💾 DB link report + live verify — `npm run doctor` |
 | `test_fresh_unit.mjs` | Unit tests (mocked fetch) — `npm test` |
+| `test_db_link.mjs` | Linked-DB tests (merge rules + KV round-trip) — `npm test` |
 | `scratch/firebase-inspect.mjs` | Firebase ka live structure dump — `npm run inspect` |
 
 ### 📦 Shop Bot stock (`@its_shop_bot`)
@@ -840,7 +907,10 @@ Helpers `rich-text.js` me hain: `fancy()`, `bracketHeader()`, `headerRule()`, `s
 | `TELEGRAM_CALL_TIMEOUT_MS` | `20000` | Boot ke getMe/deleteWebhook ka hard timeout (hang = fail → retry) |
 | `PROXY_MODE` | `auto` | `direct` = proxy pool poori tarah band (no fetch, no WAF-solve, 1 lane, ek IP) — sabse simple aur sabse kam time-waste |
 | `TELEGRAM_SESSION_2…_8` | — | Extra spare accounts. Ek account flood/dead ho to bot **khud agla** uthata hai (`npm run telegram:audit` se check) |
-| `GITHUB_VAULT_BRANCH` | `bot-vault` | Doosre instance ke liye `bot-vault-2` (warna vault overwrite hoga) |
+| `GITHUB_VAULT_BRANCH` | `bot-vault` | Doosre instance ke liye `bot-vault-bot2` (warna vault overwrite hoga). Khali chhodne par `INSTANCE_LABEL` se khud derive hota hai |
+| `KV_REST_URL` + `KV_REST_TOKEN` | — | 💾 Linked DB = Vercel KV / Upstash (priority 1). Set karne par DB linked ho jata hai |
+| `DB_STORE_URL` (+ `DB_STORE_TOKEN`) | — | 💾 Linked DB = koi bhi JSON document endpoint (priority 2) |
+| `VAULT_ENCRYPTION_KEY` | — | 💾 Linked DB ki encryption key — SAME value har instance me (warna decrypt nahi hoga) |
 
 ## Timing expectation
 
@@ -877,9 +947,13 @@ padh/sakta hai. Number pool + OTP inbox dono public hain. Rules lagwa lena
 | OTP hi nahi aata (`failed_otp_miss`) | Device offline hai ya SMS forwarder band. Online devices wala pool use karo (⚙️ Settings → 📴 Offline OFF rakho jab tak pakka na ho) |
 | Bot beech me chup-chaap band ho jata tha | Fix ho gaya — ab handler errors par bot nahi marta (`bot.catch` + guards). Phir bhi band ho to console ka aakhri error dekho |
 | `Chrome ❌ nahi mila` (server/Render par) | Free cloud par Chrome hota hi nahi. Local PC/VPS par chalao jahan Chrome ho, ya build me Chromium install karke `PUPPETEER_EXECUTABLE_PATH` do |
+| **Restart ke baad accounts/settings gayab** | 💾 DB linked nahi hai — `/diag` → `💾 Database` dekho. `npm run doctor` chalao; output me exactly batayega kaunsa env missing hai. Fix: `GITHUB_VAULT_TOKEN` + `VAULT_ENCRYPTION_KEY` (ya `KV_REST_URL`/`KV_REST_TOKEN`) set karo — same key har instance me |
+| Doctor me `403 Resource not accessible by integration` | Token classic PAT nahi hai (GitHub App token me Contents API write nahi hota). GitHub → Settings → Developer settings → Personal access tokens → **classic**, `repo` scope, phir naya token env me daalo |
+| Doctor me `push blocked: VAULT_ENCRYPTION_KEY missing` | Encryption key set nahi — linked DB me accounts (cookies/tokens) plaintext me nahi likhe jaate. `VAULT_ENCRYPTION_KEY=<32+ random chars>` set karo (same value har instance me) |
 
 ## Test
 
 ```bash
-npm test    # unit checks (koi network nahi — fetch mock hai)
+npm test    # unit checks (koi network nahi — fetch mock hai) + linked-DB tests
+npm run doctor   # 💾 DB link report (linked hai ya nahi — data bachega ya nahi)
 ```

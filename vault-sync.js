@@ -1,20 +1,33 @@
 import zlib from 'node:zlib';
 import crypto from 'node:crypto';
+import { mergeDbSnapshots } from './db-payload.js';
 
 const VAULT_OWNER = process.env.GITHUB_VAULT_OWNER || 'hulm0408';
 const VAULT_REPO = process.env.GITHUB_VAULT_REPO || 'ammi-abbu-ka-sacha-beta';
-const VAULT_BRANCH = process.env.GITHUB_VAULT_BRANCH || 'bot-vault';
 const VAULT_PATH = 'vault/accounts-vault.json';
+
+// BRANCH per-instance hona zaroori hai. Pehle har instance ka default
+// `bot-vault` tha — matlab bot2/bot3/bot4 ya koi local run MAIN ke vault
+// par push karta → ek doosre ke accounts wipe (data loss!).
+// Ab: GITHUB_VAULT_BRANCH set hai to wahi; warna INSTANCE_LABEL se derive
+// (bot2 → bot-vault-bot2). Sirf `main` default `bot-vault` par rehta hai.
+export function resolveVaultBranch(env = process.env) {
+  const explicit = String(env?.GITHUB_VAULT_BRANCH || env?.GH_VAULT_BRANCH || '').trim();
+  if (explicit) return explicit;
+  const label = String(env?.INSTANCE_LABEL || '').trim();
+  if (label && label !== 'main') return `bot-vault-${label}`;
+  return 'bot-vault';
+}
 
 // SECURITY (2026-10-22 incident): a GitHub PAT was previously XOR-masked and
 // hardcoded in this public repo — anyone with read access could reconstruct
 // it. Tokens now come EXCLUSIVELY from environment variables (Render env).
 // Never embed credentials in source, even obfuscated.
 let _noTokenWarned = false;
-export function resolveVaultToken() {
-  const fromEnv = (process.env.GITHUB_VAULT_TOKEN || process.env.GH_VAULT_TOKEN || '').trim();
+export function resolveVaultToken(env = process.env) {
+  const fromEnv = String(env?.GITHUB_VAULT_TOKEN || env?.GH_VAULT_TOKEN || '').trim();
   if (fromEnv) return fromEnv;
-  if (process.env.DISABLE_CLOUD_VAULT === '1') return '';
+  if (env?.DISABLE_CLOUD_VAULT === '1') return '';
   if (!_noTokenWarned) {
     _noTokenWarned = true;
     console.warn('[CloudVault] GITHUB_VAULT_TOKEN env not set — cloud vault sync disabled (set it in Render env; NEVER embed tokens in source).');
@@ -34,8 +47,8 @@ export function resolveVaultToken() {
 const VAULT_ENC_MARKER = 'v2-aes256gcm';
 const VAULT_ENC_SALT = 'sacha-beta-vault-salt-v2';
 
-function vaultEncryptionKey() {
-  const raw = (process.env.VAULT_ENCRYPTION_KEY || '').trim();
+function vaultEncryptionKey(keyRaw) {
+  const raw = String(keyRaw ?? process.env.VAULT_ENCRYPTION_KEY ?? '').trim();
   if (!raw) return null;
   return crypto.scryptSync(raw, VAULT_ENC_SALT, 32);
 }
@@ -44,8 +57,8 @@ let _noEncKeyWarned = false;
 function allowPlaintextVault() {
   return (process.env.ALLOW_PLAINTEXT_VAULT || '').trim() === '1';
 }
-function encryptVaultPayloadText(payloadObj) {
-  const key = vaultEncryptionKey();
+export function encryptVaultPayloadText(payloadObj, keyRaw) {
+  const key = vaultEncryptionKey(keyRaw);
   const plain = JSON.stringify(payloadObj);
   if (!key) {
     if (!allowPlaintextVault()) {
@@ -68,11 +81,11 @@ function encryptVaultPayloadText(payloadObj) {
   });
 }
 
-export function decryptVaultPayloadText(rawText) {
+export function decryptVaultPayloadText(rawText, keyRaw) {
   let obj;
   try { obj = JSON.parse(rawText); } catch (err) { throw new Error(`vault payload is not JSON: ${err.message}`); }
   if (!obj || obj.__vaultEnc !== VAULT_ENC_MARKER) return obj; // legacy plaintext → pass through
-  const key = vaultEncryptionKey();
+  const key = vaultEncryptionKey(keyRaw);
   if (!key) {
     console.warn('[CloudVault] vault file is encrypted but VAULT_ENCRYPTION_KEY env is missing — cannot decrypt.');
     return null;
@@ -102,6 +115,25 @@ let pushDebounceTimer = null;
 let pushInFlight = Promise.resolve();
 let latestSnapshotSupplier = null;
 let cloudVaultHydrated = false;
+
+// Vault ka live status — /diag aur doctor dono isse use karte hain.
+export const vaultStatus = {
+  lastPushOk: false,
+  lastPushAt: 0,
+  lastPullAt: 0,
+  lastError: '',
+  branch: '',
+};
+
+export function getVaultStatus() {
+  return {
+    branch: resolveVaultBranch(),
+    repo: `${VAULT_OWNER}/${VAULT_REPO}`,
+    tokenPresent: Boolean(resolveVaultToken()),
+    encryptionKeyPresent: Boolean(vaultEncryptionKey()),
+    ...vaultStatus,
+  };
+}
 
 /**
  * Extracts all `.json` / `.txt` text entries from a ZIP buffer using pure built-in Node `zlib`
@@ -187,11 +219,12 @@ export function extractSessionFilesFromZipBuffer(zipBuf) {
 }
 
 async function ensureOrphanVaultBranchExists(token) {
-  const refUrl = `https://api.github.com/repos/${VAULT_OWNER}/${VAULT_REPO}/git/ref/heads/${VAULT_BRANCH}`;
+  const branch = resolveVaultBranch();
+  const refUrl = `https://api.github.com/repos/${VAULT_OWNER}/${VAULT_REPO}/git/ref/heads/${branch}`;
   const refRes = await fetch(refUrl, { headers: ghHeaders(token), signal: AbortSignal.timeout(8000) });
   if (refRes.status === 200) return true;
 
-  // Create a true standalone orphan commit on `refs/heads/bot-vault` (never triggers `main` Render deploys!)
+  // Create a true standalone orphan commit on `refs/heads/<branch>` (never triggers `main` Render deploys!)
   const blobRes = await fetch(`https://api.github.com/repos/${VAULT_OWNER}/${VAULT_REPO}/git/blobs`, {
     method: 'POST',
     headers: ghHeaders(token),
@@ -222,7 +255,7 @@ async function ensureOrphanVaultBranchExists(token) {
   const createRefRes = await fetch(`https://api.github.com/repos/${VAULT_OWNER}/${VAULT_REPO}/git/refs`, {
     method: 'POST',
     headers: ghHeaders(token),
-    body: JSON.stringify({ ref: `refs/heads/${VAULT_BRANCH}`, sha: commit.sha }),
+    body: JSON.stringify({ ref: `refs/heads/${branch}`, sha: commit.sha }),
     signal: AbortSignal.timeout(8000)
   });
   return createRefRes.ok || createRefRes.status === 422;
@@ -233,7 +266,8 @@ export async function pullAccountsFromCloudVault() {
   if (!token) return null;
 
   try {
-    const url = `https://api.github.com/repos/${VAULT_OWNER}/${VAULT_REPO}/contents/${VAULT_PATH}?ref=${encodeURIComponent(VAULT_BRANCH)}`;
+    const branch = resolveVaultBranch();
+    const url = `https://api.github.com/repos/${VAULT_OWNER}/${VAULT_REPO}/contents/${VAULT_PATH}?ref=${encodeURIComponent(branch)}`;
     const res = await fetch(url, { headers: ghHeaders(token), signal: AbortSignal.timeout(8000) });
     if (!res.ok) return null;
     const meta = await res.json();
@@ -279,6 +313,13 @@ export function _mergeVaultPremiumLedger(payloadObj, remotePayload) {
   return payload;
 }
 
+// Vault push — MERGE-PROTECTED + CONFLICT-SAFE.
+//
+// Pehle: remote sirf ledger ke liye padha jata tha, baaki sab overwrite.
+// Ab:   remote ka poora snapshot merge hota hai (db-payload.js) — remote ka
+//        koi account/ledger/order kabhi local ke khaali db se DELETE nahi
+//        hota. Aur 409/422 (concurrent push) par dobara remote padh kar
+//        merge karke retry hota hai (pehle update chup-chaap drop ho jata tha).
 export async function pushAccountsToCloudVaultNow(payloadObj) {
   const token = resolveVaultToken();
   if (!token || !payloadObj) return { ok: false, reason: 'NO_TOKEN' };
@@ -287,41 +328,77 @@ export async function pushAccountsToCloudVaultNow(payloadObj) {
       _noEncKeyWarned = true;
       console.error('[CloudVault] FAIL-CLOSED: VAULT_ENCRYPTION_KEY is not set — refusing to push account vault in plaintext. Set VAULT_ENCRYPTION_KEY in the environment.');
     }
+    vaultStatus.lastPushOk = false;
+    vaultStatus.lastError = 'VAULT_ENCRYPTION_KEY missing — push blocked';
     return { ok: false, reason: 'NO_ENCRYPTION_KEY' };
   }
 
   pushInFlight = pushInFlight.then(async () => {
+    const branch = resolveVaultBranch();
+    const url = `https://api.github.com/repos/${VAULT_OWNER}/${VAULT_REPO}/contents/${VAULT_PATH}`;
     try {
       await ensureOrphanVaultBranchExists(token);
-      const url = `https://api.github.com/repos/${VAULT_OWNER}/${VAULT_REPO}/contents/${VAULT_PATH}`;
-      const existingRes = await fetch(`${url}?ref=${encodeURIComponent(VAULT_BRANCH)}`, {
-        headers: ghHeaders(token),
-        signal: AbortSignal.timeout(8000)
-      });
-      const existingJson = existingRes.ok ? await existingRes.json().catch(() => null) : null;
       let payloadToPush = payloadObj;
-      if (existingJson?.content) {
-        try {
-          const remoteRaw = Buffer.from(existingJson.content.replace(/\s+/g, ''), 'base64').toString('utf8');
-          const remotePayload = decryptVaultPayloadText(remoteRaw);
-          if (remotePayload) payloadToPush = _mergeVaultPremiumLedger(payloadObj, remotePayload);
-        } catch {}
+      let existingJson = null;
+      let lastStatus = 0;
+
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const existingRes = await fetch(`${url}?ref=${encodeURIComponent(branch)}`, {
+          headers: ghHeaders(token),
+          signal: AbortSignal.timeout(8000)
+        });
+        existingJson = existingRes.ok ? await existingRes.json().catch(() => null) : null;
+
+        // Remote snapshot padho aur MERGE karo — kabhi overwrite nahi.
+        payloadToPush = payloadObj;
+        if (existingJson?.content) {
+          try {
+            const remoteRaw = Buffer.from(existingJson.content.replace(/\s+/g, ''), 'base64').toString('utf8');
+            const remotePayload = decryptVaultPayloadText(remoteRaw);
+            if (remotePayload && typeof remotePayload === 'object') {
+              payloadToPush = mergeDbSnapshots(payloadObj, remotePayload).payload;
+            }
+          } catch {}
+        }
+
+        const body = {
+          message: `chore(vault): sync ${Object.keys(payloadToPush.accounts || {}).length} saved Swiggy accounts`,
+          content: Buffer.from(encryptVaultPayloadText(payloadToPush), 'utf8').toString('base64'),
+          branch,
+          ...(existingJson?.sha ? { sha: existingJson.sha } : {})
+        };
+        const putRes = await fetch(url, {
+          method: 'PUT',
+          headers: ghHeaders(token),
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(10000)
+        });
+        lastStatus = putRes.status;
+        if (putRes.ok) {
+          vaultStatus.lastPushOk = true;
+          vaultStatus.lastPushAt = Date.now();
+          vaultStatus.lastError = '';
+          vaultStatus.branch = branch;
+          return { ok: true, status: putRes.status };
+        }
+        // 409/422 = kisi ne beech me push kiya → remote dobara padh kar
+        // merge karke retry (data loss nahi hoga).
+        if ((putRes.status === 409 || putRes.status === 422) && attempt < 3) {
+          await new Promise((r) => setTimeout(r, 400 * attempt));
+          continue;
+        }
+        const bodyText = await putRes.text().catch(() => '');
+        vaultStatus.lastPushOk = false;
+        vaultStatus.lastError = `GitHub push HTTP ${putRes.status}${bodyText ? ` — ${String(bodyText).slice(0, 120)}` : ''}`;
+        return { ok: false, status: putRes.status, error: vaultStatus.lastError };
       }
-      const body = {
-        message: `chore(vault): sync ${Object.keys(payloadToPush.accounts || {}).length} saved Swiggy accounts`,
-        content: Buffer.from(encryptVaultPayloadText(payloadToPush), 'utf8').toString('base64'),
-        branch: VAULT_BRANCH,
-        ...(existingJson?.sha ? { sha: existingJson.sha } : {})
-      };
-      const putRes = await fetch(url, {
-        method: 'PUT',
-        headers: ghHeaders(token),
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(10000)
-      });
-      return { ok: putRes.ok, status: putRes.status };
+      vaultStatus.lastPushOk = false;
+      vaultStatus.lastError = `GitHub push failed (HTTP ${lastStatus})`;
+      return { ok: false, status: lastStatus, error: vaultStatus.lastError };
     } catch (err) {
       console.warn('[CloudVault] Push warning:', err.message);
+      vaultStatus.lastPushOk = false;
+      vaultStatus.lastError = String(err?.message || err);
       return { ok: false, error: err.message };
     }
   });

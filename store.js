@@ -8,6 +8,14 @@ import {
   scheduleCloudVaultSync,
   markCloudVaultHydrated
 } from './vault-sync.js';
+import {
+  pullLinkedPayload,
+  pushLinkedPayload,
+  resolveDbLink,
+  getDbLinkStatus as _getDbLinkStatus,
+  readOutbox
+} from './db-link.js';
+import { payloadFingerprint } from './db-payload.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -658,7 +666,29 @@ export async function hydrateAccountsFromCloudVault() {
     const remote = await pullAccountsFromCloudVault();
     markCloudVaultHydrated();
     if (!remote || typeof remote !== 'object') return { restored: 0, total: 0 };
+    return mergeRemoteSnapshotIntoDb(remote);
+  } catch (e) {
+    console.warn('[CloudVault] Hydrate note:', e.message);
+    return { restored: 0, total: 0 };
+  }
+}
 
+// ── 💾 LINKED DATABASE ─────────────────────────────────────────────────────
+//
+// Bot ka DB `data/db.json` hai — Render free disk / GH Actions runner par ye
+// har restart par mit jata hai. Isi liye DB ko ek DURABLE linked database
+// (GitHub vault / Vercel KV / DB_STORE) se bind kiya gaya hai.
+//
+//   • hydrate — boot par remote se accounts/ledger/sources wapas laata hai
+//   • push    — har save ke baad (debounced) remote me MERGE karke likhta hai
+//   • outbox  — push fail hua to snapshot bachta hai, next tick par retry
+//
+// Ye teenon cheezein milke hi "data loss" band karte hain: pehle ek bhi
+// push fail ya hydrate miss ho to data chala jata tha.
+//
+// Remote snapshot ko local db me MERGE karta hai (tombstones respect).
+function mergeRemoteSnapshotIntoDb(remote) {
+  {
     let restored = 0;
     let mutated = false;
     const db = getDb();
@@ -766,17 +796,102 @@ export async function hydrateAccountsFromCloudVault() {
       saveDb(db);
       syncAccountsJsonMirror(db, { skipCloudPush: true });
       if (restored > 0) {
-        console.log(`[CloudVault] Restored ${restored} saved Swiggy JSON account(s) from persistent vault!`);
+        console.log(`[DbLink] Restored ${restored} saved Swiggy JSON account(s) from linked DB!`);
       }
     }
     return {
       restored,
       total: Object.values(db.config.accounts).filter(a => isAccountLoggedInSession(a)).length
     };
-  } catch (e) {
-    console.warn('[CloudVault] Hydrate note:', e.message);
-    return { restored: 0, total: 0 };
   }
+}
+
+// Linked DB se hydrate — boot par remote data wapas laata hai.
+export async function hydrateFromLinkedDb() {
+  try {
+    const remote = await pullLinkedPayload();
+    if (!remote || typeof remote !== 'object') return { restored: 0, total: 0, linked: false };
+    const res = mergeRemoteSnapshotIntoDb(remote);
+    return { ...res, linked: true };
+  } catch (e) {
+    console.warn('[DbLink] Hydrate note:', e.message);
+    return { restored: 0, total: 0, linked: false };
+  }
+}
+
+// ── Linked DB push (debounced + retry) ─────────────────────────────────────
+let linkedPushTimer = null;
+let linkedPushInFlight = null;
+let lastLinkedPushFingerprint = '';
+let lastLinkedPushAt = 0;
+
+// Har save ke baad remote me likh do — par debounce se (bohot saare save
+// hote hain batch me) aur fingerprint check se (same data → same push nahi).
+//
+// ⚠️ Debounce starvation: batch chalu hai to save har second hota hai —
+// sirf trailing-debounce se push kabhi hota hi nahi. Isliye maxDelay ke
+// baad push TURANT chala jata hai (data jaldi durable hota hai).
+export function scheduleLinkedDbPush(delayMs = 5000, maxDelayMs = 30_000) {
+  if (!resolveDbLink().linked) return;
+  if (Date.now() - lastLinkedPushAt >= maxDelayMs) {
+    void flushLinkedDbPush();
+    return;
+  }
+  if (linkedPushTimer) clearTimeout(linkedPushTimer);
+  linkedPushTimer = setTimeout(() => {
+    linkedPushTimer = null;
+    void flushLinkedDbPush();
+  }, delayMs);
+  if (typeof linkedPushTimer.unref === 'function') linkedPushTimer.unref();
+}
+
+export async function flushLinkedDbPush() {
+  const link = resolveDbLink();
+  if (!link.linked) return { ok: false, reason: 'NOT_LINKED' };
+  if (linkedPushInFlight) return linkedPushInFlight;
+  linkedPushInFlight = (async () => {
+    try {
+      const snapshot = buildCloudVaultSnapshot(getDb());
+      const fp = payloadFingerprint(snapshot);
+      const st = _getDbLinkStatus();
+      if (fp && fp === lastLinkedPushFingerprint && st.lastPushOk) {
+        return { ok: true, skipped: true };
+      }
+      const res = await pushLinkedPayload(snapshot);
+      if (res?.ok) {
+        lastLinkedPushFingerprint = fp;
+        lastLinkedPushAt = Date.now();
+      }
+      return res;
+    } catch (err) {
+      console.warn('[DbLink] Push skipped:', err?.message || err);
+      return { ok: false, error: String(err?.message || err) };
+    } finally {
+      linkedPushInFlight = null;
+    }
+  })();
+  return linkedPushInFlight;
+}
+
+// Linked DB ka status — /diag + doctor CLI.
+export function getDbLinkStatus() {
+  return _getDbLinkStatus();
+}
+
+// Har 60s: pending outbox ya failed push ko retry. (Network jhatke me data
+// turant save hota hai — agli baar push ho jata hai, kuch nahi jayega.)
+let linkedRetryTimer = null;
+export function startLinkedDbRetry(intervalMs = 60_000) {
+  if (linkedRetryTimer) return;
+  linkedRetryTimer = setInterval(() => {
+    const st = _getDbLinkStatus();
+    if (!st.linked) return;
+    const pending = readOutbox();
+    if (pending || !st.lastPushOk) {
+      void flushLinkedDbPush();
+    }
+  }, intervalMs);
+  if (typeof linkedRetryTimer.unref === 'function') linkedRetryTimer.unref();
 }
 
 function syncAccountsJsonMirror(data, { skipCloudPush = false } = {}) {
@@ -1138,6 +1253,11 @@ export function saveDb(data) {
     } catch (e) {}
     fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), 'utf-8');
   }
+
+  // 💾 Linked DB — har save ke baad remote me MERGE-push (debounced + retry).
+  //    Link na ho to ye no-op hai; local file tab bhi safe rehti hai.
+  //    Yehi line hai jo "restart = sab data gaya" ko rokta hai.
+  try { scheduleLinkedDbPush(); } catch {}
 }
 
 const UNSAFE_ORDER_KEYS = new Set(['__proto__', 'prototype', 'constructor', '__defineGetter__', '__defineSetter__']);
