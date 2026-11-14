@@ -443,12 +443,51 @@ Chhota summary:
 - **Vercel par ye bot nahi chalega** (long polling, Chrome, disk) — Render
   ke 750 free hours account-wise hote hain, isliye doosra Render account.
 
+## 📋 Used numbers — "ye number phir aaye to OTP mat lo"
+
+Jis number ka OTP **ek baar consume** ho gaya, uska OTP dobara nahi lena —
+cooldown window tak (default **30 din**, pehle 7 din tha). Numbers ek ledger
+me rehte hain (`data/db.json` → `premiumFlow.used`) aur linked DB ke saath
+sync hote hain, isliye restart/redeploy par bhi block rehte hain.
+
+### Seed list (owner ki di hui files)
+
+`seed/used-numbers.json` me woh numbers hain jinka OTP bilkul nahi lena.
+Har instance boot par ye list ledger me import kar deta hai:
+
+```bash
+npm run seed:used-numbers -- <uploaded-accounts.json> [aur-files.json ...]
+npm run seed:used-numbers -- --apply     # sirf list ko local db me apply
+npm run seed:used-numbers -- --show      # summary
+```
+
+* Accounts-export file padha jata hai (`mobile`/`phone` field) — **sirf mobile
+  numbers save hote hain, token/cookie kabhi nahi** (repo public hai).
+* Har number ka **apna** timestamp hai (`addedAt`): baad me nayi file add
+  karne se purane numbers ka window **reset nahi** hota — har number apne
+  30 din ke baad unlock hota hai.
+* Re-apply (har restart) par window **extend nahi** hota — warna number
+  kabhi unlock hi nahi hota.
+* 30 din baad number **unlock** ho jata hai (dobara block nahi hota).
+
+### Future numbers khud add hote hain
+
+Jis number se OTP le liya gaya, wo `markLedger(phone, 'success')` se ledger me
+chala jata hai — **automatic**. Toing-web flow, direct bridge flow aur worldbot
+flow — teeno path ledger mark karte hain. `/diag` me dekho:
+
+```
+📋 Used numbers: 3468 ledger · 3468 blocked (30d cooldown) · 0 permanent
+```
+
+> Env se window badal sakta hai: `PREMIUM_USED_COOLDOWN_DAYS=30`
+
 ## 💾 Linked database — "data bahut loss ho raha" ka asli fix
 
 Bot ka DB ek JSON file hai: `data/db.json`. Ye file Render ke **free** disk
 par **ephemeral** hai, aur GitHub Actions runner par har run me **fresh**.
 Matlab: har restart/redeploy par saved accounts, bot settings, number-ledger
-(7-day cooldown) aur Firebase source list — sab chala jate hain.
+(30-day cooldown) aur Firebase source list — sab chala jate hain.
 
 Isi liye DB ko ek **durable linked database** se bind karna zaroori hai.
 Bot ab 3 me se koi ek driver use karta hai (priority order):
@@ -610,14 +649,15 @@ redeploy ke baad list gayab nahi hoti.
   karta hai aur sirf isi customer ka non-guest, zyada-life wala JWT accept
   karta hai. Export me `_session_tid`, `jwtTid`, `tidExpiresAt` aur
   `sessionLongLived` bhi rehte hain, taaki asal life chhupi na rahe.
-- **⏳ 7-day extracted-number cooldown:** jis number ka fresh session ek
-  baar extract/send ho jaye, woh number **7 din se pehle dobara process
+- **⏳ 30-day extracted-number cooldown:** jis number ka fresh session ek
+  baar extract/send ho jaye, woh number **30 din se pehle dobara process
   nahi hota** — na hot-queue se, na purani retry-later entry se, na next
   run me. Success timestamp `premiumFlow.used` ledger me rehta hai aur
-  cloud vault ke saath sync/hydrate hota hai, isliye Render restart/deploy
-  ke baad bhi ye rok barqarar rehti hai. Ledger kisi wajah se missing ho
-  to saved account/session ke `savedAt` se bhi wahi 7 din ginay jate hain.
-  7 din guzarne ke baad hi number dobara eligible hota hai.
+  linked DB (cloud vault / KV) ke saath sync/hydrate hota hai, isliye Render
+  restart/deploy ke baad bhi ye rok barqarar rehti hai. Ledger kisi wajah
+  se missing ho to saved account/session ke `savedAt` se bhi wahi 30 din
+  ginay jate hain. 30 din guzarne ke baad hi number dobara eligible hota
+  hai. Window `PREMIUM_USED_COOLDOWN_DAYS` se badal sakta hai.
 - Purane saved session ka latest JSON lena ho to owner command:
   `/session 9876543210` ya `/session acc_9876543210`. JWT short/expired ho
   to ye command pehle **usi saved account ko bina naya OTP liye refresh**
@@ -766,8 +806,11 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `store.js` + `vault-sync.js` | Session DB (`data/db.json`) + cloud vault |
 | `db-link.js` + `db-payload.js` | 💾 **Linked database** — durable store (KV/http/vault) + merge rules (data loss rok) |
 | `scripts/db-doctor.mjs` | 💾 DB link report + live verify — `npm run doctor` |
+| `seed/used-numbers.json` | 📋 Blocklist — jinka OTP dobara nahi lena (30-din cooldown). Sirf mobile numbers |
+| `scripts/seed-used-numbers.mjs` | 📋 List import/apply — `npm run seed:used-numbers -- <file.json>` |
 | `test_fresh_unit.mjs` | Unit tests (mocked fetch) — `npm test` |
 | `test_db_link.mjs` | Linked-DB tests (merge rules + KV round-trip) — `npm test` |
+| `test_used_numbers.mjs` | Blocklist tests (30-din unlock, idempotency) — `npm test` |
 | `scratch/firebase-inspect.mjs` | Firebase ka live structure dump — `npm run inspect` |
 
 ### 📦 Shop Bot stock (`@its_shop_bot`)
@@ -911,6 +954,7 @@ Helpers `rich-text.js` me hain: `fancy()`, `bracketHeader()`, `headerRule()`, `s
 | `KV_REST_URL` + `KV_REST_TOKEN` | — | 💾 Linked DB = Vercel KV / Upstash (priority 1). Set karne par DB linked ho jata hai |
 | `DB_STORE_URL` (+ `DB_STORE_TOKEN`) | — | 💾 Linked DB = koi bhi JSON document endpoint (priority 2) |
 | `VAULT_ENCRYPTION_KEY` | — | 💾 Linked DB ki encryption key — SAME value har instance me (warna decrypt nahi hoga) |
+| `PREMIUM_USED_COOLDOWN_DAYS` | `30` | ⏳ Used-number cooldown (OTP dobara lena) — 30 din baad unlock |
 
 ## Timing expectation
 

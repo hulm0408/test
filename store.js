@@ -44,6 +44,202 @@ const defaultData = {
   userStates: {}
 };
 
+// ── ⏳ Used-number cooldown (OTP dobara na lena) ────────────────────────────
+//
+// Owner ka rule: jis number ka OTP ek baar consume ho gaya (ya jo seed list
+// me hai), us number ka OTP dobara nahi lena — cooldown window tak.
+// Pehle 7 din tha, ab 30 din. Env se badal sakta hai:
+//   PREMIUM_USED_COOLDOWN_DAYS=30
+export const DEFAULT_EXTRACTED_NUMBER_COOLDOWN_DAYS = 30;
+export const MAX_EXTRACTED_NUMBER_COOLDOWN_DAYS = 365;
+
+export function extractedNumberCooldownDays(env = process.env) {
+  const raw = Number(env?.PREMIUM_USED_COOLDOWN_DAYS);
+  if (Number.isFinite(raw) && raw > 0) {
+    return Math.min(MAX_EXTRACTED_NUMBER_COOLDOWN_DAYS, Math.max(1, Math.round(raw)));
+  }
+  return DEFAULT_EXTRACTED_NUMBER_COOLDOWN_DAYS;
+}
+
+export function extractedNumberCooldownMs(env = process.env) {
+  return extractedNumberCooldownDays(env) * 24 * 60 * 60 * 1000;
+}
+
+// Seed file ka default path — repo ke andar (tracked), taaki har instance
+// (Render / GitHub Actions) boot par wahi list lagaye.
+export const USED_NUMBERS_SEED_FILE = path.join(__dirname, 'seed', 'used-numbers.json');
+
+// Ledger status — sirf ye 'extracted' maane wale entries cooldown window
+// ke baad release hoti hain. 'skipped'/'deferred' hamesha block rehte hain.
+function isExtractedLedgerStatusLocal(status) {
+  return /^(success|extracted|sent)$/i.test(String(status || '').trim());
+}
+
+function ledgerTimestampMsLocal(entry) {
+  const raw = entry?.extractedAt || entry?.sentAt || entry?.at || entry?.updatedAt || entry?.createdAt || '';
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    if (raw > 1e12) return raw;
+    if (raw > 1e9) return raw * 1000;
+    return 0;
+  }
+  const parsed = Date.parse(String(raw || ''));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+// ── 📋 Used-numbers seed import ─────────────────────────────────────────────
+//
+// `seed/used-numbers.json` me owner ke diye hue numbers hain. Ye sab numbers
+// cooldown window tak block hote hain (OTP dobara nahi lena).
+//
+// Rules (data-loss-safe):
+//   • Sirf MISSING numbers add hote hain — pehle se maujood entry kabhi
+//     overwrite nahi hoti (ledger authoritative hai).
+//   • Abhi-valid cooldown wala entry bilkul chhoda jata hai (timestamp mat
+//     badlo) — warna har restart par window reset hota aur number kabhi
+//     unlock hi nahi hota.
+//   • HAR number ka apna timestamp hai: `addedAt[number]` (baad me add hua)
+//     ya `seededAt` (pehli list). Isliye baad me nayi file add karne se
+//     purane numbers ka window RESET nahi hota — har number apne 30 din
+//     ke baad unlock hota hai.
+//   • Seed window khatam hone ke baad number unlock ho jata hai (re-block
+//     nahi hota) — yahi "30 din baad unlock" rule hai.
+export function seedUsedNumbersFromSeedFile(filePath = null) {
+  const target = filePath
+    || process.env.USED_NUMBERS_SEED_FILE
+    || USED_NUMBERS_SEED_FILE;
+
+  let parsed;
+  try {
+    const raw = fs.readFileSync(target, 'utf-8');
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    return { present: false, added: 0, kept: 0, skipped: 0, total: 0, file: target, error: err.message };
+  }
+
+  const numbers = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.numbers) ? parsed.numbers : []);
+  const db = getDb();
+  if (!db.premiumFlow || typeof db.premiumFlow !== 'object') db.premiumFlow = {};
+  if (!db.premiumFlow.used || typeof db.premiumFlow.used !== 'object') db.premiumFlow.used = {};
+
+  const now = Date.now();
+  const cooldownMs = extractedNumberCooldownMs();
+  const seededAt = ledgerTimestampMsLocal({ extractedAt: parsed?.seededAt, at: parsed?.seededAt });
+  const addedAtMap = (parsed?.addedAt && typeof parsed.addedAt === 'object') ? parsed.addedAt : {};
+
+  // Is number ka apna "kab se block hua" timestamp.
+  const timestampFor = (phone) => {
+    const own = ledgerTimestampMsLocal({ extractedAt: addedAtMap[phone], at: addedAtMap[phone] });
+    return own > 0 ? own : seededAt;
+  };
+
+  let added = 0;
+  let kept = 0;
+  let skipped = 0;
+
+  for (const rawNum of numbers) {
+    const phone = normalizeTenDigitPhone(rawNum);
+    if (!phone) { skipped++; continue; }
+
+    const seedTs = timestampFor(phone);
+    const seedActive = seedTs > 0 ? now < seedTs + cooldownMs : true;
+
+    const existing = db.premiumFlow.used[phone];
+    if (existing) {
+      const exTs = ledgerTimestampMsLocal(existing);
+      const exStatusOk = isExtractedLedgerStatusLocal(existing.status);
+      // Cooldown abhi chal raha hai → chhod do (window extend nahi karna).
+      if (exStatusOk && exTs > 0 && now < exTs + cooldownMs) { kept++; continue; }
+      // 'skipped'/'deferred' = hamesha block (timestamp se chhota nahi hota).
+      if (!exStatusOk) { kept++; continue; }
+      // Cooldown expire ho chuka hai → seed bhi expire hai to chhod do
+      // (number unlock ho chuka hai — dobara block nahi karna).
+      if (!seedActive) { skipped++; continue; }
+    } else if (!seedActive) {
+      // Is number ka 30-din ka window khatam — use dobara block mat karo.
+      skipped++;
+      continue;
+    }
+
+    const at = new Date(seedTs || now).toISOString();
+    db.premiumFlow.used[phone] = {
+      status: 'success',
+      at,
+      extractedAt: at,
+      seeded: true,
+      source: 'used-numbers-seed',
+      cooldownDays: Math.round(cooldownMs / (24 * 60 * 60 * 1000)),
+    };
+    added++;
+  }
+
+  if (added > 0) saveDb(db);
+
+  return {
+    present: true,
+    added,
+    kept,
+    skipped,
+    total: Object.keys(db.premiumFlow.used).length,
+    seedTotal: numbers.length,
+    file: target,
+    seedActive: seededAt > 0 ? now < seededAt + cooldownMs : true,
+    seededAt: parsed?.seededAt || '',
+  };
+}
+
+// Ledger se expire ho chuke 'success' entries hata do (ab block nahi karte).
+// Ye ledger ko bounded rakhta hai — warna 10k+ numbers tak badh ke vault
+// file GitHub ke 1MB limit se chala jayegi. Permanent block ('skipped'/
+// 'deferred') aur abhi-valid cooldown entries BACHTE hain.
+export function trimExpiredUsedNumbers() {
+  try {
+    const db = getDb();
+    const used = db?.premiumFlow?.used || {};
+    const now = Date.now();
+    const cooldownMs = extractedNumberCooldownMs();
+    let removed = 0;
+    for (const [phone, entry] of Object.entries(used)) {
+      if (!entry || typeof entry !== 'object') continue;
+      if (!isExtractedLedgerStatusLocal(entry.status)) continue; // permanent block — mat hatao
+      const ts = ledgerTimestampMsLocal(entry);
+      if (ts > 0 && now >= ts + cooldownMs) {
+        delete used[phone];
+        removed++;
+      }
+    }
+    if (removed > 0) saveDb(db);
+    return { removed, remaining: Object.keys(used).length };
+  } catch {
+    return { removed: 0, remaining: 0 };
+  }
+}
+
+// Ledger ka quick summary — /diag me "kitne numbers block hain" dikhane ke liye.
+export function getUsedNumbersSummary() {
+  try {
+    const db = getDb();
+    const used = db?.premiumFlow?.used || {};
+    const now = Date.now();
+    const cooldownMs = extractedNumberCooldownMs();
+    let blocked = 0;
+    let permanent = 0;
+    for (const entry of Object.values(used)) {
+      if (!entry || typeof entry !== 'object') continue;
+      if (!isExtractedLedgerStatusLocal(entry.status)) { permanent++; continue; }
+      const ts = ledgerTimestampMsLocal(entry);
+      if (ts > 0 && now < ts + cooldownMs) blocked++;
+    }
+    return {
+      total: Object.keys(used).length,
+      blocked,
+      permanent,
+      cooldownDays: Math.round(cooldownMs / (24 * 60 * 60 * 1000)),
+    };
+  } catch {
+    return { total: 0, blocked: 0, permanent: 0, cooldownDays: DEFAULT_EXTRACTED_NUMBER_COOLDOWN_DAYS };
+  }
+}
+
 // Strips markdown code fences and outer noise from pasted JSON / Cookie strings
 function unwrapRawSessionString(raw) {
   if (typeof raw !== 'string') return raw;
@@ -631,7 +827,28 @@ export function buildCloudVaultSnapshot(data = null) {
   }
   const premiumUsedOut = {};
   for (const [phone, entry] of Object.entries(src?.premiumFlow?.used || {})) {
-    if (entry && typeof entry === 'object') premiumUsedOut[phone] = { ...entry };
+    if (!entry || typeof entry !== 'object') continue;
+    // Cooldown expire ho chuke 'success' entries snapshot se nikaal do —
+    // wo ab block nahi karte (unlocked), aur ledger 10k+ numbers tak
+    // badhne se vault file GitHub ke 1MB limit se chala jata. Permanent
+    // block ('skipped'/'deferred') aur abhi-valid cooldown ZAROORI hain.
+    if (isExtractedLedgerStatusLocal(entry.status)) {
+      const ts = ledgerTimestampMsLocal(entry);
+      if (ts > 0 && Date.now() >= ts + extractedNumberCooldownMs()) continue;
+    }
+    // COMPACT form — remote file chhoti rahe. Har entry ~60 bytes (ISO
+    // timestamp + status) ki jagah poora metadata (seeded/source/reason/
+    // cooldownDays) bhejne se 3468 numbers ka snapshot 570KB ho jata tha
+    // (GitHub limit 1MB). Ab ~200KB. Time epoch-ms me (readers number aur
+    // ISO dono samajhte hain).
+    const compact = { status: entry.status };
+    const ts = ledgerTimestampMsLocal(entry);
+    if (ts > 0) compact.extractedAt = ts;
+    else if (entry.at) compact.at = entry.at;
+    if (entry.accountKey) compact.accountKey = String(entry.accountKey).slice(0, 60);
+    if (entry.kind) compact.kind = String(entry.kind).slice(0, 40);
+    if (entry.reason) compact.reason = String(entry.reason).slice(0, 120);
+    premiumUsedOut[phone] = compact;
   }
   return {
     version: 17,

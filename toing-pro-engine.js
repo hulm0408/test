@@ -30,6 +30,7 @@ import {
 } from './session-file.js';
 import {
   getExtractedNumberCooldown,
+  extractedNumberCooldownDays,
   markLedger,
   markPoolStatus,
 } from './number-pipeline.js';
@@ -97,7 +98,7 @@ export async function processSingleNumberViaToingPro({
         ok: false,
         kind: 'deferred_number_cooldown',
         phone,
-        reason: `Ye number pehle extract ho chuka hai — 7-day cooldown ${until} tak hai`,
+        reason: `Ye number pehle extract ho chuka hai — ${extractedNumberCooldownDays()}-day cooldown ${until} tak hai`,
       };
     }
   }

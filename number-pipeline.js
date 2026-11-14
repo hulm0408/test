@@ -24,6 +24,10 @@ import {
   syncCloudVaultNow,
   findAccountKeyByPhone,
   getNextAutoUserName,
+  extractedNumberCooldownDays,
+  extractedNumberCooldownMs,
+  DEFAULT_EXTRACTED_NUMBER_COOLDOWN_DAYS,
+  MAX_EXTRACTED_NUMBER_COOLDOWN_DAYS,
 } from './store.js';
 import { queueShopStockJson, shopStockStatus } from './shop-bot-stock.js';
 import { sessionFileText, writeSessionFile } from './session-file.js';
@@ -70,11 +74,24 @@ import { processSingleNumberViaToingPro } from './toing-pro-engine.js';
 // ---------------------------------------------------------------------------
 // Ledger (db.json → premiumFlow.used) + fresh-selection helpers
 // ---------------------------------------------------------------------------
-// Boss ka hard rule: jis number ka fresh session ek baar extract/send ho
-// gaya, woh number 7 din se pehle dobara process NAHI hoga. Ledger local
-// db ke saath cloud vault me bhi sync hota hai (store.js snapshot), warna
-// Render restart/deploy par sirf accounts wapas aate aur used-list ud jati.
-export const EXTRACTED_NUMBER_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000;
+// Boss ka hard rule: jis number ka OTP ek baar consume ho gaya, woh number
+// cooldown window tak dobara process NAHI hoga (OTP dobara nahi lena). Ledger
+// local db ke saath linked DB (cloud vault / KV) me bhi sync hota hai
+// (store.js snapshot), warna Render restart/deploy par sirf accounts wapas
+// aate aur used-list ud jati.
+//
+// Cooldown ab 30 din (pehle 7 din tha). Env se badal sakta hai:
+//   PREMIUM_USED_COOLDOWN_DAYS=30
+// (Helper store.js me hai — DB ka owner wahi hai; wahan se yahan re-export.)
+export {
+  extractedNumberCooldownDays,
+  extractedNumberCooldownMs,
+  DEFAULT_EXTRACTED_NUMBER_COOLDOWN_DAYS,
+  MAX_EXTRACTED_NUMBER_COOLDOWN_DAYS,
+};
+
+// Back-compat export (purane importers ke liye) — runtime par function chalti hai.
+export const EXTRACTED_NUMBER_COOLDOWN_MS = extractedNumberCooldownMs();
 
 function timestampMs(value) {
   if (typeof value === 'number' && Number.isFinite(value)) {
@@ -148,7 +165,7 @@ function extractedCooldownFromMaps(phone, { now = Date.now(), used = {}, savedSe
   if (!extractedAtMs) {
     return { blocked: false, extractedAtMs: 0, cooldownUntilMs: 0, remainingMs: 0, source: '' };
   }
-  const cooldownUntilMs = extractedAtMs + EXTRACTED_NUMBER_COOLDOWN_MS;
+  const cooldownUntilMs = extractedAtMs + extractedNumberCooldownMs();
   return {
     blocked: now < cooldownUntilMs,
     extractedAtMs,
@@ -441,7 +458,7 @@ export async function processSingleNumber({
         extractedAtMs: cooldown.extractedAtMs || null,
         cooldownUntilMs: cooldown.cooldownUntilMs,
         remainingMs: cooldown.remainingMs,
-        reason: `Ye number pehle extract/send ho chuka hai — 7-day cooldown ${until} tak hai, OTP nahi bheja`,
+        reason: `Ye number pehle extract/send ho chuka hai — ${extractedNumberCooldownDays()}-day cooldown ${until} tak hai, OTP nahi bheja`,
       };
     }
   }
@@ -830,7 +847,7 @@ export async function processSingleNumberViaWorldBot({
         ok: false,
         kind: 'deferred_number_cooldown',
         phone,
-        reason: 'Ye number pehle extract/send ho chuka hai — 7-day cooldown chal raha hai',
+        reason: `Ye number pehle extract/send ho chuka hai — ${extractedNumberCooldownDays()}-day cooldown chal raha hai`,
         viaWorldBot: true,
       };
     }

@@ -39,6 +39,9 @@ const {
   hydrateFromLinkedDb,
   getDbLinkStatus,
   startLinkedDbRetry,
+  seedUsedNumbersFromSeedFile,
+  trimExpiredUsedNumbers,
+  getUsedNumbersSummary,
   getSessionExportJson,
   getDb,
   findAccountKeyByPhone,
@@ -1180,6 +1183,12 @@ async function diagCard() {
       lines.push(sub(dbs.blockedReason || 'GITHUB_VAULT_TOKEN (+VAULT_ENCRYPTION_KEY) ya KV_REST_URL/TOKEN set karo'));
     }
   } catch { lines.push(field('💾 Database', '—')); }
+  // 📋 Used numbers — OTP consume hone wale numbers ka blocklist (cooldown).
+  try {
+    const used = getUsedNumbersSummary();
+    lines.push(field('📋 Used numbers', `${used.total} ledger · ${used.blocked} blocked (${used.cooldownDays}d cooldown) · ${used.permanent} permanent`));
+    lines.push(sub('Blocked number ka OTP dobara nahi lita — cooldown ke baad unlock ho jata hai.'));
+  } catch { lines.push(field('📋 Used numbers', '—')); }
   {
     const ka = keepAliveHandle?.getState?.() || { enabled: false, reason: 'not-started' };
     const lastOk = ka.lastSuccessAt
@@ -4281,6 +4290,38 @@ try {
 
 // Failed push ko retry (outbox + 60s tick) — network jhatke me data mat lo.
 try { startLinkedDbRetry(); } catch {}
+
+// ---------------------------------------------------------------------------
+// 📋 Used-numbers seed — owner ki list (seed/used-numbers.json) ka import.
+//
+// Ye numbers cooldown window tak block hote hain (OTP dobara nahi lena).
+// Har instance par boot par lagta hai, taaki Render/GH Actions dono par
+// wahi list ho. 30 din baad unlock ho jate hain (seed window expire).
+// ---------------------------------------------------------------------------
+try {
+  const seeded = seedUsedNumbersFromSeedFile();
+  if (seeded?.present) {
+    console.log(
+      `[FreshBot] 📋 Used-numbers seed: ${seeded.added} naye block, ${seeded.kept} pehle se block, ` +
+      `${seeded.skipped} skip · ledger ${seeded.total} numbers${seeded.seedActive ? '' : ' (seed window expire — naye add nahi hue)'}`
+    );
+  } else {
+    console.warn(`[FreshBot] 📋 Used-numbers seed: file nahi mili (${seeded?.file || 'seed/used-numbers.json'})`);
+  }
+} catch (e) {
+  console.warn('[FreshBot] Used-numbers seed skipped:', e?.message || e);
+}
+
+// Expire ho chuke ledger entries hata do (ledger bounded rahe, vault file
+// chhoti rahe — warna 10k+ numbers par GitHub ka 1MB limit toot jata).
+try {
+  const trimmed = trimExpiredUsedNumbers();
+  if (trimmed.removed > 0) {
+    console.log(`[FreshBot] 🧹 Ledger trim: ${trimmed.removed} expire entries hataye (ab ${trimmed.remaining}).`);
+  }
+} catch (e) {
+  console.warn('[FreshBot] Ledger trim skipped:', e?.message || e);
+}
 
 // Saved OTP bot (Hermes / HardXotp) boot par hi apply karo — taaki /diag,
 // Test Hermes aur batch — teeno ek hi bot dikhayen/chalayen.
