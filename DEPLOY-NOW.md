@@ -16,7 +16,10 @@ hota hai, minutes free hain.
    - `BOT_TOKEN` = token
    - `OWNER_IDS` = apni Telegram id (bot ko `/start` karne par dikhti hai)
    - *(recommended)* `GITHUB_VAULT_TOKEN` + `VAULT_ENCRYPTION_KEY` — warna har
-     6 ghante naye runner par accounts/settings reset ho jayenge
+     6 ghante naye runner par accounts/settings reset ho jayenge.
+     `GITHUB_VAULT_TOKEN` ke liye **classic PAT** chahiye (`repo` scope) —
+     same value har instance me. Nahi to `npm run doctor` se confirm kar lo
+     ki DB linked hai (warna har restart par data chala jayega)
 3. Chalao:
    👉 https://github.com/hulm0408/workwr/actions → **Bot live** → **Run workflow**
    → instance chuno → **Run workflow**
@@ -50,7 +53,7 @@ par). Manual ⏹ STOP ya target pura hone par ye nishan clear ho jata hai.
    | `BOT_TOKEN` | naya token |
    | `OWNER_IDS` | apni Telegram id |
    | `INSTANCE_LABEL` | `bot2` (bot3, bot4 …) |
-   | `GITHUB_VAULT_BRANCH` | `bot-vault-2` (bot-vault-3 …) |
+   | `GITHUB_VAULT_BRANCH` | `bot-vault-bot2` (bot-vault-bot3 …) |
 5. Deploy ke baad `https://<service>.onrender.com/health` → `"instance":"bot2"`
 6. Free plan par neend na aaye: https://cron-job.org se
    `GET https://<service>.onrender.com/health` har 5–10 min

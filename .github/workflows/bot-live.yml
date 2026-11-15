@@ -93,7 +93,9 @@ jobs:
           BOT_TOKEN: ${{ steps.pick.outputs.instance == 'bot3' && secrets.BOT_TOKEN_3 || steps.pick.outputs.instance == 'bot4' && secrets.BOT_TOKEN_4 || secrets.BOT_TOKEN }}
           OWNER_IDS: ${{ steps.pick.outputs.instance == 'bot3' && secrets.OWNER_IDS_3 || steps.pick.outputs.instance == 'bot4' && secrets.OWNER_IDS_4 || secrets.OWNER_IDS }}
           INSTANCE_LABEL: ${{ steps.pick.outputs.instance }}
-          GITHUB_VAULT_BRANCH: ${{ steps.pick.outputs.instance == 'bot3' && 'bot-vault-3' || steps.pick.outputs.instance == 'bot4' && 'bot-vault-4' || 'bot-vault-2' }}
+          # GITHUB_VAULT_BRANCH set nahi kiya — bot khud INSTANCE_LABEL se
+          # derive kar leta hai (bot2 → bot-vault-bot2, bot3 → bot-vault-bot3).
+          # Isse har instance ka apna DB hota hai (ek doosre ko wipe nahi karta).
           GITHUB_VAULT_TOKEN: ${{ secrets.GITHUB_VAULT_TOKEN }}
           VAULT_ENCRYPTION_KEY: ${{ secrets.VAULT_ENCRYPTION_KEY }}
           TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}

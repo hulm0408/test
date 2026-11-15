@@ -36,6 +36,12 @@ const { Telegraf } = await import('telegraf');
 const {
   isBoss,
   hydrateAccountsFromCloudVault,
+  hydrateFromLinkedDb,
+  getDbLinkStatus,
+  startLinkedDbRetry,
+  seedUsedNumbersFromSeedFile,
+  trimExpiredUsedNumbers,
+  getUsedNumbersSummary,
   getSessionExportJson,
   getDb,
   findAccountKeyByPhone,
@@ -1157,6 +1163,32 @@ async function diagCard() {
     }
   }
   lines.push(field('⏰ Uptime', fmtDuration(Date.now() - runtimeHealth.bootAt)));
+  // 💾 Database — data durable hai ya nahi (restart = data loss?). Ye line
+  // hi sabse zaroori hai: iske bina owner ko pata hi nahi chalta ki DB
+  // linked hai ya nahi (aur isiliye data chup-chaap chala jaata tha).
+  try {
+    const dbs = getDbLinkStatus();
+    if (dbs.linked) {
+      const age = dbs.lastPushAt
+        ? `${Math.max(0, Math.round((Date.now() - dbs.lastPushAt) / 1000))}s pehle`
+        : 'abhi push nahi hua';
+      const mark = dbs.pushBlocked ? '⛔' : (dbs.lastPushOk ? '✅' : '⚠️');
+      const detail = dbs.pushBlocked
+        ? `${mark} ${dbs.driver} · ${dbs.target} — push blocked: ${dbs.blockedReason}`
+        : `${mark} ${dbs.driver} · ${dbs.target} · ${dbs.lastPushOk ? `last push ${age}` : (dbs.lastError ? `last push fail: ${String(dbs.lastError).slice(0, 70)}` : 'push pending')}`;
+      lines.push(field('💾 Database', detail));
+      if (dbs.pendingOutbox) lines.push(sub('⚠️ Ek pending push hai (outbox) — retry chal raha hai.'));
+    } else {
+      lines.push(field('💾 Database', `⚠️ LINKED NAHI — sirf local file (restart = data loss)`));
+      lines.push(sub(dbs.blockedReason || 'GITHUB_VAULT_TOKEN (+VAULT_ENCRYPTION_KEY) ya KV_REST_URL/TOKEN set karo'));
+    }
+  } catch { lines.push(field('💾 Database', '—')); }
+  // 📋 Used numbers — OTP consume hone wale numbers ka blocklist (cooldown).
+  try {
+    const used = getUsedNumbersSummary();
+    lines.push(field('📋 Used numbers', `${used.total} ledger · ${used.blocked} blocked (${used.cooldownDays}d cooldown) · ${used.permanent} permanent`));
+    lines.push(sub('Blocked number ka OTP dobara nahi lita — cooldown ke baad unlock ho jata hai.'));
+  } catch { lines.push(field('📋 Used numbers', '—')); }
   {
     const ka = keepAliveHandle?.getState?.() || { enabled: false, reason: 'not-started' };
     const lastOk = ka.lastSuccessAt
@@ -4223,6 +4255,72 @@ try {
   if (hydrated) console.log(`[FreshBot] Cloud vault hydrate: ${hydrated.restored}/${hydrated.total} accounts wapas aaye.`);
 } catch (e) {
   console.warn('[FreshBot] Cloud vault hydrate skipped:', e?.message || e);
+}
+
+// ---------------------------------------------------------------------------
+// 💾 LINKED DATABASE hydrate — DB ko durable store se bind karo.
+//
+// Render free disk / GitHub Actions runner par `data/db.json` har restart
+// par mit jata hai (accounts, settings, number-ledger, Firebase source list).
+// Isi liye DB ka linked store (GitHub vault / Vercel KV / DB_STORE) se boot
+// par sab kuch wapas aata hai.
+//
+// ⚠️ 12s timeout ke baad bhi local db ko khaali chhodkar aage nahi badhte —
+// pehle ka behaviour me timeout par bot khali db par chalta tha aur pehli
+// push se remote DB WIPE ho jata tha (asli data loss).
+// ---------------------------------------------------------------------------
+try {
+  const linkStatus0 = getDbLinkStatus();
+  if (linkStatus0.linked) {
+    const linked = await Promise.race([
+      hydrateFromLinkedDb(),
+      sleepMs(20_000).then(() => null),
+    ]);
+    if (linked) {
+      console.log(`[FreshBot] 💾 Linked DB (${linkStatus0.driver}) hydrate: ${linked.restored}/${linked.total} accounts wapas aaye.`);
+    } else {
+      console.warn(`[FreshBot] 💾 Linked DB (${linkStatus0.driver}) hydrate timeout — remote data merge push se protect rahega.`);
+    }
+  } else {
+    console.warn('[FreshBot] ⚠️ DB LINKED nahi hai — accounts/settings sirf local file me hain (restart = data loss). `npm run doctor` dekho.');
+  }
+} catch (e) {
+  console.warn('[FreshBot] Linked DB hydrate skipped:', e?.message || e);
+}
+
+// Failed push ko retry (outbox + 60s tick) — network jhatke me data mat lo.
+try { startLinkedDbRetry(); } catch {}
+
+// ---------------------------------------------------------------------------
+// 📋 Used-numbers seed — owner ki list (seed/used-numbers.json) ka import.
+//
+// Ye numbers cooldown window tak block hote hain (OTP dobara nahi lena).
+// Har instance par boot par lagta hai, taaki Render/GH Actions dono par
+// wahi list ho. 30 din baad unlock ho jate hain (seed window expire).
+// ---------------------------------------------------------------------------
+try {
+  const seeded = seedUsedNumbersFromSeedFile();
+  if (seeded?.present) {
+    console.log(
+      `[FreshBot] 📋 Used-numbers seed: ${seeded.added} naye block, ${seeded.kept} pehle se block, ` +
+      `${seeded.skipped} skip · ledger ${seeded.total} numbers${seeded.seedActive ? '' : ' (seed window expire — naye add nahi hue)'}`
+    );
+  } else {
+    console.warn(`[FreshBot] 📋 Used-numbers seed: file nahi mili (${seeded?.file || 'seed/used-numbers.json'})`);
+  }
+} catch (e) {
+  console.warn('[FreshBot] Used-numbers seed skipped:', e?.message || e);
+}
+
+// Expire ho chuke ledger entries hata do (ledger bounded rahe, vault file
+// chhoti rahe — warna 10k+ numbers par GitHub ka 1MB limit toot jata).
+try {
+  const trimmed = trimExpiredUsedNumbers();
+  if (trimmed.removed > 0) {
+    console.log(`[FreshBot] 🧹 Ledger trim: ${trimmed.removed} expire entries hataye (ab ${trimmed.remaining}).`);
+  }
+} catch (e) {
+  console.warn('[FreshBot] Ledger trim skipped:', e?.message || e);
 }
 
 // Saved OTP bot (Hermes / HardXotp) boot par hi apply karo — taaki /diag,

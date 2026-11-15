@@ -9,7 +9,9 @@
   },
   "scripts": {
     "start": "node fresh-bot.js",
-    "test": "node test_fresh_unit.mjs",
+    "test": "node test_fresh_unit.mjs && node test_db_link.mjs && node test_used_numbers.mjs",
+    "doctor": "node scripts/db-doctor.mjs",
+    "seed:used-numbers": "node scripts/seed-used-numbers.mjs",
     "inspect": "node scratch/firebase-inspect.mjs",
     "telegram:login": "node telegram-login.js",
     "telegram:check": "node telegram-login.js --check",
