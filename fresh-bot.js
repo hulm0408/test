@@ -66,7 +66,15 @@ const {
 const { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, _countDeviceOnlineStates } = await import('./firebase-numbers.js');
 const telegramOtp = await import('./telegram-otp-source.js');
 const { GoldDropClient, isGoldDropDailyOtpLimit, isGoldDropInvalidOtp, isGoldDropSecurityCheck, retryGoldDropSecurity, goldDropEmailForMobile } = await import('./gold-drop-client.js');
-const { parseWinningCodes, launchGoldDropChecker, checkGoldDropCode } = await import('./gold-drop-checker.js');
+// Checker is optional at startup: a missing checker dependency must not take
+// the entire bot down. Surface a clear error only when the checker is used.
+async function loadGoldDropChecker() {
+  try { return await import('./gold-drop-checker.js'); }
+  catch (error) {
+    console.error('[GoldDrop] Checker module unavailable:', error?.code || 'import error');
+    throw new Error('Code checker dependency missing ya broken hai; sahi build redeploy karein.');
+  }
+}
 const { readFile } = await import('node:fs/promises');
 let goldDropRunning = false;
 let goldDropRun = null;
@@ -1549,6 +1557,7 @@ async function startGoldChecker(ctx, source, codes) {
       section('🎟 Code checker', [field('Progress', `${done} / ${codes.length}`), field('Status', text)].join('\n')),
       kb([[{ text: '⏹ STOP', callback_data: 'gold_drop_stop' }]])).catch(() => {});
     telegramOtp.setActiveOtpBotProfile(source);
+    const { launchGoldDropChecker, checkGoldDropCode } = await loadGoldDropChecker();
     browser = await launchGoldDropChecker(findChromePath());
     for (const code of codes) {
       if (run.stop) break;
@@ -4201,12 +4210,13 @@ bot.on('document', async (ctx) => {
     if (!response.ok) throw new Error('File download failed');
     const bytes = await response.arrayBuffer();
     if (bytes.byteLength > 128 * 1024) throw new Error('File badi hai');
+    const { parseWinningCodes } = await loadGoldDropChecker();
     const codes = parseWinningCodes(new TextDecoder('utf-8', { fatal: true }).decode(bytes).replace(/^\uFEFF/, ''));
     pending.delete(uid);
     startGoldChecker(ctx, st.source, codes).catch(() => ctx.reply('⚠️ Code checker shuru nahi ho saka.').catch(() => {}));
   } catch {
     // The Telegram file URL embeds the bot token: never echo the underlying error.
-    await ctx.reply('File nahi padh paaya. Valid UTF-8 .txt mein 1–100 codes bhejein.').catch(() => {});
+    await ctx.reply('File nahi padh paaya ya checker available nahi hai. Valid UTF-8 .txt bhejein aur build check karein.').catch(() => {});
   }
 });
 
@@ -4221,6 +4231,7 @@ bot.on('text', async (ctx) => {
   if (st.action === 'gold_checker_codes') {
     if (ctx.chat?.type !== 'private') return;
     try {
+      const { parseWinningCodes } = await loadGoldDropChecker();
       const codes = parseWinningCodes(txt);
       pending.delete(uid);
       startGoldChecker(ctx, st.source, codes).catch(() => ctx.reply('⚠️ Code checker shuru nahi ho saka.').catch(() => {}));
