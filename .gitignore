@@ -32,3 +32,8 @@ telegram-api.json
 
 # 🗂 Session JSON files (login ke baad banti hain) — credentials, git me kabhi nahi.
 data/session-files/
+
+# Gold Drop stealth worker (Python) — local venv / bytecode / runtime folders
+.venv-golddrop/
+__pycache__/
+downloaded_files/

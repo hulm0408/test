@@ -13,3 +13,8 @@ data
 test-data
 scratch
 *.log
+
+# Gold Drop stealth worker — local Python venv / bytecode image me nahi jaana
+.venv-golddrop
+__pycache__
+downloaded_files

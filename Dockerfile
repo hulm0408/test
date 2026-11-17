@@ -25,6 +25,24 @@ ENV NODE_ENV=production \
     PUPPETEER_SKIP_DOWNLOAD=true \
     PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
 
+# ── Gold Drop stealth stack (SeleniumBase CDP mode + Playwright) ──
+# Checker (gold-drop-checker.js) ka default engine ab Python worker
+# (gold_drop_stealth.py) hai: SeleniumBase stealthy Chrome launch karti hai,
+# endpoint_url deti hai, aur Playwright connect_over_cdp se drive hota hai.
+# Playwright ko APNA browser download karne ki zaroorat NAHI hai — wo isi
+# image ke google-chrome-stable se CDP par judta hai. xvfb optional headed
+# mode ke liye (GOLD_DROP_HEADED=1), jo Turnstile ke liye zyada human lagta hai.
+RUN set -eux; \
+    apt-get -o Acquire::Retries=3 update; \
+    apt-get install -y --no-install-recommends python3 python3-venv xvfb; \
+    rm -rf /var/lib/apt/lists/*; \
+    python3 -m venv /opt/golddrop-venv; \
+    /opt/golddrop-venv/bin/pip install --no-cache-dir --upgrade pip; \
+    /opt/golddrop-venv/bin/pip install --no-cache-dir seleniumbase playwright; \
+    /opt/golddrop-venv/bin/sbase get uc_driver || echo "uc_driver abhi nahi mila — pehli run par download hoga"
+
+ENV GOLD_DROP_PYTHON=/opt/golddrop-venv/bin/python
+
 WORKDIR /app
 
 # Pehle sirf package files (layer cache — code badle par npm dobara na chale)
@@ -42,6 +60,11 @@ COPY . .
 # Fail the image build, not the running service, if the optional checker has
 # a missing production dependency. Never launch the bot or contact Telegram here.
 RUN node --input-type=module -e "const m = await import('./gold-drop-checker.js'); if (typeof m.launchGoldDropChecker !== 'function' || typeof m.checkGoldDropCode !== 'function') throw new Error('Gold Drop checker API missing'); console.log('Gold Drop checker dependencies and API OK')"
+
+# Stealth worker (SeleniumBase CDP + Playwright) ka syntax + classification
+# selftest bhi build par hi verify ho jaye — browser launch yahan NAHI hota.
+RUN /opt/golddrop-venv/bin/python -m py_compile gold_drop_stealth.py \
+    && /opt/golddrop-venv/bin/python gold_drop_stealth.py --selftest
 
 # data/ = bot ka db (settings/accounts). Render par persistent disk yahin
 # mount hoga (render.yaml dekho) — bina disk ke ye folder har deploy par
