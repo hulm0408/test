@@ -32,6 +32,9 @@ assert.equal(isNewGoldDropReward(sample, []), true);
 assert.equal(isNewGoldDropReward(sample, [`1|${sample}`]), false);
 assert.equal(isNewGoldDropReward(sample.replace('05:21', '05:22'), [`1|${sample}`]), false);
 assert.equal(extractGoldDropReward('OTP 123456, registration success'), null);
+assert.deepEqual(extractGoldDropReward('[VK-BGCITY-S] Your reward code: ABC12345. Redeem now'), { code: 'ABC12345', sms: '[VK-BGCITY-S] Your reward code: ABC12345. Redeem now' });
+assert.deepEqual(extractGoldDropReward('[VK-BGCITY-S] Your reward code is\nAB12CD34. Visit the site\nTIME: 5:21'), { code: 'AB12CD34', sms: '[VK-BGCITY-S] Your reward code is\nAB12CD34. Visit the site' });
+assert.equal(extractGoldDropReward('Your OTP code is 123456'), null);
 assert.equal(goldDropEmailForMobile('itsnoob012@gmail.com', '9876543210', () => 0), 'itsnoob012+987654@gmail.com');
 assert.equal(goldDropEmailForMobile('itsnoob012@gmail.com', '9876543210', n => n - 1), 'itsnoob012+012345@gmail.com');
 assert.throws(() => goldDropEmailForMobile('not-an-email', '9876543210'), /Invalid/);
@@ -39,6 +42,7 @@ assert.throws(() => goldDropEmailForMobile('itsnoob012@gmail.com', '123'), /Inva
 const limitMessage = 'Your OTP limit for today is exhausted. Please try again tomorrow';
 assert.equal(isGoldDropDailyOtpLimit(new Error(`Gold Drop HTTP 400: ${limitMessage}`)), true);
 assert.equal(isGoldDropDailyOtpLimit(new Error(limitMessage)), true);
+assert.equal(isGoldDropDailyOtpLimit(new Error('Gold Drop HTTP 400: Please try again tomorrow using the same number')), true);
 assert.equal(isGoldDropDailyOtpLimit(new Error('Gold Drop HTTP 429: Too many requests')), false);
 assert.equal(isGoldDropDailyOtpLimit(new Error('fetch failed')), false);
 for (const status of [200, 400]) {

@@ -25,7 +25,7 @@ export function goldDropEmailForMobile(email, mobile, randomIndex = randomInt) {
 // Other failures (including unknown rate limits or network errors) remain fatal.
 export function isGoldDropDailyOtpLimit(error) {
   const message = String(error?.message || '').replace(/^Gold Drop HTTP \d+:\s*/i, '').trim();
-  return /^Your OTP limit for today is exhausted\. Please try again tomorrow\.?$/i.test(message);
+  return /^(?:Your OTP limit for today is exhausted\.\s*)?Please try again tomorrow(?: using the same number)?[.!]?$/i.test(message);
 }
 
 export function signGoldDropPayload(fields, dataKey, userKey, timestamp = String(Date.now())) {
