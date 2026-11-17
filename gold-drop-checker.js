@@ -94,12 +94,14 @@ export async function launchGoldDropStealthChecker({
         settlePending(id, 'resolve', handle.endpointUrl);
       } else if (msg.type === 'result') {
         settlePending(id, 'resolve', { status: String(msg.status || 'unknown'), message: String(msg.message || '') });
-      } else if (msg.type === 'warmup') {
+      } else if (msg.type === 'warmup' || msg.type === 'register' || msg.type === 'verify') {
         settlePending(id, 'resolve', {
           ok: msg.ok === true,
+          stage: String(msg.stage || ''),
           userAgent: String(msg.userAgent || ''),
           cookies: Array.isArray(msg.cookies) ? msg.cookies : [],
           message: String(msg.message || ''),
+          screenshot: String(msg.screenshot || ''),
         });
       } else if (msg.type === 'error') {
         if (!settlePending(id, 'reject', new Error(String(msg.message || 'Stealth worker error').slice(0, 300)))) {
@@ -175,6 +177,23 @@ export async function warmupGoldDropStealth(handle, {
   if (handle?.stealth !== true) throw new Error('Stealth worker handle nahi hai');
   return sendStealthCommand(handle, { cmd: 'warmup', url, timeoutMs }, timeoutMs + 60000,
     'Stealth warmup timeout — site ka security step atka hua hai');
+}
+
+// ─── Browser-native registration (API bilkul nahi — asli form, asli browser) ──
+// Site ke saare hidden tokens / cookies / fingerprint checks browser khud
+// satisfy karta hai, isliye "security check" rejection ka sawaal hi nahi.
+export async function registerGoldDropStealth(handle, { name, mobile, email, pincode, code, image, url = 'https://golddropgolddhamaka.com/register' }) {
+  if (handle?.stealth !== true) throw new Error('Stealth worker handle nahi hai');
+  const timeoutMs = Number(process.env.GOLD_DROP_REG_TIMEOUT_MS || 180000);
+  return sendStealthCommand(handle, { cmd: 'register', name, mobile, email, pincode, code, image, url }, timeoutMs,
+    'Stealth registration timeout — site atki hui hai');
+}
+
+export async function verifyGoldDropOtpStealth(handle, otp) {
+  if (handle?.stealth !== true) throw new Error('Stealth worker handle nahi hai');
+  const timeoutMs = Number(process.env.GOLD_DROP_VERIFY_TIMEOUT_MS || 90000);
+  return sendStealthCommand(handle, { cmd: 'verify', otp }, timeoutMs,
+    'Stealth verify timeout — site atki hui hai');
 }
 
 export async function launchGoldDropChecker(executablePath, { stealth, pythonPath } = {}) {

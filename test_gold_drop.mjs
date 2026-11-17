@@ -8,7 +8,7 @@ import { GoldDropClient, goldDropEmailForMobile, isGoldDropDailyOtpLimit, isGold
 import { GoldDropCookieJar } from './gold-drop-cookies.js';
 import { extractGoldDropReward, isNewGoldDropReward, findFreshGoldDropReward } from './gold-drop-rewards.js';
 import { parseTelegramNumberCard } from './telegram-otp-source.js';
-import { parseWinningCodes, checkGoldDropCode, launchGoldDropChecker, launchGoldDropStealthChecker, warmupGoldDropStealth } from './gold-drop-checker.js';
+import { parseWinningCodes, checkGoldDropCode, launchGoldDropChecker, launchGoldDropStealthChecker, warmupGoldDropStealth, registerGoldDropStealth, verifyGoldDropOtpStealth } from './gold-drop-checker.js';
 
 const key = 'abcdefghijklmnopqrstuv';
 const signed = signGoldDropPayload({ otp: '123456' }, key, 'user', '1234');
@@ -210,6 +210,18 @@ for line in sys.stdin:
                             "path": "/", "secure": True, "expires": 2000000000},
                           {"name": "foreign", "value": "nope", "domain": ".other.example.com",
                             "path": "/", "secure": True, "expires": 2000000000}]})
+    elif kind == "register":
+        if cmd.get("mobile") == "9000000000":
+            send({"type": "register", "id": cmd.get("id"), "ok": False,
+                  "message": "Your OTP limit for today is exhausted. Please try again tomorrow."})
+        else:
+            send({"type": "register", "id": cmd.get("id"), "ok": True, "stage": "otp",
+                  "message": "Site ne OTP step dikhaya."})
+    elif kind == "verify":
+        if cmd.get("otp") == "000000":
+            send({"type": "verify", "id": cmd.get("id"), "ok": False, "message": "Invalid OTP, Please enter OTP"})
+        else:
+            send({"type": "verify", "id": cmd.get("id"), "ok": True, "message": "Site ne verify success dikhaya."})
     elif kind == "close":
         break
 sys.exit(0)
@@ -248,6 +260,20 @@ sys.exit(0)
   assert.equal(warmHeaders[0]['User-Agent'], 'FakeStealthUA/9.9');
   assert.equal(warmHeaders[0]['Accept-Language'], 'en-US,en;q=0.9');
   assert.match(warmHeaders[0].Cookie, /cf_clearance=abc123/);
+
+  // Browser-native registration: site ke messages verbatim aate hain, taaki
+  // daily-limit / invalid-OTP classification bilkul API flow jaisa rahe.
+  const regOk = await registerGoldDropStealth(warming, { name: 'Rahul Kumar', mobile: '9876543210', email: 'x@gmail.com', pincode: '509412', code: 'KKD2LS01261026', image: '' });
+  assert.equal(regOk.ok, true);
+  assert.equal(regOk.stage, 'otp');
+  const regLimited = await registerGoldDropStealth(warming, { name: 'Rahul Kumar', mobile: '9000000000', email: 'x@gmail.com', pincode: '509412', code: 'KKD2LS01261026', image: '' });
+  assert.equal(regLimited.ok, false);
+  assert.equal(isGoldDropDailyOtpLimit(new Error(regLimited.message)), true);
+  const verifyOk = await verifyGoldDropOtpStealth(warming, '123456');
+  assert.equal(verifyOk.ok, true);
+  const verifyBad = await verifyGoldDropOtpStealth(warming, '000000');
+  assert.equal(verifyBad.ok, false);
+  assert.equal(isGoldDropInvalidOtp(new Error(verifyBad.message)), true);
   await warming.close();
 
   // Asal worker protocol smoke test — ping/pong/close bina browser ke chalta
