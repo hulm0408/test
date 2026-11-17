@@ -1,6 +1,7 @@
 // Gold Drop API protocol based on the supplied PHP example. No automatic retries:
 // register/verify can create an entry and must not be repeated on a timeout.
 import { createHmac, randomInt, randomBytes } from 'node:crypto';
+import { GoldDropCookieJar } from './gold-drop-cookies.js';
 
 const BASE = 'https://golddropgolddhamaka.com/api';
 const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
@@ -87,6 +88,7 @@ export class GoldDropClient {
   constructor({ fetchImpl = fetch, base = BASE } = {}) {
     this.fetch = fetchImpl;
     this.base = base.replace(/\/$/, '');
+    this.cookieJar = new GoldDropCookieJar(this.base);
     this.userKey = '';
     this.dataKey = '';
   }
@@ -94,8 +96,11 @@ export class GoldDropClient {
   async request(path, body, contentType) {
     const headers = { Accept: 'application/json', Origin: 'https://golddropgolddhamaka.com', Referer: 'https://golddropgolddhamaka.com/register', 'X-Requested-With': 'lodu.hehe.com' };
     if (contentType) headers['Content-Type'] = contentType;
-    if (this.userKey) headers.Cookie = `gold-drop-id=${this.userKey}`;
-    const response = await this.fetch(`${this.base}${path}`, { method: 'POST', headers, body, signal: AbortSignal.timeout(45000) });
+    const url = `${this.base}${path}`;
+    const cookie = this.cookieJar.header(url, this.userKey);
+    if (cookie) headers.Cookie = cookie;
+    const response = await this.fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(45000) });
+    this.cookieJar.store(response.headers, url);
     const raw = await response.text();
     let data;
     try { data = unwrapGoldDropResponse(JSON.parse(raw)); } catch { data = { raw }; }
