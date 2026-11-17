@@ -8,7 +8,7 @@ import { GoldDropClient, goldDropEmailForMobile, isGoldDropDailyOtpLimit, isGold
 import { GoldDropCookieJar } from './gold-drop-cookies.js';
 import { extractGoldDropReward, isNewGoldDropReward, findFreshGoldDropReward } from './gold-drop-rewards.js';
 import { parseTelegramNumberCard } from './telegram-otp-source.js';
-import { parseWinningCodes, checkGoldDropCode, launchGoldDropChecker, launchGoldDropStealthChecker } from './gold-drop-checker.js';
+import { parseWinningCodes, checkGoldDropCode, launchGoldDropChecker, launchGoldDropStealthChecker, warmupGoldDropStealth } from './gold-drop-checker.js';
 
 const key = 'abcdefghijklmnopqrstuv';
 const signed = signGoldDropPayload({ otp: '123456' }, key, 'user', '1234');
@@ -29,6 +29,8 @@ await client.bootstrap({ zip: '509412' });
 await client.register({ name: 'Rahul Kumar', mobile: '9876543210', email: 'x@example.com', pincode: '509412', code: 'KKD2LS01261026', image: Buffer.from('photo') });
 await client.verifyOtp('123456');
 assert.equal(calls.length, 4);
+// Bina stealth warmup ke koi browser User-Agent nahi jaata (purana behavior).
+assert.equal(calls[0].options.headers['User-Agent'], undefined);
 assert.equal(calls[2].options.headers.Cookie, 'gold-drop-id=u');
 assert.match(calls[2].options.body.toString(), /name="img"; filename="pack.jpg"/);
 assert.match(calls[3].url, /\/users\/verify-otp\/u\?t=/);
@@ -60,6 +62,22 @@ assert.equal(jar.header('https://example.com/apix'), '');
 const removed = new Headers(); removed.append('set-cookie', 'x=; Path=/api; Max-Age=0');
 jar.store(removed, 'https://example.com/api/users');
 assert.equal(jar.header('https://example.com/api/users'), '');
+// importCookies: stealth warmup ke browser cookies (Playwright/CDP format)
+const warmJar = new GoldDropCookieJar('https://golddropgolddhamaka.com/api');
+const importedCount = warmJar.importCookies([
+  { name: 'cf_clearance', value: 'tok123', domain: '.golddropgolddhamaka.com', path: '/', secure: true, expires: 2000000000 },
+  { name: 'session_cookie', value: 's1', domain: 'golddropgolddhamaka.com', path: '/api', secure: true, expires: -1 },
+  { name: 'expired_one', value: 'x', domain: '.golddropgolddhamaka.com', path: '/', secure: true, expires: 1000 },
+  { name: 'foreign', value: 'x', domain: '.other.example.com', path: '/', secure: true, expires: 2000000000 },
+  { name: 'parent', value: 'x', domain: '.example.com', path: '/', secure: true, expires: 2000000000 },
+  { name: 'bad name!', value: 'x', domain: '.golddropgolddhamaka.com', path: '/', secure: false, expires: 2000000000 },
+]);
+assert.equal(importedCount, 2);
+assert.match(warmJar.header('https://golddropgolddhamaka.com/api/users'), /cf_clearance=tok123/);
+assert.match(warmJar.header('https://golddropgolddhamaka.com/api/users'), /session_cookie=s1/);
+assert.doesNotMatch(warmJar.header('https://golddropgolddhamaka.com/api/users'), /foreign|parent|expired_one|bad name/);
+assert.equal(warmJar.header('https://other.example.com/api/users'), '');
+assert.equal(warmJar.header('http://golddropgolddhamaka.com/api/users'), ''); // secure cookies http par nahi
 await assert.rejects(client.verifyOtp('123'), /six digits/);
 const sample = '▪️ ʟᴀꜱᴛ ꜱᴍꜱ\n[VK-BGCITY-S] Success! Your Reward Code is 7E8RJ9MMYFWA. Please visit https://www.go\nᴛɪᴍᴇ: 17-11-2026 | 05:21 pm';
 assert.deepEqual(extractGoldDropReward(sample), { code: '7E8RJ9MMYFWA', sms: '[VK-BGCITY-S] Success! Your Reward Code is 7E8RJ9MMYFWA. Please visit https://www.go' });
@@ -186,6 +204,12 @@ for line in sys.stdin:
         if cmd.get("code") == "CRASH":
             os._exit(3)
         send({"type": "result", "id": cmd.get("id"), "status": "otp_sent", "message": "fake:" + str(cmd.get("code"))})
+    elif kind == "warmup":
+        send({"type": "warmup", "id": cmd.get("id"), "ok": True, "userAgent": "FakeStealthUA/9.9",
+              "cookies": [{"name": "cf_clearance", "value": "abc123", "domain": ".golddropgolddhamaka.com",
+                            "path": "/", "secure": True, "expires": 2000000000},
+                          {"name": "foreign", "value": "nope", "domain": ".other.example.com",
+                            "path": "/", "secure": True, "expires": 2000000000}]})
     elif kind == "close":
         break
 sys.exit(0)
@@ -205,6 +229,26 @@ sys.exit(0)
   await assert.rejects(checkGoldDropCode(crashing, { code: 'CRASH', name: 'x', mobile: '9876543210' }), /band ho gaya/);
   await assert.rejects(checkGoldDropCode(crashing, { code: 'ABC123', name: 'x', mobile: '9876543210' }), /band hai/);
   await crashing.close();
+
+  // Warmup: clearance cookies + browser UA wapas aate hain, foreign cookie
+  // jar reject karti hai, aur API client unke saath security-check-free chalta hai.
+  const warming = await launchGoldDropStealthChecker({ pythonPath: python3, workerPath: fakeWorker });
+  const warm = await warmupGoldDropStealth(warming);
+  assert.equal(warm.ok, true);
+  assert.equal(warm.userAgent, 'FakeStealthUA/9.9');
+  assert.equal(warm.cookies.length, 2);
+  const warmHeaders = [];
+  const warmClient = new GoldDropClient({ fetchImpl: async (url, options) => {
+    warmHeaders.push(options.headers);
+    return new Response(JSON.stringify({ userKey: 'u', dataKey: key }), { status: 200 });
+  } });
+  assert.equal(warmClient.importSessionCookies(warm.cookies), 1); // foreign rejected
+  warmClient.setUserAgent(warm.userAgent);
+  await warmClient.bootstrap({ zip: '509412' });
+  assert.equal(warmHeaders[0]['User-Agent'], 'FakeStealthUA/9.9');
+  assert.equal(warmHeaders[0]['Accept-Language'], 'en-US,en;q=0.9');
+  assert.match(warmHeaders[0].Cookie, /cf_clearance=abc123/);
+  await warming.close();
 
   // Asal worker protocol smoke test — ping/pong/close bina browser ke chalta
   // hai (seleniumbase/playwright sirf launch par import hote hain).

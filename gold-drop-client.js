@@ -85,16 +85,31 @@ export function unwrapGoldDropResponse(value) {
 }
 
 export class GoldDropClient {
-  constructor({ fetchImpl = fetch, base = BASE } = {}) {
+  constructor({ fetchImpl = fetch, base = BASE, userAgent = '' } = {}) {
     this.fetch = fetchImpl;
     this.base = base.replace(/\/$/, '');
     this.cookieJar = new GoldDropCookieJar(this.base);
     this.userKey = '';
     this.dataKey = '';
+    // Stealth warmup ka browser User-Agent — WAF clearance cookies UA-bound
+    // hoti hain, isliye browser aur API client ka UA same rakhna zaroori hai.
+    this.userAgent = String(userAgent || '');
+  }
+
+  setUserAgent(userAgent) {
+    this.userAgent = String(userAgent || '');
+  }
+
+  importSessionCookies(cookies) {
+    return this.cookieJar.importCookies(cookies);
   }
 
   async request(path, body, contentType) {
     const headers = { Accept: 'application/json', Origin: 'https://golddropgolddhamaka.com', Referer: 'https://golddropgolddhamaka.com/register', 'X-Requested-With': 'lodu.hehe.com' };
+    if (this.userAgent) {
+      headers['User-Agent'] = this.userAgent;
+      headers['Accept-Language'] = 'en-US,en;q=0.9';
+    }
     if (contentType) headers['Content-Type'] = contentType;
     const url = `${this.base}${path}`;
     const cookie = this.cookieJar.header(url, this.userKey);
