@@ -21,11 +21,20 @@ export function goldDropEmailForMobile(email, mobile, randomIndex = randomInt) {
   return `${match[1]}+${suffix}@${match[2]}`;
 }
 
-// Only this exact upstream response is eligible for moving to another number.
-// Other failures (including unknown rate limits or network errors) remain fatal.
+// Only known upstream OTP rejections should advance to another number.
+// Unknown rate limits and transport failures must not trigger a retry loop.
+function goldDropErrorMessage(error) {
+  return String(error?.message || '').replace(/^Gold Drop HTTP \d+:\s*/i, '').trim()
+    .replace(/^[\s"'“”‘’]+|[\s"'“”‘’]+$/g, '').trim();
+}
+
 export function isGoldDropDailyOtpLimit(error) {
-  const message = String(error?.message || '').replace(/^Gold Drop HTTP \d+:\s*/i, '').trim();
+  const message = goldDropErrorMessage(error);
   return /^(?:Your OTP limit for today is exhausted\.\s*)?Please try again tomorrow(?: using the same number)?[.!]?$/i.test(message);
+}
+
+export function isGoldDropInvalidOtp(error) {
+  return /^Invalid OTP(?:\s*[,.:!-]\s*Please enter OTP)?[.!]?$/i.test(goldDropErrorMessage(error));
 }
 
 export function signGoldDropPayload(fields, dataKey, userKey, timestamp = String(Date.now())) {
