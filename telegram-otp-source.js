@@ -19,7 +19,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { existsSync, readFileSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { normalizeIndianMobileNumber } from './phone-utils.js';
-import { extractGoldDropReward, isNewGoldDropReward } from './gold-drop-rewards.js';
+import { findFreshGoldDropReward } from './gold-drop-rewards.js';
 import { parseForwarderDateTime, _extractSixDigitCode } from './firebase-numbers.js';
 import * as roster from './telegram-account-roster.js';
 import { classifyTelegramError, accountStateLine } from './telegram-account-health.js';
@@ -1778,27 +1778,34 @@ export function _otpCandidateIsNewForTests(candidate, baseline) {
 export async function captureTelegramMessageBaseline() {
   return withTelegramLock(async () => {
     const messages = await fetchIncomingUnlocked(otpScanLimit());
-    return messages.map(message => `${messageId(message)}|${messageText(message)}`);
+    const tracked = await fetchTrackedMessagesUnlocked(messages);
+    return [...messages, ...tracked].map(message => `${messageId(message)}|${messageText(message)}`);
   });
 }
 
-export async function waitForGoldDropReward(phone, { baseline = [], timeoutMs = 10000 } = {}) {
+export async function waitForGoldDropReward(phone, { baseline = [], deliveredCodes = [], timeoutMs = 10000 } = {}) {
   return withTelegramLock(async () => {
-    const seen = new Set(baseline);
     const deadline = Date.now() + timeoutMs;
     let attempt = 0;
-    while (Date.now() < deadline) {
-      await refreshHermesChatUnlocked({ phone, attempt: ++attempt });
+    const scan = async () => {
       const recent = await fetchIncomingUnlocked(otpScanLimit());
       const tracked = await fetchTrackedMessagesUnlocked(recent);
-      for (const message of [...recent, ...tracked]) {
-        const text = messageText(message);
-        const cardPhone = parseTelegramNumberCard(text)?.phone || '';
-        if (cardPhone && cardPhone !== phone) continue;
-        if (seen.has(`${messageId(message)}|${text}`)) continue;
-        if (isNewGoldDropReward(text, baseline)) return extractGoldDropReward(text);
-      }
+      return findFreshGoldDropReward([...recent, ...tracked].map(message => ({
+        id: messageId(message), text: messageText(message),
+      })), {
+        phone, baseline, deliveredCodes,
+        cardPhoneOf: text => parseTelegramNumberCard(text)?.phone || '',
+      });
+    };
+    // Scan before refreshing; also scan once after the final refresh even if a
+    // slow Telegram request has used the remaining time budget.
+    let reward = await scan();
+    if (reward) return reward;
+    while (Date.now() < deadline) {
+      await refreshHermesChatUnlocked({ phone, attempt: ++attempt });
       await sleep(Math.min(1000, Math.max(0, deadline - Date.now())));
+      reward = await scan();
+      if (reward) return reward;
     }
     return '';
   });

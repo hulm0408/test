@@ -16,3 +16,20 @@ export function isNewGoldDropReward(text, baseline = []) {
   if (!reward) return false;
   return !baseline.some(old => extractGoldDropReward(old)?.code === reward.code);
 }
+
+// Cards can be edited in place. Compare content and reward codes, not just IDs,
+// and reject explicitly different numbers and codes already delivered this run.
+export function findFreshGoldDropReward(messages, { phone, baseline = [], deliveredCodes = [], cardPhoneOf = () => '' } = {}) {
+  const priorMessages = new Set(baseline);
+  const delivered = new Set(deliveredCodes);
+  for (const message of messages) {
+    const text = String(message.text || '');
+    const cardPhone = cardPhoneOf(text);
+    if (cardPhone && cardPhone !== phone) continue;
+    if (priorMessages.has(`${message.id}|${text}`)) continue;
+    const reward = extractGoldDropReward(text);
+    if (!reward || delivered.has(reward.code) || !isNewGoldDropReward(text, baseline)) continue;
+    return reward;
+  }
+  return null;
+}

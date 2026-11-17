@@ -37,6 +37,33 @@ export function isGoldDropInvalidOtp(error) {
   return /^Invalid OTP(?:\s*[,.:!-]\s*Please enter OTP)?[.!]?$/i.test(goldDropErrorMessage(error));
 }
 
+export function isGoldDropSecurityCheck(error) {
+  return /^Please complete the security check to continue[.!]?$/i.test(goldDropErrorMessage(error));
+}
+
+// A security rejection may be temporary, but waiting does not solve a challenge.
+// Retry only this explicit rejection, never timeouts/unknown errors, and stop
+// after a bounded number of retries instead of repeatedly consuming numbers.
+export async function retryGoldDropSecurity(operation, {
+  maxRetries = 3, delayMs = 60000, shouldStop = () => false, onWait = async () => {},
+  sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
+} = {}) {
+  for (let retries = 0; ; retries++) {
+    if (shouldStop()) throw new Error('Gold Drop stopped');
+    try { return await operation(); } catch (error) {
+      if (!isGoldDropSecurityCheck(error) || retries >= maxRetries || shouldStop()) throw error;
+      await onWait(retries + 1, maxRetries);
+      let remaining = delayMs;
+      while (remaining > 0 && !shouldStop()) {
+        const ms = Math.min(1000, remaining);
+        await sleep(ms);
+        remaining -= ms;
+      }
+      if (shouldStop()) throw new Error('Gold Drop stopped');
+    }
+  }
+}
+
 export function signGoldDropPayload(fields, dataKey, userKey, timestamp = String(Date.now())) {
   const t = String(timestamp);
   const payload = b64(JSON.stringify({ ...fields, userKey: String(userKey), t }));
@@ -78,7 +105,7 @@ export class GoldDropClient {
 
   async bootstrap(ipInfo = {}) {
     const body = await this.request('/users', JSON.stringify({ ipInfo }), 'application/json');
-    if (!body?.userKey || !body?.dataKey) throw new Error('Gold Drop bootstrap did not return session keys');
+    if (!body?.userKey || !body?.dataKey) throw new Error(String(body?.message || 'Gold Drop bootstrap did not return session keys'));
     this.userKey = String(body.userKey);
     this.dataKey = String(body.dataKey);
     await this.request(`/users/get-start/${encodeURIComponent(this.userKey)}`, '', 'application/json');
