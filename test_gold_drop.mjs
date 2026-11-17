@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
-import { GoldDropClient, signGoldDropPayload, unwrapGoldDropResponse } from './gold-drop-client.js';
+import { GoldDropClient, goldDropEmailForMobile, isGoldDropDailyOtpLimit, signGoldDropPayload, unwrapGoldDropResponse } from './gold-drop-client.js';
 import { extractGoldDropReward, isNewGoldDropReward } from './gold-drop-rewards.js';
 
 const key = 'abcdefghijklmnopqrstuv';
@@ -32,4 +32,18 @@ assert.equal(isNewGoldDropReward(sample, []), true);
 assert.equal(isNewGoldDropReward(sample, [`1|${sample}`]), false);
 assert.equal(isNewGoldDropReward(sample.replace('05:21', '05:22'), [`1|${sample}`]), false);
 assert.equal(extractGoldDropReward('OTP 123456, registration success'), null);
+assert.equal(goldDropEmailForMobile('itsnoob012@gmail.com', '9876543210', () => 0), 'itsnoob012+987654@gmail.com');
+assert.equal(goldDropEmailForMobile('itsnoob012@gmail.com', '9876543210', n => n - 1), 'itsnoob012+012345@gmail.com');
+assert.throws(() => goldDropEmailForMobile('not-an-email', '9876543210'), /Invalid/);
+assert.throws(() => goldDropEmailForMobile('itsnoob012@gmail.com', '123'), /Invalid/);
+const limitMessage = 'Your OTP limit for today is exhausted. Please try again tomorrow';
+assert.equal(isGoldDropDailyOtpLimit(new Error(`Gold Drop HTTP 400: ${limitMessage}`)), true);
+assert.equal(isGoldDropDailyOtpLimit(new Error(limitMessage)), true);
+assert.equal(isGoldDropDailyOtpLimit(new Error('Gold Drop HTTP 429: Too many requests')), false);
+assert.equal(isGoldDropDailyOtpLimit(new Error('fetch failed')), false);
+for (const status of [200, 400]) {
+  const limited = new GoldDropClient({ fetchImpl: async () => new Response(JSON.stringify({ statusCode: 400, message: limitMessage }), { status }) });
+  limited.userKey = 'u'; limited.dataKey = key;
+  await assert.rejects(limited.register({ name: 'Rahul Kumar', mobile: '9876543210', email: 'x@example.com', pincode: '509412', code: 'KKD2LS01261026', image: Buffer.from('photo') }), isGoldDropDailyOtpLimit);
+}
 console.log('Gold Drop client and reward tests passed');
