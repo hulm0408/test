@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
-import { GoldDropClient, goldDropEmailForMobile, isGoldDropDailyOtpLimit, isGoldDropInvalidOtp, signGoldDropPayload, unwrapGoldDropResponse } from './gold-drop-client.js';
-import { extractGoldDropReward, isNewGoldDropReward } from './gold-drop-rewards.js';
+import { GoldDropClient, goldDropEmailForMobile, isGoldDropDailyOtpLimit, isGoldDropInvalidOtp, isGoldDropSecurityCheck, retryGoldDropSecurity, signGoldDropPayload, unwrapGoldDropResponse } from './gold-drop-client.js';
+import { extractGoldDropReward, isNewGoldDropReward, findFreshGoldDropReward } from './gold-drop-rewards.js';
+import { parseTelegramNumberCard } from './telegram-otp-source.js';
+import { parseWinningCodes, checkGoldDropCode } from './gold-drop-checker.js';
 
 const key = 'abcdefghijklmnopqrstuv';
 const signed = signGoldDropPayload({ otp: '123456' }, key, 'user', '1234');
@@ -35,6 +37,14 @@ assert.equal(extractGoldDropReward('OTP 123456, registration success'), null);
 assert.deepEqual(extractGoldDropReward('[VK-BGCITY-S] Your reward code: ABC12345. Redeem now'), { code: 'ABC12345', sms: '[VK-BGCITY-S] Your reward code: ABC12345. Redeem now' });
 assert.deepEqual(extractGoldDropReward('[VK-BGCITY-S] Your reward code is\nAB12CD34. Visit the site\nTIME: 5:21'), { code: 'AB12CD34', sms: '[VK-BGCITY-S] Your reward code is\nAB12CD34. Visit the site' });
 assert.equal(extractGoldDropReward('Your OTP code is 123456'), null);
+const hathiCard = '━[ 📞 ʏᴏᴜʀ ɴᴜᴍʙᴇʀ ]━\n────────────────────\n📞 ɴᴜᴍʙᴇʀ: +91 70025 99623\n🟢 ꜱᴛᴀᴛᴜꜱ: ᴀᴄᴛɪᴠᴇ\n📱 ᴅᴇᴠɪᴄᴇ: RMX1827\n\n▪ ʟᴀꜱᴛ ꜱᴍꜱ\n[JX-BGCITY-S] Success! Your Reward Code is 7EKMXEY3R3H3. Please visit https://www.go\nᴛɪᴍᴇ: 17-11-2026 | 06:47 PM\n\n━ ⚡ HATHIX OTP ━';
+assert.equal(parseTelegramNumberCard(hathiCard)?.phone, '7002599623');
+const cardPhoneOf = text => parseTelegramNumberCard(text)?.phone || '';
+const hathiReward = { code: '7EKMXEY3R3H3', sms: '[JX-BGCITY-S] Success! Your Reward Code is 7EKMXEY3R3H3. Please visit https://www.go' };
+assert.deepEqual(findFreshGoldDropReward([{ id: 10, text: hathiCard }], { phone: '7002599623', baseline: ['10|old OTP card'], cardPhoneOf }), hathiReward);
+assert.equal(findFreshGoldDropReward([{ id: 10, text: hathiCard }], { phone: '9999999999', baseline: [], cardPhoneOf }), null);
+assert.equal(findFreshGoldDropReward([{ id: 10, text: hathiCard }], { phone: '7002599623', baseline: [`10|${hathiCard}`], cardPhoneOf }), null);
+assert.equal(findFreshGoldDropReward([{ id: 10, text: hathiCard }], { phone: '7002599623', deliveredCodes: new Set(['7EKMXEY3R3H3']), cardPhoneOf }), null);
 assert.equal(goldDropEmailForMobile('itsnoob012@gmail.com', '9876543210', () => 0), 'itsnoob012+987654@gmail.com');
 assert.equal(goldDropEmailForMobile('itsnoob012@gmail.com', '9876543210', n => n - 1), 'itsnoob012+012345@gmail.com');
 assert.throws(() => goldDropEmailForMobile('not-an-email', '9876543210'), /Invalid/);
@@ -60,4 +70,51 @@ for (const status of [200, 400]) {
   invalid.userKey = 'u'; invalid.dataKey = key;
   await assert.rejects(invalid.verifyOtp('123456'), isGoldDropInvalidOtp);
 }
-console.log('Gold Drop client and reward tests passed');
+const securityMessage = 'Please complete the security check to continue.';
+assert.equal(isGoldDropSecurityCheck(new Error(`Gold Drop HTTP 400: ${securityMessage}`)), true);
+assert.equal(isGoldDropSecurityCheck(new Error('fetch failed')), false);
+for (const status of [200, 400]) {
+  const blocked = new GoldDropClient({ fetchImpl: async () => new Response(JSON.stringify({ statusCode: 400, message: securityMessage }), { status }) });
+  await assert.rejects(blocked.bootstrap({ zip: '509412' }), isGoldDropSecurityCheck);
+  blocked.userKey = 'u'; blocked.dataKey = key;
+  await assert.rejects(blocked.register({ name: 'Rahul Kumar', mobile: '9876543210', email: 'x@example.com', pincode: '509412', code: 'KKD2LS01261026', image: Buffer.from('photo') }), isGoldDropSecurityCheck);
+}
+assert.deepEqual(parseWinningCodes('ABC123\nxyz987 ABC123'), ['ABC123', 'XYZ987']);
+assert.throws(() => parseWinningCodes('bad/code'), /letters\/digits/);
+assert.throws(() => parseWinningCodes('A'.repeat(13)), /12 characters/);
+function mockCheckerPage({ security = true, view = { body: '', errors: [], otpField: true } } = {}) {
+  const clicks = [];
+  const page = {
+    goto: async () => {}, waitForSelector: async () => {}, type: async () => {},
+    $eval: async () => false, click: async selector => { clicks.push(selector); },
+    waitForFunction: async () => { if (!security) throw new Error('timeout'); },
+    waitForNavigation: async () => {}, evaluate: async () => view, close: async () => {},
+  };
+  return { browser: { newPage: async () => page }, clicks };
+}
+const allowed = mockCheckerPage();
+assert.equal((await checkGoldDropCode(allowed.browser, { code: 'ABC123', name: 'Rahul Kumar', mobile: '9876543210' })).status, 'otp_sent');
+assert.equal(allowed.clicks.includes('#enbBtn'), true);
+const blocked = mockCheckerPage({ security: false });
+assert.equal((await checkGoldDropCode(blocked.browser, { code: 'ABC123', name: 'Rahul Kumar', mobile: '9876543210' })).status, 'security_check');
+assert.equal(blocked.clicks.includes('#enbBtn'), false);
+const rejected = mockCheckerPage({ view: { body: '', errors: ['Invalid winning code'], otpField: false } });
+assert.equal((await checkGoldDropCode(rejected.browser, { code: 'ABC123', name: 'Rahul Kumar', mobile: '9876543210' })).message, 'Invalid winning code');
+let attempts = 0, waited = 0, waitNotices = 0;
+assert.equal(await retryGoldDropSecurity(async () => {
+  if (++attempts < 3) throw new Error(securityMessage);
+  return 'ok';
+}, { delayMs: 60000, sleep: async ms => { waited += ms; }, onWait: async () => { waitNotices++; } }), 'ok');
+assert.equal(attempts, 3);
+assert.equal(waited, 120000);
+assert.equal(waitNotices, 2);
+let blockedAttempts = 0;
+await assert.rejects(retryGoldDropSecurity(async () => { blockedAttempts++; throw new Error(securityMessage); }, { maxRetries: 3, delayMs: 1, sleep: async () => {} }), isGoldDropSecurityCheck);
+assert.equal(blockedAttempts, 4);
+let otherAttempts = 0;
+await assert.rejects(retryGoldDropSecurity(async () => { otherAttempts++; throw new Error('network error'); }, { sleep: async () => {} }), /network error/);
+assert.equal(otherAttempts, 1);
+let stopped = false, cancelledAttempts = 0;
+await assert.rejects(retryGoldDropSecurity(async () => { cancelledAttempts++; throw new Error(securityMessage); }, { shouldStop: () => stopped, sleep: async () => { stopped = true; } }), /stopped/);
+assert.equal(cancelledAttempts, 1);
+console.log('Gold Drop client, reward and checker tests passed');

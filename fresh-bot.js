@@ -65,7 +65,8 @@ const {
 } = await import('./autopilot-engine.js');
 const { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, _countDeviceOnlineStates } = await import('./firebase-numbers.js');
 const telegramOtp = await import('./telegram-otp-source.js');
-const { GoldDropClient, isGoldDropDailyOtpLimit, isGoldDropInvalidOtp, goldDropEmailForMobile } = await import('./gold-drop-client.js');
+const { GoldDropClient, isGoldDropDailyOtpLimit, isGoldDropInvalidOtp, isGoldDropSecurityCheck, retryGoldDropSecurity, goldDropEmailForMobile } = await import('./gold-drop-client.js');
+const { parseWinningCodes, launchGoldDropChecker, checkGoldDropCode } = await import('./gold-drop-checker.js');
 const { readFile } = await import('node:fs/promises');
 let goldDropRunning = false;
 let goldDropRun = null;
@@ -79,6 +80,7 @@ const bs = await import('./bot-settings.js');
 const proxyPool = await import('./proxy-pool.js');
 const {
   getChromeStatus,
+  findChromePath,
   getSwiggyAccountJwtSessionInfo,
   refreshSavedSwiggySession,
   SWIGGY_LONG_SESSION_MIN_MS,
@@ -356,6 +358,7 @@ function summaryCard(snap) {
 
 const startRows = () => [
   [{ text: '🟡 Gold Drop offer', callback_data: 'gold_drop_offer' }],
+  [{ text: '🎟 Code checker', callback_data: 'gold_checker_open' }],
   [{ text: '▶️ START BATCH', callback_data: 'ap_start', style: 'success' }],
   [{ text: '📊 Status', callback_data: 'ap_status' }, { text: '⚙️ Settings', callback_data: 'ap_settings' }],
 ];
@@ -368,6 +371,7 @@ const stopRows = () => [
 ];
 const idleRows = () => [
   [{ text: '🟡 Gold Drop offer', callback_data: 'gold_drop_offer' }],
+  [{ text: '🎟 Code checker', callback_data: 'gold_checker_open' }],
   [{ text: '▶️ START BATCH', callback_data: 'ap_start', style: 'success' }],
   [{ text: '📊 Status', callback_data: 'ap_status' }, { text: '⚙️ Settings', callback_data: 'ap_settings' }],
 ];
@@ -1500,6 +1504,81 @@ bot.action('gold_drop_offer', async (ctx) => {
   ])).catch(() => {});
 });
 
+// Voucher checker: only the official form is used; the site performs its own
+// Turnstile check. User explicitly accepts the redemption site's terms.
+bot.action('gold_checker_open', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  if (ctx.chat?.type !== 'private') return ctx.answerCbQuery('Private chat mein kholen.', { show_alert: true }).catch(() => {});
+  await ctx.answerCbQuery().catch(() => {});
+  await ctx.reply(section('🎟 Gold Drop code checker', [
+    'Codes check karne ke liye official site par GET OTP submit hoga; OTP verify nahi hoga.',
+    'Har code ke liye selected OTP bot ka number use hoga. Website ke security check ke bina submit nahi hoga.',
+    'Source button dabane se aap redemption website ki terms accept karte hain.',
+  ].join('\n')), kb([
+    [{ text: '📨 Hermes', callback_data: 'gold_checker_source_hermes' }, { text: '🐘 Hathi', callback_data: 'gold_checker_source_hathi' }],
+    [{ text: '🔐 HardXotp', callback_data: 'gold_checker_source_chauhan' }],
+    [{ text: '📄 Terms padhein', url: 'https://www.golddropwins.com/terms-and-conditions' }],
+    [{ text: '🏠 Home', callback_data: 'ap_home' }],
+  ])).catch(() => {});
+});
+
+bot.action(/^gold_checker_source_(hermes|hathi|chauhan)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  if (ctx.chat?.type !== 'private') return ctx.answerCbQuery('Private chat mein kholen.', { show_alert: true }).catch(() => {});
+  if (goldDropRunning || isAutopilotRunning()) return ctx.answerCbQuery('Ek run pehle se chal raha hai.', { show_alert: true }).catch(() => {});
+  if (!telegramOtp.isTelegramOtpConfigured()) return ctx.answerCbQuery('Pehle Telegram OTP account configure karein.', { show_alert: true }).catch(() => {});
+  pending.set(String(ctx.from.id), { action: 'gold_checker_codes', source: ctx.match[1] });
+  await ctx.answerCbQuery().catch(() => {});
+  await ctx.reply('🎟 Ab codes paste karein ya .txt file bhejein (maximum 100, ek code per line).').catch(() => {});
+});
+
+async function startGoldChecker(ctx, source, codes) {
+  if (goldDropRunning || isAutopilotRunning()) throw new Error('Ek run pehle se chal raha hai.');
+  if (!telegramOtp.isTelegramOtpConfigured()) throw new Error('Telegram OTP account configure nahi hai.');
+  goldDropRunning = true;
+  const run = { owner: String(ctx.from.id), chatId: ctx.chat.id, stop: false };
+  goldDropRun = run;
+  const previousProfile = telegramOtp.getActiveOtpBotProfile().id;
+  let browser;
+  let card;
+  let done = 0;
+  const usedPhones = new Set();
+  try {
+    card = await ctx.reply('🎟 Code checker shuru ho raha hai…', kb([[{ text: '⏹ STOP', callback_data: 'gold_drop_stop' }]]));
+    const update = async text => ctx.telegram.editMessageText(run.chatId, card.message_id, undefined,
+      section('🎟 Code checker', [field('Progress', `${done} / ${codes.length}`), field('Status', text)].join('\n')),
+      kb([[{ text: '⏹ STOP', callback_data: 'gold_drop_stop' }]])).catch(() => {});
+    telegramOtp.setActiveOtpBotProfile(source);
+    browser = await launchGoldDropChecker(findChromePath());
+    for (const code of codes) {
+      if (run.stop) break;
+      await update('OTP bot se number le raha hoon');
+      const entry = await telegramOtp.getNextTelegramNumber({ forceNew: usedPhones.size > 0, excludePhones: [...usedPhones], shouldAbort: () => run.stop });
+      if (run.stop) break;
+      const mobile = String(entry?.phone || '').replace(/\D/g, '').slice(-10);
+      if (!/^[6789]\d{9}$/.test(mobile) || usedPhones.has(mobile)) throw new Error('OTP bot se naya valid number nahi mila');
+      usedPhones.add(mobile);
+      await update('Official form check ho raha hai');
+      const result = await checkGoldDropCode(browser, { code, name: 'Rahul Kumar', mobile });
+      done++;
+      await ctx.telegram.sendMessage(run.chatId, `${code} · ${mobile}\n${result.status}: ${result.message}`);
+      if (result.status === 'security_check' || result.status === 'unknown') break;
+    }
+    await ctx.telegram.editMessageText(run.chatId, card.message_id, undefined,
+      section('🎟 Code checker', [field('Progress', `${done} / ${codes.length}`), field('Status', run.stop ? 'Stopped' : done === codes.length ? 'Complete' : 'Ruka — last result dekhein')].join('\n')),
+      kb([[{ text: '🏠 Home', callback_data: 'ap_home' }]])).catch(() => {});
+  } catch (error) {
+    if (card) await ctx.telegram.editMessageText(run.chatId, card.message_id, undefined, `⚠️ Code checker ruka: ${String(error?.message || 'Unknown error').slice(0, 180)}`, kb([[{ text: '🏠 Home', callback_data: 'ap_home' }]])).catch(() => {});
+    else await ctx.reply('⚠️ Code checker shuru nahi ho saka.').catch(() => {});
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+    telegramOtp.resetActiveOtpBotProfile();
+    telegramOtp.setActiveOtpBotProfile(previousProfile);
+    goldDropRun = null;
+    goldDropRunning = false;
+  }
+}
+
 // Choose the source first, then the number of reward SMS messages to collect.
 bot.action(/^gold_drop_start_(hermes|hathi|chauhan)$/, async (ctx) => {
   if (!(await gate(ctx))) return;
@@ -1551,7 +1630,7 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
   goldDropRunning = true;
   goldDropRun = run;
   const previousProfile = telegramOtp.getActiveOtpBotProfile().id;
-  const render = async (stage, finished = false) => {
+  const render = async (stage, finished = false, securityCheck = false) => {
     run.stage = stage;
     const text = section('🟡 Gold Drop', [
       field('Source', source.toUpperCase()),
@@ -1559,12 +1638,23 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
       field('Number', run.phone || '—'),
       field('Status', stage),
     ].join('\n'));
-    const rows = finished ? [[{ text: '🏠 Home', callback_data: 'ap_home' }]] : [[{ text: '⏹ STOP', callback_data: 'gold_drop_stop' }]];
+    const rows = finished
+      ? [
+        ...(securityCheck ? [[{ text: '🌐 Official site kholen', url: 'https://golddropgolddhamaka.com/register' }]] : []),
+        [{ text: '🏠 Home', callback_data: 'ap_home' }],
+      ]
+      : [[{ text: '⏹ STOP', callback_data: 'gold_drop_stop' }]];
     await ctx.telegram.editMessageText(run.chatId, cardMessageId, undefined, text, kb(rows)).catch(error => {
       console.warn('[GoldDrop] Card update failed:', error?.message || error);
     });
   };
   const checkStop = () => { if (run.stop) throw new Error('STOP requested'); };
+  // Keep the public operation name only; never log challenge tokens or cookies.
+  let goldDropApiStep = '';
+  const retrySecurity = operation => retryGoldDropSecurity(operation, {
+    shouldStop: () => run.stop,
+    onWait: async (attempt, max) => render(`Security check (${goldDropApiStep}) — 1 min wait, retry ${attempt}/${max}`),
+  });
   try {
     telegramOtp.setActiveOtpBotProfile(source);
     const image = await readFile(new URL('./assets/gold-drop-pack.jpg', import.meta.url));
@@ -1585,8 +1675,9 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
       run.exhaustedPhones.add(phone);
       await render('Registration taiyar ho raha hai');
       const client = new GoldDropClient();
+      goldDropApiStep = 'session';
       try {
-        await client.bootstrap({ country: 'India', countryCode: 'IN', zip: '509412' });
+        await retrySecurity(() => client.bootstrap({ country: 'India', countryCode: 'IN', zip: '509412' }));
       } catch (error) {
         if (!isGoldDropDailyOtpLimit(error)) throw error;
         telegramOtp.discardCurrentTelegramNumber(phone);
@@ -1596,9 +1687,14 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
       }
       const otpBaseline = await telegramOtp.captureTelegramOtpWatermark(phone);
       if (otpBaseline.error) throw new Error('OTP inbox baseline nahi mil saka');
+      // Capture before registration: reward SMS can arrive on the edited card
+      // before verifyOtp returns (or even before its verification call).
+      const rewardBaseline = await telegramOtp.captureTelegramMessageBaseline();
       checkStop();
+      goldDropApiStep = 'registration';
+      const email = goldDropEmailForMobile('itsnoob012@gmail.com', phone);
       try {
-        await client.register({ name: 'Rahul Kumar', mobile: phone, email: goldDropEmailForMobile('itsnoob012@gmail.com', phone), pincode: '509412', code: 'KKD2LS01261026', image });
+        await retrySecurity(() => client.register({ name: 'Rahul Kumar', mobile: phone, email, pincode: '509412', code: 'KKD2LS01261026', image }));
       } catch (error) {
         if (!isGoldDropDailyOtpLimit(error)) throw error;
         run.exhaustedPhones.add(phone);
@@ -1617,31 +1713,43 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
       if (!otp.code) {
         // A normal inbox timeout skips this number; provider failures stay visible.
         if (otp.error && !/^OTP bot chat me \d+s tak code nahi mila/i.test(otp.error)) throw new Error(otp.error);
-        telegramOtp.discardCurrentTelegramNumber(phone);
-        await render('OTP nahi mila — next number');
+        // A reward SMS might have replaced the OTP on the same edited card.
+        const earlyReward = await telegramOtp.waitForGoldDropReward(phone, { baseline: rewardBaseline, deliveredCodes: run.codes, timeoutMs: 0 });
+        if (earlyReward) {
+          await ctx.telegram.sendMessage(run.chatId, earlyReward.sms);
+          run.codes.add(earlyReward.code);
+          run.count++;
+          await render('Reward SMS bheja');
+        } else {
+          telegramOtp.discardCurrentTelegramNumber(phone);
+          await render('OTP nahi mila — next number');
+        }
         continue;
       }
-      const rewardBaseline = await telegramOtp.captureTelegramMessageBaseline();
       checkStop();
       await render('OTP verify ho raha hai');
+      goldDropApiStep = 'OTP verification';
+      let otpRejected = false;
       try {
-        await client.verifyOtp(otp.code);
+        await retrySecurity(() => client.verifyOtp(otp.code));
       } catch (error) {
         if (!isGoldDropInvalidOtp(error) && !isGoldDropDailyOtpLimit(error)) throw error;
-        telegramOtp.discardCurrentTelegramNumber(phone);
-        checkStop();
-        await render(isGoldDropInvalidOtp(error) ? 'Invalid OTP — next number' : 'OTP daily limit — next number');
-        continue;
+        otpRejected = true;
       }
-      // Even if STOP is pressed during verify, capture the resulting SMS before stopping.
-      await render('Reward SMS ke liye 7 second refresh');
-      const reward = await telegramOtp.waitForGoldDropReward(phone, { baseline: rewardBaseline, timeoutMs: 7000 });
+      // Scan even after a known verification rejection: the reward may already
+      // be on the card. A rejected OTP doesn't trigger a new refresh wait.
+      await render(otpRejected ? 'OTP reject — reward inbox check' : 'Reward SMS ke liye 7 second refresh');
+      const reward = await telegramOtp.waitForGoldDropReward(phone, { baseline: rewardBaseline, deliveredCodes: run.codes, timeoutMs: otpRejected ? 0 : 7000 });
       if (!reward) {
         telegramOtp.discardCurrentTelegramNumber(phone);
         await render('Reward SMS nahi mila — next number');
         continue;
       }
-      if (run.codes.has(reward.code)) throw new Error('Duplicate reward code mila; run ruka');
+      if (run.codes.has(reward.code)) {
+        telegramOtp.discardCurrentTelegramNumber(phone);
+        await render('Duplicate reward SMS — next number');
+        continue;
+      }
       // Only count a new reward after its actual SMS is delivered successfully.
       await ctx.telegram.sendMessage(run.chatId, reward.sms);
       run.codes.add(reward.code);
@@ -1650,7 +1758,11 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
     }
     await render(run.stop ? '⏹ Stopped' : '✅ Target complete', true);
   } catch (error) {
-    await render(run.stop ? '⏹ Stopped' : `⚠️ Ruka: ${String(error?.message || 'Unknown error').slice(0, 160)}`, true);
+    const securityCheck = !run.stop && isGoldDropSecurityCheck(error);
+    const status = run.stop ? '⏹ Stopped' : securityCheck
+      ? `⚠️ Website security check (${goldDropApiStep || 'unknown step'}). Official site par khud complete karein; automatic run ruka hai.`
+      : `⚠️ Ruka: ${String(error?.message || 'Unknown error').slice(0, 160)}`;
+    await render(status, true, securityCheck);
   } finally {
     telegramOtp.resetActiveOtpBotProfile();
     telegramOtp.setActiveOtpBotProfile(previousProfile);
@@ -4073,6 +4185,31 @@ bot.action(/^tr_testr_(custom_[a-z0-9]+)$/, async (ctx) => {
 });
 
 
+bot.on('document', async (ctx) => {
+  const uid = String(ctx.from?.id);
+  if (!isOwner(ctx.from?.id) || ctx.chat?.type !== 'private') return;
+  const st = pending.get(uid);
+  if (st?.action !== 'gold_checker_codes') return;
+  const doc = ctx.message?.document;
+  if (!/\.txt$/i.test(doc?.file_name || '') || !doc?.file_size || doc.file_size > 128 * 1024) {
+    await ctx.reply('Sirf 128 KB tak ki .txt file bhejein.').catch(() => {});
+    return;
+  }
+  try {
+    const url = await ctx.telegram.getFileLink(doc.file_id);
+    const response = await fetch(String(url), { signal: AbortSignal.timeout(15000) });
+    if (!response.ok) throw new Error('File download failed');
+    const bytes = await response.arrayBuffer();
+    if (bytes.byteLength > 128 * 1024) throw new Error('File badi hai');
+    const codes = parseWinningCodes(new TextDecoder('utf-8', { fatal: true }).decode(bytes).replace(/^\uFEFF/, ''));
+    pending.delete(uid);
+    startGoldChecker(ctx, st.source, codes).catch(() => ctx.reply('⚠️ Code checker shuru nahi ho saka.').catch(() => {}));
+  } catch {
+    // The Telegram file URL embeds the bot token: never echo the underlying error.
+    await ctx.reply('File nahi padh paaya. Valid UTF-8 .txt mein 1–100 codes bhejein.').catch(() => {});
+  }
+});
+
 bot.on('text', async (ctx) => {
   const uid = String(ctx.from?.id);
   if (!isOwner(ctx.from?.id)) return;
@@ -4080,6 +4217,18 @@ bot.on('text', async (ctx) => {
   if (!st) return;
   const rawMessageText = String(ctx.message?.text || '');
   const txt = rawMessageText.trim();
+
+  if (st.action === 'gold_checker_codes') {
+    if (ctx.chat?.type !== 'private') return;
+    try {
+      const codes = parseWinningCodes(txt);
+      pending.delete(uid);
+      startGoldChecker(ctx, st.source, codes).catch(() => ctx.reply('⚠️ Code checker shuru nahi ho saka.').catch(() => {}));
+    } catch (error) {
+      await ctx.reply(`⚠️ ${String(error?.message || 'Invalid codes')}`).catch(() => {});
+    }
+    return;
+  }
 
   if (st.action === 'gold_drop_target') {
     if (ctx.chat?.type !== 'private') return;
