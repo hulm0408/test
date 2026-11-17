@@ -41,7 +41,7 @@ COPY . .
 
 # Fail the image build, not the running service, if the optional checker has
 # a missing production dependency. Never launch the bot or contact Telegram here.
-RUN node --input-type=module -e "await import('./gold-drop-checker.js'); console.log('Gold Drop checker dependencies OK')"
+RUN node --input-type=module -e "const m = await import('./gold-drop-checker.js'); if (typeof m.launchGoldDropChecker !== 'function' || typeof m.checkGoldDropCode !== 'function') throw new Error('Gold Drop checker API missing'); console.log('Gold Drop checker dependencies and API OK')"
 
 # data/ = bot ka db (settings/accounts). Render par persistent disk yahin
 # mount hoga (render.yaml dekho) — bina disk ke ye folder har deploy par
