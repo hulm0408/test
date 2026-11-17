@@ -65,7 +65,7 @@ const {
 } = await import('./autopilot-engine.js');
 const { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, _countDeviceOnlineStates } = await import('./firebase-numbers.js');
 const telegramOtp = await import('./telegram-otp-source.js');
-const { GoldDropClient } = await import('./gold-drop-client.js');
+const { GoldDropClient, isGoldDropDailyOtpLimit, goldDropEmailForMobile } = await import('./gold-drop-client.js');
 const { readFile } = await import('node:fs/promises');
 let goldDropRunning = false;
 let goldDropRun = null;
@@ -1485,7 +1485,7 @@ bot.action('gold_drop_offer', async (ctx) => {
   await ctx.answerCbQuery().catch(() => {});
   await ctx.reply(section('🟡 Gold Drop Gold Dhamaka', [
     field('Name', 'Rahul Kumar'),
-    field('Email', 'itsnoob012@gmail.com'),
+    field('Email', 'itsnoob012+<6 mobile digits>@gmail.com'),
     field('PIN code', '509412'),
     field('Batch code', 'KKD2LS01261026'),
     '',
@@ -1547,7 +1547,7 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
   if (goldDropRunning || isAutopilotRunning()) throw new Error('Ek run pehle se chal raha hai.');
   if (!telegramOtp.isTelegramOtpConfigured()) throw new Error('Pehle Telegram OTP account configure karein.');
   if (!Number.isInteger(target) || target < 1 || target > 100) throw new Error('Target 1 se 100 ke beech hona chahiye.');
-  const run = { owner: String(ctx.from.id), chatId: ctx.chat.id, source, target, count: 0, stop: false, stage: 'Shuru ho raha hai', phone: '', codes: new Set() };
+  const run = { owner: String(ctx.from.id), chatId: ctx.chat.id, source, target, count: 0, stop: false, stage: 'Shuru ho raha hai', phone: '', codes: new Set(), exhaustedPhones: new Set() };
   goldDropRunning = true;
   goldDropRun = run;
   const previousProfile = telegramOtp.getActiveOtpBotProfile().id;
@@ -1571,10 +1571,15 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
     while (run.count < target && !run.stop) {
       run.phone = '';
       await render('OTP bot se number le raha hoon');
-      const entry = await telegramOtp.getNextTelegramNumber();
+      const entry = await telegramOtp.getNextTelegramNumber({
+        forceNew: run.exhaustedPhones.size > 0,
+        excludePhones: [...run.exhaustedPhones],
+        shouldAbort: () => run.stop,
+      });
       checkStop();
       const phone = String(entry?.phone || '').replace(/\D/g, '').slice(-10);
       if (!/^[6789]\d{9}$/.test(phone)) throw new Error('OTP bot se valid mobile nahi mila');
+      if (run.exhaustedPhones.has(phone)) throw new Error('OTP bot ne exhausted number dobara diya');
       run.phone = phone;
       await render('Registration taiyar ho raha hai');
       const client = new GoldDropClient();
@@ -1582,7 +1587,16 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
       const otpBaseline = await telegramOtp.captureTelegramOtpWatermark(phone);
       if (otpBaseline.error) throw new Error('OTP inbox baseline nahi mil saka');
       checkStop();
-      await client.register({ name: 'Rahul Kumar', mobile: phone, email: 'itsnoob012@gmail.com', pincode: '509412', code: 'KKD2LS01261026', image });
+      try {
+        await client.register({ name: 'Rahul Kumar', mobile: phone, email: goldDropEmailForMobile('itsnoob012@gmail.com', phone), pincode: '509412', code: 'KKD2LS01261026', image });
+      } catch (error) {
+        if (!isGoldDropDailyOtpLimit(error)) throw error;
+        run.exhaustedPhones.add(phone);
+        telegramOtp.discardCurrentTelegramNumber(phone);
+        checkStop();
+        await render('OTP daily limit — next number');
+        continue;
+      }
       checkStop();
       await render('OTP ke liye refresh');
       const otp = await telegramOtp.waitForTelegramOtpCode(phone, {

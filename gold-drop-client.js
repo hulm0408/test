@@ -6,6 +6,28 @@ const BASE = 'https://golddropgolddhamaka.com/api';
 const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 const b64 = value => Buffer.from(value, 'utf8').toString('base64');
 
+// Gmail plus addressing keeps delivery in the original inbox while using six
+// randomly selected digits from the current mobile number for each entry.
+export function goldDropEmailForMobile(email, mobile, randomIndex = randomInt) {
+  const match = /^([^@+]+)@(gmail\.com)$/i.exec(String(email));
+  if (!match || !/^[6789]\d{9}$/.test(String(mobile))) throw new Error('Invalid Gold Drop email or mobile');
+  const digits = [...String(mobile)];
+  let suffix = '';
+  for (let i = 0; i < 6; i++) {
+    const index = randomIndex(digits.length);
+    if (!Number.isInteger(index) || index < 0 || index >= digits.length) throw new Error('Invalid random index');
+    suffix += digits.splice(index, 1)[0];
+  }
+  return `${match[1]}+${suffix}@${match[2]}`;
+}
+
+// Only this exact upstream response is eligible for moving to another number.
+// Other failures (including unknown rate limits or network errors) remain fatal.
+export function isGoldDropDailyOtpLimit(error) {
+  const message = String(error?.message || '').replace(/^Gold Drop HTTP \d+:\s*/i, '').trim();
+  return /^Your OTP limit for today is exhausted\. Please try again tomorrow\.?$/i.test(message);
+}
+
 export function signGoldDropPayload(fields, dataKey, userKey, timestamp = String(Date.now())) {
   const t = String(timestamp);
   const payload = b64(JSON.stringify({ ...fields, userKey: String(userKey), t }));
