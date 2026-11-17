@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import { GoldDropClient, goldDropEmailForMobile, isGoldDropDailyOtpLimit, isGoldDropInvalidOtp, isGoldDropSecurityCheck, retryGoldDropSecurity, signGoldDropPayload, unwrapGoldDropResponse } from './gold-drop-client.js';
+import { GoldDropCookieJar } from './gold-drop-cookies.js';
 import { extractGoldDropReward, isNewGoldDropReward, findFreshGoldDropReward } from './gold-drop-rewards.js';
 import { parseTelegramNumberCard } from './telegram-otp-source.js';
 import { parseWinningCodes, checkGoldDropCode } from './gold-drop-checker.js';
@@ -27,6 +28,34 @@ assert.equal(calls.length, 4);
 assert.equal(calls[2].options.headers.Cookie, 'gold-drop-id=u');
 assert.match(calls[2].options.body.toString(), /name="img"; filename="pack.jpg"/);
 assert.match(calls[3].url, /\/users\/verify-otp\/u\?t=/);
+
+const cookieCalls = [];
+const sessionClient = new GoldDropClient({ fetchImpl: async (url, opts) => {
+  cookieCalls.push({ url, opts });
+  const first = cookieCalls.length === 1;
+  const headers = new Headers();
+  if (first) {
+    headers.append('set-cookie', 'session=one; Path=/api; Secure; HttpOnly');
+    headers.append('set-cookie', 'narrow=private; Path=/api/users/get-start; Secure');
+    headers.append('set-cookie', 'foreign=ignored; Domain=example.com; Path=/');
+  }
+  return new Response(JSON.stringify(first ? { userKey: 'u', dataKey: key } : { statusCode: 200 }), { status: 200, headers });
+} });
+await sessionClient.bootstrap({ zip: '509412' });
+await sessionClient.register({ name: 'Rahul Kumar', mobile: '9876543210', email: 'x@example.com', pincode: '509412', code: 'KKD2LS01261026', image: Buffer.from('photo') });
+assert.match(cookieCalls[1].opts.headers.Cookie, /session=one/);
+assert.match(cookieCalls[1].opts.headers.Cookie, /narrow=private/);
+assert.match(cookieCalls[2].opts.headers.Cookie, /session=one/);
+assert.doesNotMatch(cookieCalls[2].opts.headers.Cookie, /narrow=private|foreign=ignored/);
+assert.match(cookieCalls[2].opts.headers.Cookie, /gold-drop-id=u/);
+const jar = new GoldDropCookieJar('https://example.com/api');
+const hdr = new Headers(); hdr.append('set-cookie', 'x=1; Path=/api; Secure');
+jar.store(hdr, 'https://example.com/api/users');
+assert.equal(jar.header('https://other.example.com/api/users'), '');
+assert.equal(jar.header('https://example.com/apix'), '');
+const removed = new Headers(); removed.append('set-cookie', 'x=; Path=/api; Max-Age=0');
+jar.store(removed, 'https://example.com/api/users');
+assert.equal(jar.header('https://example.com/api/users'), '');
 await assert.rejects(client.verifyOtp('123'), /six digits/);
 const sample = '▪️ ʟᴀꜱᴛ ꜱᴍꜱ\n[VK-BGCITY-S] Success! Your Reward Code is 7E8RJ9MMYFWA. Please visit https://www.go\nᴛɪᴍᴇ: 17-11-2026 | 05:21 pm';
 assert.deepEqual(extractGoldDropReward(sample), { code: '7E8RJ9MMYFWA', sms: '[VK-BGCITY-S] Success! Your Reward Code is 7E8RJ9MMYFWA. Please visit https://www.go' });
