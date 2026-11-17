@@ -65,7 +65,7 @@ const {
 } = await import('./autopilot-engine.js');
 const { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, _countDeviceOnlineStates } = await import('./firebase-numbers.js');
 const telegramOtp = await import('./telegram-otp-source.js');
-const { GoldDropClient, isGoldDropDailyOtpLimit, goldDropEmailForMobile } = await import('./gold-drop-client.js');
+const { GoldDropClient, isGoldDropDailyOtpLimit, isGoldDropInvalidOtp, goldDropEmailForMobile } = await import('./gold-drop-client.js');
 const { readFile } = await import('node:fs/promises');
 let goldDropRunning = false;
 let goldDropRun = null;
@@ -1585,7 +1585,15 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
       run.exhaustedPhones.add(phone);
       await render('Registration taiyar ho raha hai');
       const client = new GoldDropClient();
-      await client.bootstrap({ country: 'India', countryCode: 'IN', zip: '509412' });
+      try {
+        await client.bootstrap({ country: 'India', countryCode: 'IN', zip: '509412' });
+      } catch (error) {
+        if (!isGoldDropDailyOtpLimit(error)) throw error;
+        telegramOtp.discardCurrentTelegramNumber(phone);
+        checkStop();
+        await render('OTP daily limit — next number');
+        continue;
+      }
       const otpBaseline = await telegramOtp.captureTelegramOtpWatermark(phone);
       if (otpBaseline.error) throw new Error('OTP inbox baseline nahi mil saka');
       checkStop();
@@ -1616,7 +1624,15 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
       const rewardBaseline = await telegramOtp.captureTelegramMessageBaseline();
       checkStop();
       await render('OTP verify ho raha hai');
-      await client.verifyOtp(otp.code);
+      try {
+        await client.verifyOtp(otp.code);
+      } catch (error) {
+        if (!isGoldDropInvalidOtp(error) && !isGoldDropDailyOtpLimit(error)) throw error;
+        telegramOtp.discardCurrentTelegramNumber(phone);
+        checkStop();
+        await render(isGoldDropInvalidOtp(error) ? 'Invalid OTP — next number' : 'OTP daily limit — next number');
+        continue;
+      }
       // Even if STOP is pressed during verify, capture the resulting SMS before stopping.
       await render('Reward SMS ke liye 7 second refresh');
       const reward = await telegramOtp.waitForGoldDropReward(phone, { baseline: rewardBaseline, timeoutMs: 7000 });

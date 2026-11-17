@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
-import { GoldDropClient, goldDropEmailForMobile, isGoldDropDailyOtpLimit, signGoldDropPayload, unwrapGoldDropResponse } from './gold-drop-client.js';
+import { GoldDropClient, goldDropEmailForMobile, isGoldDropDailyOtpLimit, isGoldDropInvalidOtp, signGoldDropPayload, unwrapGoldDropResponse } from './gold-drop-client.js';
 import { extractGoldDropReward, isNewGoldDropReward } from './gold-drop-rewards.js';
 
 const key = 'abcdefghijklmnopqrstuv';
@@ -42,6 +42,11 @@ assert.throws(() => goldDropEmailForMobile('itsnoob012@gmail.com', '123'), /Inva
 const limitMessage = 'Your OTP limit for today is exhausted. Please try again tomorrow';
 assert.equal(isGoldDropDailyOtpLimit(new Error(`Gold Drop HTTP 400: ${limitMessage}`)), true);
 assert.equal(isGoldDropDailyOtpLimit(new Error(limitMessage)), true);
+assert.equal(isGoldDropDailyOtpLimit(new Error(`Gold Drop HTTP 400: ${limitMessage}"`)), true);
+assert.equal(isGoldDropInvalidOtp(new Error('Gold Drop HTTP 400: Invalid OTP, Please enter OTP ')), true);
+assert.equal(isGoldDropInvalidOtp(new Error('Invalid OTP, Please enter OTP"')), true);
+assert.equal(isGoldDropInvalidOtp(new Error('Gold Drop HTTP 500: internal error')), false);
+assert.equal(isGoldDropInvalidOtp(new Error('fetch failed')), false);
 assert.equal(isGoldDropDailyOtpLimit(new Error('Gold Drop HTTP 400: Please try again tomorrow using the same number')), true);
 assert.equal(isGoldDropDailyOtpLimit(new Error('Gold Drop HTTP 429: Too many requests')), false);
 assert.equal(isGoldDropDailyOtpLimit(new Error('fetch failed')), false);
@@ -49,5 +54,10 @@ for (const status of [200, 400]) {
   const limited = new GoldDropClient({ fetchImpl: async () => new Response(JSON.stringify({ statusCode: 400, message: limitMessage }), { status }) });
   limited.userKey = 'u'; limited.dataKey = key;
   await assert.rejects(limited.register({ name: 'Rahul Kumar', mobile: '9876543210', email: 'x@example.com', pincode: '509412', code: 'KKD2LS01261026', image: Buffer.from('photo') }), isGoldDropDailyOtpLimit);
+}
+for (const status of [200, 400]) {
+  const invalid = new GoldDropClient({ fetchImpl: async () => new Response(JSON.stringify({ statusCode: 400, message: 'Invalid OTP, Please enter OTP' }), { status }) });
+  invalid.userKey = 'u'; invalid.dataKey = key;
+  await assert.rejects(invalid.verifyOtp('123456'), isGoldDropInvalidOtp);
 }
 console.log('Gold Drop client and reward tests passed');
