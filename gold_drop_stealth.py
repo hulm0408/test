@@ -18,6 +18,13 @@ Commands (stdin, ek JSON object per line):
   {"cmd": "check", "id": 1, "code": "ABC123", "name": "Rahul", "mobile": "98..."}
       -> {"type": "result", "id": 1, "status": "otp_sent", "message": "..."}
       ya {"type": "error", "id": 1, "message": "..."}
+  {"cmd": "warmup", "id": 2, "url": "https://golddropgolddhamaka.com/register",
+   "timeoutMs": 45000}
+      -> {"type": "warmup", "id": 2, "ok": true,
+          "userAgent": "Mozilla/5.0 ...", "cookies": [...]}
+      Security challenge asli browser fingerprint se khud clear hone deta hai,
+      phir clearance cookies + UA wapas deta hai taaki HTTP API client
+      (gold-drop-client.js) unke saath "security check" se bach kar chale.
   {"cmd": "ping"}   -> {"type": "pong"}
   {"cmd": "close"}  -> worker safai se band ho kar exit 0 karta hai.
 
@@ -32,6 +39,7 @@ import io
 import json
 import re
 import sys
+import time
 import traceback
 
 SITE_URL = "https://www.golddropwins.com/"
@@ -56,6 +64,38 @@ PAGE_VIEW_JS = """() => ({
     'input[name="otp"], input[id="otp"], input[autocomplete="one-time-code"]')]
     .some(el => el.getClientRects().length > 0 && !el.disabled && el.type !== 'hidden'),
 })"""
+
+# WAF challenge pages (Cloudflare "Just a moment..." style) ka pata lagane ke
+# liye signals. Challenge ko solve/click NAHI karte — stealth browser ka asli
+# fingerprint passive challenge ko khud clear kara deta hai.
+CHALLENGE_TITLE_RE = re.compile(
+    r"just a moment|attention required|checking your browser|verify you are|one more step",
+    re.IGNORECASE,
+)
+
+CHALLENGE_DOM_JS = """() => !!document.querySelector(
+  '#challenge-form, #challenge-stage, #cf-chl-running, #cf-challenge-running, '
+  + '.cf-browser-verification, #cf-challenge-container, script[src*="challenge-platform"]'
+)"""
+
+
+def challenge_title_active(title):
+    """Pure function — title dekh kar batao ki WAF challenge page hai ya nahi."""
+    return bool(CHALLENGE_TITLE_RE.search(str(title or "")))
+
+
+def challenge_active(page):
+    """Page abhi bhi security challenge dikha raha hai ya nahi."""
+    try:
+        title = page.title() or ""
+    except Exception:
+        return True  # navigation ke beech — abhi clear nahi
+    if challenge_title_active(title):
+        return True
+    try:
+        return bool(page.evaluate(CHALLENGE_DOM_JS))
+    except Exception:
+        return True
 
 
 def send(payload):
@@ -164,6 +204,43 @@ class GoldDropStealthBrowser:
             except Exception:
                 pass
 
+    def warmup(self, url, timeout_ms=45000):
+        """Offer page stealth browser me kholo; site ka security challenge asli
+        fingerprint se khud clear hone do; clearance cookies + UA wapas do."""
+        if self.context is None:
+            raise RuntimeError("Browser launch nahi hua — pehle launch command bhejo")
+        if not url:
+            raise RuntimeError("warmup url required")
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError  # noqa: PLC0415
+
+        page = self.context.new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            deadline = time.monotonic() + max(5, int(timeout_ms)) / 1000
+            cleared = False
+            while time.monotonic() < deadline:
+                if not challenge_active(page):
+                    cleared = True
+                    break
+                page.wait_for_timeout(1000)
+            if not cleared:
+                return {
+                    "ok": False,
+                    "message": "Site ka security challenge abhi bhi active hai; 1 min wait ke baad retry hoga.",
+                }
+            page.wait_for_timeout(1500)  # clearance cookies set hone ka buffer
+            user_agent = page.evaluate("() => navigator.userAgent")
+            cookies = self.context.cookies([url])
+            log(f"warmup ok — {len(cookies)} cookies, UA: {str(user_agent)[:60]}")
+            return {"ok": True, "userAgent": str(user_agent or ""), "cookies": cookies}
+        except PlaywrightTimeoutError:
+            return {"ok": False, "message": "Warmup page load timeout hua."}
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+
     def close(self):
         # Playwright pehle (CDP disconnect), phir SeleniumBase apna Chrome band kare.
         for closer in (
@@ -208,6 +285,12 @@ def serve():
             elif kind == "check":
                 result = stealth.check(cmd.get("code") or "", cmd.get("name") or "", cmd.get("mobile") or "")
                 send({"type": "result", "id": cmd_id, **result})
+            elif kind == "warmup":
+                result = stealth.warmup(
+                    str(cmd.get("url") or ""),
+                    int(cmd.get("timeoutMs") or 45000),
+                )
+                send({"type": "warmup", "id": cmd_id, **result})
             elif kind == "close":
                 break
             else:
@@ -232,6 +315,13 @@ def selftest():
     assert classify_view({"body": "kuch confirm nahi", "errors": [], "otpField": False})["status"] == "unknown"
     assert classify_view({"body": "", "errors": [], "otpField": False})["status"] == "unknown"
     assert classify_view({"body": None, "errors": None, "otpField": False})["status"] == "unknown"
+    assert challenge_title_active("Just a moment...") is True
+    assert challenge_title_active("Attention Required! | Cloudflare") is True
+    assert challenge_title_active("Checking your browser before accessing golddropgolddhamaka.com") is True
+    assert challenge_title_active("Verify you are human") is True
+    assert challenge_title_active("Gold Drop Gold Dhamaka — Register") is False
+    assert challenge_title_active("") is False
+    assert challenge_title_active(None) is False
     print("selftest OK")
     return 0
 

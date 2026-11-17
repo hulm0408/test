@@ -1660,9 +1660,49 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
   const checkStop = () => { if (run.stop) throw new Error('STOP requested'); };
   // Keep the public operation name only; never log challenge tokens or cookies.
   let goldDropApiStep = '';
+  // Stealth warmup: site ka security clearance ek asli stealthy browser
+  // (SeleniumBase CDP mode + Playwright connect_over_cdp) se lekar uski
+  // clearance cookies + User-Agent API client ko deta hai — isse "security
+  // check" rejection aana band ho jata hai. Challenge ko solve/click nahi
+  // karte; asli browser fingerprint se site khud clear karti hai. Browser na
+  // chale to purana 1-min wait-retry behavior jaari rehta hai.
+  let stealthBrowser = null;
+  let stealthLaunchFn = null;
+  let stealthWarmupFn = null;
+  let stealthBroken = process.env.GOLD_DROP_WARMUP === '0';
+  let warmupData = null; // { userAgent, cookies } — run bhar reuse, security retry par refresh
+  const refreshWarmup = async () => {
+    if (stealthBroken) return false;
+    try {
+      if (!stealthWarmupFn) {
+        const mod = await loadGoldDropChecker();
+        stealthLaunchFn = mod?.launchGoldDropStealthChecker;
+        stealthWarmupFn = mod?.warmupGoldDropStealth;
+        if (typeof stealthLaunchFn !== 'function' || typeof stealthWarmupFn !== 'function') throw new Error('stealth module unavailable');
+      }
+      if (stealthBrowser?.closed) stealthBrowser = null;
+      if (!stealthBrowser) stealthBrowser = await stealthLaunchFn({ chromePath: findChromePath() });
+      const result = await stealthWarmupFn(stealthBrowser);
+      if (!result?.ok || !result.cookies?.length) throw new Error(result?.message || 'warmup failed');
+      warmupData = { userAgent: result.userAgent, cookies: result.cookies };
+      return true;
+    } catch (error) {
+      console.warn('[GoldDrop] Stealth warmup nahi chala:', String(error?.message || error).slice(0, 160));
+      stealthBroken = true; // is run me dobara browser nahi kholenge — wait-retry jaari
+      return false;
+    }
+  };
+  const applyWarmup = client => {
+    if (!warmupData) return;
+    client.setUserAgent(warmupData.userAgent);
+    client.importSessionCookies(warmupData.cookies);
+  };
   const retrySecurity = operation => retryGoldDropSecurity(operation, {
     shouldStop: () => run.stop,
-    onWait: async (attempt, max) => render(`Security check (${goldDropApiStep}) — 1 min wait, retry ${attempt}/${max}`),
+    onWait: async (attempt, max) => {
+      await render(`Security check (${goldDropApiStep}) — stealth browser se refresh, retry ${attempt}/${max}`);
+      if (run.activeClient && await refreshWarmup()) applyWarmup(run.activeClient);
+    },
   });
   try {
     telegramOtp.setActiveOtpBotProfile(source);
@@ -1684,6 +1724,14 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
       run.exhaustedPhones.add(phone);
       await render('Registration taiyar ho raha hai');
       const client = new GoldDropClient();
+      run.activeClient = client;
+      // Pehle number par stealth browser se security clearance lo (run bhar ke
+      // liye); cookies + UA har naye client par apply hote hain.
+      if (!warmupData && !stealthBroken) {
+        await render('Stealth browser se security clearance ho rahi hai');
+        await refreshWarmup();
+      }
+      applyWarmup(client);
       goldDropApiStep = 'session';
       try {
         await retrySecurity(() => client.bootstrap({ country: 'India', countryCode: 'IN', zip: '509412' }));
@@ -1773,6 +1821,8 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
       : `⚠️ Ruka: ${String(error?.message || 'Unknown error').slice(0, 160)}`;
     await render(status, true, securityCheck);
   } finally {
+    run.activeClient = null;
+    if (stealthBrowser) await stealthBrowser.close().catch(() => {});
     telegramOtp.resetActiveOtpBotProfile();
     telegramOtp.setActiveOtpBotProfile(previousProfile);
     goldDropRun = null;

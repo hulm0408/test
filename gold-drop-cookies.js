@@ -45,8 +45,35 @@ export class GoldDropCookieJar {
     }
   }
 
-  header(requestUrl, userKey = '') {
-    const url = new URL(requestUrl);
+  // Browser (stealth warmup) se aayi cookies import karo — Playwright/CDP format:
+  // { name, value, domain, path, secure, expires (unix seconds, -1 = session) }.
+  // Wahi origin scope rules jo store() par hain: sirf is service ka host.
+  importCookies(cookies = []) {
+    let count = 0;
+    const originHost = this.origin.hostname.toLowerCase();
+    for (const cookie of Array.isArray(cookies) ? cookies : []) {
+      const name = String(cookie?.name || '');
+      const value = String(cookie?.value ?? '');
+      if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) || /[\x00-\x20\x7f;,]/.test(value)) continue;
+      const rawDomain = String(cookie?.domain || '').toLowerCase();
+      const hostOnly = !rawDomain.startsWith('.');
+      const domain = rawDomain.replace(/^\./, '');
+      // Parent-domain ya foreign cookies nahi — bilkul is origin ka host hi.
+      if (domain !== originHost) continue;
+      const path = String(cookie?.path || '/');
+      if (!path.startsWith('/')) continue;
+      const secure = !!cookie?.secure;
+      const expSeconds = Number(cookie?.expires);
+      const expires = Number.isFinite(expSeconds) && expSeconds > 0 ? expSeconds * 1000 : Infinity;
+      const id = `${domain}|${path}|${name}`;
+      if (expires <= Date.now()) { this.cookies.delete(id); continue; }
+      this.cookies.set(id, { name, value, domain, hostOnly, path, secure, expires });
+      count++;
+    }
+    return count;
+  }
+
+  header(requestUrl, userKey = '') {    const url = new URL(requestUrl);
     if (url.origin !== this.origin.origin) return '';
     const parts = [];
     for (const [id, cookie] of this.cookies) {

@@ -94,6 +94,13 @@ export async function launchGoldDropStealthChecker({
         settlePending(id, 'resolve', handle.endpointUrl);
       } else if (msg.type === 'result') {
         settlePending(id, 'resolve', { status: String(msg.status || 'unknown'), message: String(msg.message || '') });
+      } else if (msg.type === 'warmup') {
+        settlePending(id, 'resolve', {
+          ok: msg.ok === true,
+          userAgent: String(msg.userAgent || ''),
+          cookies: Array.isArray(msg.cookies) ? msg.cookies : [],
+          message: String(msg.message || ''),
+        });
       } else if (msg.type === 'error') {
         if (!settlePending(id, 'reject', new Error(String(msg.message || 'Stealth worker error').slice(0, 300)))) {
           console.warn('[GoldDrop] Stealth worker error (koi pending command nahi):', String(msg.message || '').slice(0, 200));
@@ -132,23 +139,42 @@ export async function launchGoldDropStealthChecker({
   return handle;
 }
 
-async function checkGoldDropCodeStealth(handle, { code, name, mobile }) {
-  if (handle.closed) throw new Error('Stealth worker band hai; checker dobara shuru karein');
+function sendStealthCommand(handle, payload, timeoutMs, timeoutMessage) {
+  if (handle.closed) return Promise.reject(new Error('Stealth worker band hai; checker dobara shuru karein'));
   const id = ++handle.seq;
-  const timeoutMs = Number(process.env.GOLD_DROP_CHECK_TIMEOUT_MS || 150000);
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      if (handle.pending.delete(id)) reject(new Error('Stealth check timeout — site ya security step atka hua hai'));
+      if (handle.pending.delete(id)) reject(new Error(timeoutMessage));
     }, timeoutMs);
     handle.pending.set(id, { resolve, reject, timer });
     try {
-      handle.proc.stdin.write(JSON.stringify({ cmd: 'check', id, code, name, mobile }) + '\n');
+      handle.proc.stdin.write(JSON.stringify({ ...payload, id }) + '\n');
     } catch (error) {
       clearTimeout(timer);
       handle.pending.delete(id);
       reject(error);
     }
   });
+}
+
+async function checkGoldDropCodeStealth(handle, { code, name, mobile }) {
+  const timeoutMs = Number(process.env.GOLD_DROP_CHECK_TIMEOUT_MS || 150000);
+  return sendStealthCommand(handle, { cmd: 'check', code, name, mobile }, timeoutMs,
+    'Stealth check timeout — site ya security step atka hua hai');
+}
+
+// Registration API flow ke liye: stealth browser me offer page kholkar site ka
+// security challenge asli fingerprint se clear hone do, phir clearance cookies
+// + browser User-Agent wapas lo — GoldDropClient inke saath "security check"
+// rejection ke bina chalta hai. ok:false mile to caller purane wait-retry par
+// chalta hai (challenge ko hum kabhi solve/click nahi karte).
+export async function warmupGoldDropStealth(handle, {
+  url = 'https://golddropgolddhamaka.com/register',
+  timeoutMs = Number(process.env.GOLD_DROP_WARMUP_TIMEOUT_MS || 45000),
+} = {}) {
+  if (handle?.stealth !== true) throw new Error('Stealth worker handle nahi hai');
+  return sendStealthCommand(handle, { cmd: 'warmup', url, timeoutMs }, timeoutMs + 60000,
+    'Stealth warmup timeout — site ka security step atka hua hai');
 }
 
 export async function launchGoldDropChecker(executablePath, { stealth, pythonPath } = {}) {
