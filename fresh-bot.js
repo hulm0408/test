@@ -1660,49 +1660,68 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
   const checkStop = () => { if (run.stop) throw new Error('STOP requested'); };
   // Keep the public operation name only; never log challenge tokens or cookies.
   let goldDropApiStep = '';
-  // Stealth warmup: site ka security clearance ek asli stealthy browser
-  // (SeleniumBase CDP mode + Playwright connect_over_cdp) se lekar uski
-  // clearance cookies + User-Agent API client ko deta hai — isse "security
-  // check" rejection aana band ho jata hai. Challenge ko solve/click nahi
-  // karte; asli browser fingerprint se site khud clear karti hai. Browser na
-  // chale to purana 1-min wait-retry behavior jaari rehta hai.
+  // Browser-native registration: poora flow stealth browser ke ANDAR hota hai
+  // (SeleniumBase CDP mode + Playwright connect_over_cdp) — koi raw API call
+  // nahi, isliye site ka "security check" rejection aata hi nahi; site ke saare
+  // hidden tokens/cookies/fingerprint browser khud satisfy karta hai. Browser
+  // na chale to purana API client + 1-min wait-retry fallback me chalta hai.
   let stealthBrowser = null;
   let stealthLaunchFn = null;
-  let stealthWarmupFn = null;
-  let stealthBroken = process.env.GOLD_DROP_WARMUP === '0';
-  let warmupData = null; // { userAgent, cookies } — run bhar reuse, security retry par refresh
-  const refreshWarmup = async () => {
-    if (stealthBroken) return false;
-    try {
-      if (!stealthWarmupFn) {
-        const mod = await loadGoldDropChecker();
-        stealthLaunchFn = mod?.launchGoldDropStealthChecker;
-        stealthWarmupFn = mod?.warmupGoldDropStealth;
-        if (typeof stealthLaunchFn !== 'function' || typeof stealthWarmupFn !== 'function') throw new Error('stealth module unavailable');
+  let stealthRegisterFn = null;
+  let stealthVerifyFn = null;
+  let stealthBroken = process.env.GOLD_DROP_BROWSER_REG === '0';
+  const getGoldDropDriver = async () => {
+    if (!stealthBroken) {
+      try {
+        if (!stealthRegisterFn) {
+          const mod = await loadGoldDropChecker();
+          stealthLaunchFn = mod?.launchGoldDropStealthChecker;
+          stealthRegisterFn = mod?.registerGoldDropStealth;
+          stealthVerifyFn = mod?.verifyGoldDropOtpStealth;
+          if (typeof stealthLaunchFn !== 'function' || typeof stealthRegisterFn !== 'function' || typeof stealthVerifyFn !== 'function') {
+            throw new Error('stealth module unavailable');
+          }
+        }
+        if (stealthBrowser?.closed) stealthBrowser = null;
+        if (!stealthBrowser) {
+          await render('Stealth browser khul raha hai');
+          stealthBrowser = await stealthLaunchFn({ chromePath: findChromePath() });
+        }
+        const handle = stealthBrowser;
+        let lastPayload = null; // register details — verify ke post-OTP details step ke liye
+        return {
+          async bootstrap() {}, // browser flow me alag session bootstrap nahi hota
+          async register(details) {
+            lastPayload = { ...details, image: Buffer.from(details.image).toString('base64') };
+            const result = await stealthRegisterFn(handle, lastPayload);
+            if (!result?.ok) {
+              const error = new Error(result?.message || 'Browser registration failed');
+              if (result?.screenshot) error.screenshot = result.screenshot;
+              throw error;
+            }
+            return result;
+          },
+          async verifyOtp(otp) {
+            const result = await stealthVerifyFn(handle, otp, lastPayload || {});
+            if (!result?.ok) {
+              const error = new Error(result?.message || 'Browser OTP verify failed');
+              if (result?.screenshot) error.screenshot = result.screenshot;
+              throw error;
+            }
+            return result;
+          },
+        };
+      } catch (error) {
+        console.warn('[GoldDrop] Stealth browser nahi chala, API fallback:', String(error?.message || error).slice(0, 160));
+        stealthBroken = true;
+        if (stealthBrowser) { await stealthBrowser.close().catch(() => {}); stealthBrowser = null; }
       }
-      if (stealthBrowser?.closed) stealthBrowser = null;
-      if (!stealthBrowser) stealthBrowser = await stealthLaunchFn({ chromePath: findChromePath() });
-      const result = await stealthWarmupFn(stealthBrowser);
-      if (!result?.ok || !result.cookies?.length) throw new Error(result?.message || 'warmup failed');
-      warmupData = { userAgent: result.userAgent, cookies: result.cookies };
-      return true;
-    } catch (error) {
-      console.warn('[GoldDrop] Stealth warmup nahi chala:', String(error?.message || error).slice(0, 160));
-      stealthBroken = true; // is run me dobara browser nahi kholenge — wait-retry jaari
-      return false;
     }
-  };
-  const applyWarmup = client => {
-    if (!warmupData) return;
-    client.setUserAgent(warmupData.userAgent);
-    client.importSessionCookies(warmupData.cookies);
+    return new GoldDropClient();
   };
   const retrySecurity = operation => retryGoldDropSecurity(operation, {
     shouldStop: () => run.stop,
-    onWait: async (attempt, max) => {
-      await render(`Security check (${goldDropApiStep}) — stealth browser se refresh, retry ${attempt}/${max}`);
-      if (run.activeClient && await refreshWarmup()) applyWarmup(run.activeClient);
-    },
+    onWait: async (attempt, max) => render(`Security check (${goldDropApiStep}) — 1 min wait, retry ${attempt}/${max}`),
   });
   try {
     telegramOtp.setActiveOtpBotProfile(source);
@@ -1723,18 +1742,10 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
       // Never reuse any number in this run, including successful or timed-out entries.
       run.exhaustedPhones.add(phone);
       await render('Registration taiyar ho raha hai');
-      const client = new GoldDropClient();
-      run.activeClient = client;
-      // Pehle number par stealth browser se security clearance lo (run bhar ke
-      // liye); cookies + UA har naye client par apply hote hain.
-      if (!warmupData && !stealthBroken) {
-        await render('Stealth browser se security clearance ho rahi hai');
-        await refreshWarmup();
-      }
-      applyWarmup(client);
+      const driver = await getGoldDropDriver();
       goldDropApiStep = 'session';
       try {
-        await retrySecurity(() => client.bootstrap({ country: 'India', countryCode: 'IN', zip: '509412' }));
+        await retrySecurity(() => driver.bootstrap({ country: 'India', countryCode: 'IN', zip: '509412' }));
       } catch (error) {
         if (!isGoldDropDailyOtpLimit(error)) throw error;
         telegramOtp.discardCurrentTelegramNumber(phone);
@@ -1751,7 +1762,7 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
       goldDropApiStep = 'registration';
       const email = goldDropEmailForMobile('itsnoob012@gmail.com', phone);
       try {
-        await retrySecurity(() => client.register({ name: 'Rahul Kumar', mobile: phone, email, pincode: '509412', code: 'KKD2LS01261026', image }));
+        await retrySecurity(() => driver.register({ name: 'Rahul Kumar', mobile: phone, email, pincode: '509412', code: 'KKD2LS01261026', image }));
       } catch (error) {
         if (!isGoldDropDailyOtpLimit(error)) throw error;
         run.exhaustedPhones.add(phone);
@@ -1788,7 +1799,7 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
       goldDropApiStep = 'OTP verification';
       let otpRejected = false;
       try {
-        await retrySecurity(() => client.verifyOtp(otp.code));
+        await retrySecurity(() => driver.verifyOtp(otp.code));
       } catch (error) {
         if (!isGoldDropInvalidOtp(error) && !isGoldDropDailyOtpLimit(error)) throw error;
         otpRejected = true;
@@ -1815,13 +1826,19 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
     }
     await render(run.stop ? '⏹ Stopped' : '✅ Target complete', true);
   } catch (error) {
+    // Browser flow ka structural failure (form/button nahi mila) — screenshot
+    // bhejo taaki asli page dikhe aur selector fix ho sake.
+    if (error?.screenshot) {
+      await ctx.telegram.sendPhoto(run.chatId,
+        { source: Buffer.from(String(error.screenshot), 'base64') },
+        { caption: `⚠️ Browser registration yahan atki: ${String(error?.message || '').slice(0, 180)}` }).catch(() => {});
+    }
     const securityCheck = !run.stop && isGoldDropSecurityCheck(error);
     const status = run.stop ? '⏹ Stopped' : securityCheck
       ? `⚠️ Website security check (${goldDropApiStep || 'unknown step'}). Official site par khud complete karein; automatic run ruka hai.`
       : `⚠️ Ruka: ${String(error?.message || 'Unknown error').slice(0, 160)}`;
     await render(status, true, securityCheck);
   } finally {
-    run.activeClient = null;
     if (stealthBrowser) await stealthBrowser.close().catch(() => {});
     telegramOtp.resetActiveOtpBotProfile();
     telegramOtp.setActiveOtpBotProfile(previousProfile);

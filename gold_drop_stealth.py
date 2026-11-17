@@ -34,11 +34,14 @@ maange to result `security_check` ke saath wapas jata hai (purane checker jaisa)
 """
 
 import argparse
+import base64
 import contextlib
 import io
 import json
+import os
 import re
 import sys
+import tempfile
 import time
 import traceback
 
@@ -98,6 +101,224 @@ def challenge_active(page):
         return True
 
 
+def _fill_field(page, field, value):
+    """Pehla visible+unused matching input bharna; bhara hua element mark hota hai."""
+    for selector in FIELD_SELECTORS[field]:
+        locator = page.locator(f"{selector}:not([data-gd-filled])")
+        try:
+            count = locator.count()
+        except Exception:
+            continue
+        for index in range(min(count, 5)):
+            element = locator.nth(index)
+            try:
+                if not element.is_visible():
+                    continue
+                element.fill(str(value), timeout=3000)
+                element.evaluate("el => el.setAttribute('data-gd-filled', '1')")
+                return True
+            except Exception:
+                continue
+    return False
+
+
+def _click_submit(page):
+    for selector in SUBMIT_SELECTORS:
+        locator = page.locator(selector)
+        try:
+            count = locator.count()
+        except Exception:
+            continue
+        for index in range(min(count, 4)):
+            element = locator.nth(index)
+            try:
+                if not element.is_visible():
+                    continue
+                element.click(timeout=5000)
+                return True
+            except Exception:
+                continue
+    return False
+
+
+def _otp_boxes_visible(page):
+    """Split-digit OTP boxes (4-8 alag maxlength=1 inputs) dikhte hain?"""
+    try:
+        locator = page.locator("input[maxlength='1']")
+        count = locator.count()
+        if count < 4:
+            return []
+        visible = [locator.nth(i) for i in range(count)]
+        visible = [el for el in visible if el.is_visible()]
+        return visible if 4 <= len(visible) <= 8 else []
+    except Exception:
+        return []
+
+
+def _otp_field_visible(page):
+    for selector in OTP_FIELD_SELECTORS:
+        locator = page.locator(selector)
+        try:
+            for index in range(min(locator.count(), 3)):
+                if locator.nth(index).is_visible():
+                    return True
+        except Exception:
+            continue
+    return bool(_otp_boxes_visible(page))
+
+
+def _fill_otp(page, otp):
+    for selector in OTP_FIELD_SELECTORS:
+        locator = page.locator(selector)
+        try:
+            for index in range(min(locator.count(), 3)):
+                element = locator.nth(index)
+                if element.is_visible():
+                    element.fill(str(otp), timeout=3000)
+                    return True
+        except Exception:
+            continue
+    boxes = _otp_boxes_visible(page)
+    if boxes:
+        for element, digit in zip(boxes, str(otp)):
+            element.fill(digit, timeout=2000)
+        return True
+    return False
+
+
+# Wizard ka agla step aaya? (koi visible khaali text input jo abhi bhara nahi)
+UNFILLED_INPUT_JS = """() => [...document.querySelectorAll(
+  'input:not([type]), input[type="text"], input[type="tel"], input[type="email"], input[type="number"]'
+)].some(el => !el.dataset.gdFilled && !el.value && el.getClientRects().length > 0
+  && !el.disabled && !el.readOnly)"""
+
+
+def _fill_details(page, fields, image_b64, image_state):
+    """Jo fields is step par visible hain wo bharo + photo upload + terms tick.
+    image_state = {"path": str, "uploaded": bool} — temp file reuse/cleanup ke liye."""
+    for field, value in fields:
+        if value:
+            _fill_field(page, field, value)
+    if image_b64 and not image_state["uploaded"]:
+        try:
+            file_input = page.locator("input[type='file']")
+            if file_input.count() > 0 and file_input.first.is_visible():
+                if not image_state["path"]:
+                    handle, image_state["path"] = tempfile.mkstemp(suffix=".jpg")
+                    with os.fdopen(handle, "wb") as tmp:
+                        tmp.write(base64.b64decode(image_b64))
+                file_input.first.set_input_files(image_state["path"])
+                image_state["uploaded"] = True
+        except Exception as error:
+            log(f"photo upload warning: {error}")
+    try:
+        boxes = page.locator("input[type='checkbox']")
+        for index in range(min(boxes.count(), 6)):
+            box = boxes.nth(index)
+            if box.is_visible() and not box.is_checked():
+                box.check()
+    except Exception:
+        pass
+
+
+def _wait_outcome(page, timeout_s):
+    """Submit ke baad poll: 'error' (site text verbatim) / 'otp' / 'done' /
+    'next' (wizard ka agla step) / 'unclear' (timeout)."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        errors = _page_errors(page)
+        if errors:
+            return ("error", " | ".join(errors)[:300])
+        if _otp_field_visible(page):
+            return ("otp", "Site ne OTP step dikhaya.")
+        try:
+            body = page.evaluate(BODY_TEXT_JS) or ""
+        except Exception:
+            body = ""
+        if SUCCESS_RE.search(body) and not challenge_active(page):
+            return ("done", "Site ne success dikhaya.")
+        try:
+            if page.evaluate(UNFILLED_INPUT_JS):
+                return ("next", "")
+        except Exception:
+            pass
+        page.wait_for_timeout(1000)
+    return ("unclear", "")
+
+
+def _page_errors(page):
+    try:
+        return [str(item).strip() for item in (page.evaluate(ERROR_TEXT_JS) or []) if str(item).strip()]
+    except Exception:
+        return []
+
+
+def _screenshot_b64(page):
+    """Failure debugging ke liye chhota JPEG screenshot (base64)."""
+    try:
+        return base64.b64encode(page.screenshot(type="jpeg", quality=55)).decode("ascii")
+    except Exception:
+        return ""
+
+
+# ─── Registration form automation (poora flow stealth browser ke andar) ───
+# API reverse-engineering ke bajaye asli form bharte hain — site ke saare
+# hidden tokens/cookies/fingerprint checks browser khud satisfy karta hai.
+
+# Priority order matters: 'pincode' me 'code' aa jata hai, isliye pincode
+# pehle. Har rule ka pehla visible+unused input liya jata hai.
+FIELD_SELECTORS = {
+    "email": [
+        "input[type='email']",
+        "input[name*='email' i]", "input[id*='email' i]", "input[placeholder*='email' i]",
+    ],
+    "pincode": [
+        "input[name*='pin' i]", "input[id*='pin' i]", "input[placeholder*='pin' i]",
+        "input[name*='zip' i]", "input[name*='postal' i]", "input[placeholder*='postal' i]",
+    ],
+    "mobile": [
+        "input[type='tel']",
+        "input[name*='mobile' i]", "input[id*='mobile' i]", "input[placeholder*='mobile' i]",
+        "input[name*='phone' i]", "input[placeholder*='phone' i]",
+        "input[name*='number' i]", "input[placeholder*='number' i]",
+        "input[name*='whatsapp' i]", "input[placeholder*='whatsapp' i]",
+    ],
+    "code": [
+        "input[name*='batch' i]", "input[id*='batch' i]", "input[placeholder*='batch' i]",
+        "input[name*='coupon' i]", "input[name*='voucher' i]", "input[placeholder*='coupon' i]",
+        "input[name*='code' i]", "input[id*='code' i]", "input[placeholder*='code' i]",
+    ],
+    "name": [
+        "input[name*='name' i]", "input[id*='name' i]", "input[placeholder*='name' i]",
+    ],
+}
+
+OTP_FIELD_SELECTORS = [
+    "input[autocomplete='one-time-code']",
+    "input[name*='otp' i]", "input[id*='otp' i]", "input[placeholder*='otp' i]",
+]
+
+SUBMIT_SELECTORS = [
+    "button[type='submit']", "input[type='submit']",
+    "button:has-text('get started')", "button:has-text('start')",
+    "button:has-text('register')", "button:has-text('submit')",
+    "button:has-text('send otp')", "button:has-text('get otp')",
+    "button:has-text('verify')", "button:has-text('confirm')",
+    "button:has-text('continue')", "button:has-text('next')",
+    "button:has-text('proceed')", "button:has-text('participate')",
+    "a:has-text('get started')", "a:has-text('register')", "a:has-text('participate')",
+    "form button",
+]
+
+ERROR_TEXT_JS = """() => [...document.querySelectorAll(
+  '.sp_error, [role="alert"], .alert-danger, .alert-danger li, .error, .text-danger, .invalid-feedback'
+)].map(el => (el.innerText || '').trim()).filter(Boolean)"""
+
+BODY_TEXT_JS = "() => (document.body?.innerText || '')"
+
+SUCCESS_RE = re.compile(r"success|verified|congrat|registered|thank\s*you", re.IGNORECASE)
+
+
 def send(payload):
     """Protocol line — stdout par sirf yehi jaana chahiye."""
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -128,6 +349,7 @@ class GoldDropStealthBrowser:
         self.pw = None
         self.browser = None
         self.context = None
+        self.reg_page = None
         self.turnstile_timeout_ms = DEFAULT_TURNSTILE_TIMEOUT_MS
 
     def launch(self, chrome_path="", headed=False, turnstile_timeout_ms=DEFAULT_TURNSTILE_TIMEOUT_MS):
@@ -241,8 +463,110 @@ class GoldDropStealthBrowser:
             except Exception:
                 pass
 
+    def register(self, *, url, name, mobile, email, pincode, code, image_b64):
+        """POORA registration stealth browser ke andar — koi raw API nahi.
+        Landing CTA ("Get Started") se lekar multi-step wizard tak: har step
+        par jo fields visible hain wo bharta hai, photo upload karta hai,
+        terms tick karta hai, site ka apna button click karta hai. Site ke
+        saare hidden tokens/cookies/fingerprint browser khud satisfy karta
+        hai. Page ko verify step ke liye rakhta hai."""
+        if self.context is None:
+            raise RuntimeError("Browser launch nahi hua — pehle launch command bhejo")
+        self._close_reg_page()
+        page = self.context.new_page()
+        self.reg_page = page
+        image_state = {"path": "", "uploaded": False}
+        try:
+            page.goto(url or REGISTER_URL, wait_until="domcontentloaded", timeout=45000)
+            deadline = time.monotonic() + 45
+            while time.monotonic() < deadline and challenge_active(page):
+                page.wait_for_timeout(1000)
+            if challenge_active(page):
+                return {"ok": False, "message": "Site ka security challenge abhi bhi active hai; baad me try karein.",
+                        "screenshot": _screenshot_b64(page)}
+            page.wait_for_timeout(1200)
+
+            fields = (("name", name), ("mobile", mobile), ("email", email),
+                      ("pincode", pincode), ("code", code))
+            clicked_any = False
+            for _step in range(4):  # landing CTA + multi-step wizard
+                _fill_details(page, fields, image_b64, image_state)
+                if not _click_submit(page):
+                    if not clicked_any:
+                        return {"ok": False, "message": "Form ya Get Started/Submit button nahi mila.",
+                                "screenshot": _screenshot_b64(page)}
+                    break
+                clicked_any = True
+                status, message = _wait_outcome(page, 15)
+                if status == "error":
+                    return {"ok": False, "message": message, "screenshot": _screenshot_b64(page)}
+                if status in ("otp", "done"):
+                    return {"ok": True, "stage": status, "message": message}
+                if status == "unclear":
+                    break
+                # "next" → wizard ka agla step, loop jaari
+            return {"ok": False, "message": "Submit ke baad site ka response clear nahi hua.",
+                    "screenshot": _screenshot_b64(page)}
+        finally:
+            if image_state["path"]:
+                try:
+                    os.unlink(image_state["path"])
+                except OSError:
+                    pass
+
+    def verify(self, otp, *, name="", mobile="", email="", pincode="", code="", image_b64=""):
+        """register() ke baad wale page par OTP bharna aur verify karna.
+        Mobile-first flows me details form OTP ke BAAD aata hai — wo step bhi
+        yahin complete hota hai."""
+        page = self.reg_page
+        if page is None:
+            raise RuntimeError("Register page nahi mila — pehle register command bhejo")
+        image_state = {"path": "", "uploaded": False}
+        try:
+            if not _fill_otp(page, otp):
+                return {"ok": False, "message": "OTP input nahi mila.",
+                        "screenshot": _screenshot_b64(page)}
+            if not _click_submit(page):
+                return {"ok": False, "message": "Verify button nahi mila.",
+                        "screenshot": _screenshot_b64(page)}
+            fields = (("name", name), ("mobile", mobile), ("email", email),
+                      ("pincode", pincode), ("code", code))
+            for _step in range(3):
+                status, message = _wait_outcome(page, 20)
+                if status == "error":
+                    return {"ok": False, "message": message}
+                if status == "done":
+                    return {"ok": True, "message": message}
+                if status == "next":
+                    # OTP ke baad details wala step aaya — bharo aur submit karo.
+                    _fill_details(page, fields, image_b64, image_state)
+                    if not _click_submit(page):
+                        return {"ok": False, "message": "Details step ka submit button nahi mila.",
+                                "screenshot": _screenshot_b64(page)}
+                    continue
+                # "otp" dobara ya "unclear" — block mat karo, reward SMS confirm karega.
+                return {"ok": True, "message": "Verify response unclear — reward SMS se confirm hoga."}
+            return {"ok": True, "message": "Verify response unclear — reward SMS se confirm hoga."}
+        finally:
+            if image_state["path"]:
+                try:
+                    os.unlink(image_state["path"])
+                except OSError:
+                    pass
+            self._close_reg_page()
+
+    def _close_reg_page(self):
+        page = getattr(self, "reg_page", None)
+        self.reg_page = None
+        if page is not None:
+            try:
+                page.close()
+            except Exception:
+                pass
+
     def close(self):
         # Playwright pehle (CDP disconnect), phir SeleniumBase apna Chrome band kare.
+        self._close_reg_page()
         for closer in (
             lambda: self.browser and self.browser.close(),
             lambda: self.pw and self.pw.stop(),
@@ -291,6 +615,28 @@ def serve():
                     int(cmd.get("timeoutMs") or 45000),
                 )
                 send({"type": "warmup", "id": cmd_id, **result})
+            elif kind == "register":
+                result = stealth.register(
+                    url=str(cmd.get("url") or ""),
+                    name=str(cmd.get("name") or ""),
+                    mobile=str(cmd.get("mobile") or ""),
+                    email=str(cmd.get("email") or ""),
+                    pincode=str(cmd.get("pincode") or ""),
+                    code=str(cmd.get("code") or ""),
+                    image_b64=str(cmd.get("image") or ""),
+                )
+                send({"type": "register", "id": cmd_id, **result})
+            elif kind == "verify":
+                result = stealth.verify(
+                    str(cmd.get("otp") or ""),
+                    name=str(cmd.get("name") or ""),
+                    mobile=str(cmd.get("mobile") or ""),
+                    email=str(cmd.get("email") or ""),
+                    pincode=str(cmd.get("pincode") or ""),
+                    code=str(cmd.get("code") or ""),
+                    image_b64=str(cmd.get("image") or ""),
+                )
+                send({"type": "verify", "id": cmd_id, **result})
             elif kind == "close":
                 break
             else:
