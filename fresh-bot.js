@@ -1581,6 +1581,8 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
       if (!/^[6789]\d{9}$/.test(phone)) throw new Error('OTP bot se valid mobile nahi mila');
       if (run.exhaustedPhones.has(phone)) throw new Error('OTP bot ne exhausted number dobara diya');
       run.phone = phone;
+      // Never reuse any number in this run, including successful or timed-out entries.
+      run.exhaustedPhones.add(phone);
       await render('Registration taiyar ho raha hai');
       const client = new GoldDropClient();
       await client.bootstrap({ country: 'India', countryCode: 'IN', zip: '509412' });
@@ -1604,15 +1606,25 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
         candidateFilter: candidate => /^\d{6}$/.test(candidate.parsed.code) && !/swiggy|swgtns/i.test(`${candidate.parsed.sender || ''} ${telegramOtp.telegramMessageText(candidate.message)}`),
       });
       checkStop();
-      if (!otp.code) throw new Error('OTP nahi mila; run ruka, registration retry nahi ki gayi');
+      if (!otp.code) {
+        // A normal inbox timeout skips this number; provider failures stay visible.
+        if (otp.error && !/^OTP bot chat me \d+s tak code nahi mila/i.test(otp.error)) throw new Error(otp.error);
+        telegramOtp.discardCurrentTelegramNumber(phone);
+        await render('OTP nahi mila — next number');
+        continue;
+      }
       const rewardBaseline = await telegramOtp.captureTelegramMessageBaseline();
       checkStop();
       await render('OTP verify ho raha hai');
       await client.verifyOtp(otp.code);
       // Even if STOP is pressed during verify, capture the resulting SMS before stopping.
-      await render('Reward SMS ke liye 10 second refresh');
-      const reward = await telegramOtp.waitForGoldDropReward(phone, { baseline: rewardBaseline, timeoutMs: 10000 });
-      if (!reward) throw new Error('Reward SMS 10 second mein nahi mila; OTP bot manually check karein');
+      await render('Reward SMS ke liye 7 second refresh');
+      const reward = await telegramOtp.waitForGoldDropReward(phone, { baseline: rewardBaseline, timeoutMs: 7000 });
+      if (!reward) {
+        telegramOtp.discardCurrentTelegramNumber(phone);
+        await render('Reward SMS nahi mila — next number');
+        continue;
+      }
       if (run.codes.has(reward.code)) throw new Error('Duplicate reward code mila; run ruka');
       // Only count a new reward after its actual SMS is delivered successfully.
       await ctx.telegram.sendMessage(run.chatId, reward.sms);
