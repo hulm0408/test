@@ -189,10 +189,11 @@ export async function registerGoldDropStealth(handle, { name, mobile, email, pin
     'Stealth registration timeout — site atki hui hai');
 }
 
-export async function verifyGoldDropOtpStealth(handle, otp) {
+export async function verifyGoldDropOtpStealth(handle, otp, details = {}) {
   if (handle?.stealth !== true) throw new Error('Stealth worker handle nahi hai');
-  const timeoutMs = Number(process.env.GOLD_DROP_VERIFY_TIMEOUT_MS || 90000);
-  return sendStealthCommand(handle, { cmd: 'verify', otp }, timeoutMs,
+  const timeoutMs = Number(process.env.GOLD_DROP_VERIFY_TIMEOUT_MS || 120000);
+  // details isliye chahiye: mobile-first flows me details form OTP ke BAAD aata hai.
+  return sendStealthCommand(handle, { cmd: 'verify', otp, ...details }, timeoutMs,
     'Stealth verify timeout — site atki hui hai');
 }
 

@@ -1688,10 +1688,12 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
           stealthBrowser = await stealthLaunchFn({ chromePath: findChromePath() });
         }
         const handle = stealthBrowser;
+        let lastPayload = null; // register details — verify ke post-OTP details step ke liye
         return {
           async bootstrap() {}, // browser flow me alag session bootstrap nahi hota
           async register(details) {
-            const result = await stealthRegisterFn(handle, { ...details, image: Buffer.from(details.image).toString('base64') });
+            lastPayload = { ...details, image: Buffer.from(details.image).toString('base64') };
+            const result = await stealthRegisterFn(handle, lastPayload);
             if (!result?.ok) {
               const error = new Error(result?.message || 'Browser registration failed');
               if (result?.screenshot) error.screenshot = result.screenshot;
@@ -1700,7 +1702,7 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
             return result;
           },
           async verifyOtp(otp) {
-            const result = await stealthVerifyFn(handle, otp);
+            const result = await stealthVerifyFn(handle, otp, lastPayload || {});
             if (!result?.ok) {
               const error = new Error(result?.message || 'Browser OTP verify failed');
               if (result?.screenshot) error.screenshot = result.screenshot;
