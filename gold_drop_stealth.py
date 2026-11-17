@@ -40,6 +40,8 @@ import io
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -351,17 +353,49 @@ class GoldDropStealthBrowser:
         self.browser = None
         self.context = None
         self.reg_page = None
+        self.mode = ""
+        self.pure_proc = None
+        self.pure_profile = ""
         self.turnstile_timeout_ms = DEFAULT_TURNSTILE_TIMEOUT_MS
 
     def launch(self, chrome_path="", headed=False, turnstile_timeout_ms=DEFAULT_TURNSTILE_TIMEOUT_MS):
         try:
-            from seleniumbase import SB  # noqa: PLC0415 - lazy: ping/selftest ko deps nahi chahiye
             from playwright.sync_api import sync_playwright  # noqa: PLC0415
         except ImportError as error:
             raise RuntimeError(
                 "Python stealth deps missing — Dockerfile ka pip install step "
                 f"dekhein ({error})"
             ) from error
+
+        self.turnstile_timeout_ms = int(turnstile_timeout_ms or DEFAULT_TURNSTILE_TIMEOUT_MS)
+        errors = []
+        # Attempt 1: SeleniumBase UC mode (patched chromedriver = best stealth).
+        try:
+            endpoint_url = self._launch_seleniumbase_uc(chrome_path, headed)
+        except Exception as error:
+            log(f"UC launch failed: {error}")
+            errors.append(f"UC: {str(error)[:120]}")
+            self._cleanup_partial()
+            # Attempt 2: pure Chrome + remote-debugging port (chromedriver hi
+            # nahi — 'Connection closed while reading from the driver' wali
+            # crash class poori tarah gayab). Stealth flags ke saath.
+            try:
+                endpoint_url = self._launch_pure_cdp(chrome_path)
+            except Exception as error2:
+                log(f"pure-CDP launch failed: {error2}")
+                errors.append(f"CDP: {str(error2)[:120]}")
+                raise RuntimeError(" | ".join(errors)) from error2
+
+        # Step 3: Playwright ko running stealthy browser se CDP par jodo.
+        self.pw = sync_playwright().start()
+        self.browser = self.pw.chromium.connect_over_cdp(endpoint_url)
+        contexts = self.browser.contexts
+        self.context = contexts[0] if contexts else self.browser.new_context()
+        log(f"launch ok via {self.mode}: {endpoint_url}")
+        return endpoint_url
+
+    def _launch_seleniumbase_uc(self, chrome_path, headed):
+        from seleniumbase import SB  # noqa: PLC0415
 
         sb_kwargs = {"uc": True}
         if chrome_path:
@@ -375,7 +409,6 @@ class GoldDropStealthBrowser:
         # Docker/Render root container me Chrome ke liye zaroori flags.
         sb_kwargs["chromium_arg"] = "--no-sandbox --disable-dev-shm-usage --disable-gpu"
 
-        # Step 1+2: SeleniumBase stealthy browser + endpoint_url.
         # SB(...) ek _GeneratorContextManager return karta hai — ASLI sb object
         # sirf __enter__() ka return value hota hai (yehi AttributeError tha).
         # SeleniumBase/UC apne messages stdout par print karta hai — protocol
@@ -386,15 +419,63 @@ class GoldDropStealthBrowser:
             # CDP mode activate karo — iske baad browser pure CDP par chalta hai.
             self.sb.activate_cdp_mode("about:blank")
             endpoint_url = self.sb.get_endpoint_url()
-        log(f"SeleniumBase CDP endpoint: {endpoint_url}")
-
-        # Step 3: Playwright ko usi stealthy browser se CDP par jodo.
-        self.pw = sync_playwright().start()
-        self.browser = self.pw.chromium.connect_over_cdp(endpoint_url)
-        contexts = self.browser.contexts
-        self.context = contexts[0] if contexts else self.browser.new_context()
-        self.turnstile_timeout_ms = int(turnstile_timeout_ms or DEFAULT_TURNSTILE_TIMEOUT_MS)
+        self.mode = "seleniumbase-uc"
         return endpoint_url
+
+    def _launch_pure_cdp(self, chrome_path):
+        """Bina chromedriver ke seedha Chrome + remote-debugging port.
+        Container me sabse stable launch; automation-detection flags off."""
+        chrome = (chrome_path or shutil.which("google-chrome-stable") or shutil.which("google-chrome")
+                  or shutil.which("chromium") or shutil.which("chromium-browser"))
+        if not chrome:
+            raise RuntimeError("Chrome/Chromium binary nahi mila")
+        profile = tempfile.mkdtemp(prefix="gd-chrome-")
+        self.pure_profile = profile
+        self.pure_proc = subprocess.Popen([
+            chrome,
+            "--remote-debugging-port=0",
+            f"--user-data-dir={profile}",
+            "--no-first-run", "--no-default-browser-check",
+            "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+            "--disable-software-rasterizer", "--disable-extensions", "--mute-audio",
+            "--disable-blink-features=AutomationControlled",
+            "--lang=en-US", "--window-size=1280,900",
+            "--headless=new",
+            "about:blank",
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        port_file = os.path.join(profile, "DevToolsActivePort")
+        for _ in range(150):  # ~45s
+            try:
+                with open(port_file, "r", encoding="utf-8") as handle:
+                    port = int(handle.readline().strip())
+                if port > 0:
+                    self.mode = "pure-cdp"
+                    return f"http://127.0.0.1:{port}"
+            except (FileNotFoundError, ValueError):
+                pass
+            if self.pure_proc.poll() is not None:
+                raise RuntimeError(
+                    f"Chrome turant band ho gaya (exit {self.pure_proc.returncode}) — container RAM/deps check karo"
+                )
+            time.sleep(0.3)
+        raise RuntimeError("Chrome DevTools port 45s me nahi mila")
+
+    def _cleanup_partial(self):
+        """Launch attempt ke beech half-open cheezein saaf karo."""
+        for closer in (
+            lambda: self.sb_cm and self.sb_cm.__exit__(None, None, None),
+            lambda: self.pure_proc is not None and self.pure_proc.poll() is None and self.pure_proc.kill(),
+        ):
+            try:
+                closer()
+            except Exception:
+                pass
+        self.sb = None
+        self.sb_cm = None
+        self.pure_proc = None
+        if self.pure_profile:
+            shutil.rmtree(self.pure_profile, ignore_errors=True)
+            self.pure_profile = ""
 
     def check(self, code, name, mobile):
         """Step 4: standard Playwright commands se official form check."""
@@ -570,21 +651,26 @@ class GoldDropStealthBrowser:
                 pass
 
     def close(self):
-        # Playwright pehle (CDP disconnect), phir SeleniumBase apna Chrome band kare.
+        # Playwright pehle (CDP disconnect), phir browser process band kare.
         self._close_reg_page()
         for closer in (
             lambda: self.browser and self.browser.close(),
             lambda: self.pw and self.pw.stop(),
             lambda: self.sb_cm and self.sb_cm.__exit__(None, None, None),
+            lambda: self.pure_proc is not None and self.pure_proc.poll() is None and self.pure_proc.terminate(),
         ):
             try:
                 closer()
             except Exception as error:
                 log(f"close warning: {error}")
+        if self.pure_profile:
+            shutil.rmtree(self.pure_profile, ignore_errors=True)
         self.browser = None
         self.pw = None
         self.sb = None
         self.sb_cm = None
+        self.pure_proc = None
+        self.pure_profile = ""
         self.context = None
 
 
@@ -611,7 +697,7 @@ def serve():
                     headed=bool(cmd.get("headed")),
                     turnstile_timeout_ms=int(cmd.get("turnstileTimeoutMs") or DEFAULT_TURNSTILE_TIMEOUT_MS),
                 )
-                send({"type": "ready", "id": cmd_id, "endpointUrl": endpoint_url})
+                send({"type": "ready", "id": cmd_id, "endpointUrl": endpoint_url, "mode": stealth.mode})
             elif kind == "check":
                 result = stealth.check(cmd.get("code") or "", cmd.get("name") or "", cmd.get("mobile") or "")
                 send({"type": "result", "id": cmd_id, **result})
