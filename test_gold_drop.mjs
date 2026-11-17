@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import { GoldDropClient, signGoldDropPayload, unwrapGoldDropResponse } from './gold-drop-client.js';
+import { extractGoldDropReward, isNewGoldDropReward } from './gold-drop-rewards.js';
 
 const key = 'abcdefghijklmnopqrstuv';
 const signed = signGoldDropPayload({ otp: '123456' }, key, 'user', '1234');
@@ -25,4 +26,10 @@ assert.equal(calls[2].options.headers.Cookie, 'gold-drop-id=u');
 assert.match(calls[2].options.body.toString(), /name="img"; filename="pack.jpg"/);
 assert.match(calls[3].url, /\/users\/verify-otp\/u\?t=/);
 await assert.rejects(client.verifyOtp('123'), /six digits/);
-console.log('Gold Drop client tests passed');
+const sample = '▪️ ʟᴀꜱᴛ ꜱᴍꜱ\n[VK-BGCITY-S] Success! Your Reward Code is 7E8RJ9MMYFWA. Please visit https://www.go\nᴛɪᴍᴇ: 17-11-2026 | 05:21 pm';
+assert.deepEqual(extractGoldDropReward(sample), { code: '7E8RJ9MMYFWA', sms: '[VK-BGCITY-S] Success! Your Reward Code is 7E8RJ9MMYFWA. Please visit https://www.go' });
+assert.equal(isNewGoldDropReward(sample, []), true);
+assert.equal(isNewGoldDropReward(sample, [`1|${sample}`]), false);
+assert.equal(isNewGoldDropReward(sample.replace('05:21', '05:22'), [`1|${sample}`]), false);
+assert.equal(extractGoldDropReward('OTP 123456, registration success'), null);
+console.log('Gold Drop client and reward tests passed');

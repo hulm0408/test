@@ -19,6 +19,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { existsSync, readFileSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { normalizeIndianMobileNumber } from './phone-utils.js';
+import { extractGoldDropReward, isNewGoldDropReward } from './gold-drop-rewards.js';
 import { parseForwarderDateTime, _extractSixDigitCode } from './firebase-numbers.js';
 import * as roster from './telegram-account-roster.js';
 import { classifyTelegramError, accountStateLine } from './telegram-account-health.js';
@@ -1795,7 +1796,7 @@ export async function waitForGoldDropReward(phone, { baseline = [], timeoutMs = 
         const cardPhone = parseTelegramNumberCard(text)?.phone || '';
         if (cardPhone && cardPhone !== phone) continue;
         if (seen.has(`${messageId(message)}|${text}`)) continue;
-        if (/success\s*!?\s*your reward code is\s+[a-z0-9]+/i.test(text) && /gold\s*drop|bigcity/i.test(text)) return text;
+        if (isNewGoldDropReward(text, baseline)) return extractGoldDropReward(text);
       }
       await sleep(Math.min(1000, Math.max(0, deadline - Date.now())));
     }
