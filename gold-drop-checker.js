@@ -91,6 +91,7 @@ export async function launchGoldDropStealthChecker({
       const id = msg.id ?? 0;
       if (msg.type === 'ready') {
         handle.endpointUrl = String(msg.endpointUrl || '');
+        handle.mode = String(msg.mode || '');
         settlePending(id, 'resolve', handle.endpointUrl);
       } else if (msg.type === 'result') {
         settlePending(id, 'resolve', { status: String(msg.status || 'unknown'), message: String(msg.message || '') });

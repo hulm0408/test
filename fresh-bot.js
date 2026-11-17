@@ -1686,6 +1686,7 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
         if (!stealthBrowser) {
           await render('Stealth browser khul raha hai');
           stealthBrowser = await stealthLaunchFn({ chromePath: findChromePath() });
+          console.log(`[GoldDrop] Stealth browser ready (${stealthBrowser.mode || 'unknown'}) ${stealthBrowser.endpointUrl}`);
         }
         const handle = stealthBrowser;
         let lastPayload = null; // register details — verify ke post-OTP details step ke liye
