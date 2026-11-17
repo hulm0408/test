@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
+import { execFileSync, spawn } from 'node:child_process';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { GoldDropClient, goldDropEmailForMobile, isGoldDropDailyOtpLimit, isGoldDropInvalidOtp, isGoldDropSecurityCheck, retryGoldDropSecurity, signGoldDropPayload, unwrapGoldDropResponse } from './gold-drop-client.js';
 import { GoldDropCookieJar } from './gold-drop-cookies.js';
 import { extractGoldDropReward, isNewGoldDropReward, findFreshGoldDropReward } from './gold-drop-rewards.js';
 import { parseTelegramNumberCard } from './telegram-otp-source.js';
-import { parseWinningCodes, checkGoldDropCode } from './gold-drop-checker.js';
+import { parseWinningCodes, checkGoldDropCode, launchGoldDropChecker, launchGoldDropStealthChecker } from './gold-drop-checker.js';
 
 const key = 'abcdefghijklmnopqrstuv';
 const signed = signGoldDropPayload({ otp: '123456' }, key, 'user', '1234');
@@ -146,4 +150,97 @@ assert.equal(otherAttempts, 1);
 let stopped = false, cancelledAttempts = 0;
 await assert.rejects(retryGoldDropSecurity(async () => { cancelledAttempts++; throw new Error(securityMessage); }, { shouldStop: () => stopped, sleep: async () => { stopped = true; } }), /stopped/);
 assert.equal(cancelledAttempts, 1);
-console.log('Gold Drop client, reward and checker tests passed');
+
+// ─── Stealth bridge: SeleniumBase CDP mode + Playwright connect_over_cdp ───
+let python3 = '';
+for (const candidate of ['python3', 'python']) {
+  try { execFileSync(candidate, ['--version'], { stdio: 'pipe' }); python3 = candidate; break; } catch {}
+}
+if (python3) {
+  // Worker ka syntax + offline selftest (browser launch nahi hota).
+  execFileSync(python3, ['-m', 'py_compile', 'gold_drop_stealth.py'], { stdio: 'pipe' });
+  assert.match(execFileSync(python3, ['gold_drop_stealth.py', '--selftest'], { encoding: 'utf8' }), /selftest OK/);
+
+  // Fake worker: NDJSON protocol, ek garbage line bhi bhejta hai (ignore honi chahiye).
+  const fakeWorker = join(mkdtempSync(join(tmpdir(), 'gold-fake-worker-')), 'fake_worker.py');
+  writeFileSync(fakeWorker, String.raw`import json, os, sys
+
+def send(payload):
+    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.flush()
+
+sys.stdout.write("ye line JSON nahi hai — bridge ko ignore karni chahiye\n")
+sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    cmd = json.loads(line)
+    kind = cmd.get("cmd")
+    if kind == "ping":
+        send({"type": "pong"})
+    elif kind == "launch":
+        send({"type": "ready", "id": cmd.get("id"), "endpointUrl": "http://127.0.0.1:19222"})
+    elif kind == "check":
+        if cmd.get("code") == "CRASH":
+            os._exit(3)
+        send({"type": "result", "id": cmd.get("id"), "status": "otp_sent", "message": "fake:" + str(cmd.get("code"))})
+    elif kind == "close":
+        break
+sys.exit(0)
+`);
+
+  // Handshake endpointUrl deta hai; check commands parse hote hain; close saaf.
+  const stealth = await launchGoldDropStealthChecker({ pythonPath: python3, workerPath: fakeWorker });
+  assert.equal(stealth.stealth, true);
+  assert.equal(stealth.endpointUrl, 'http://127.0.0.1:19222');
+  assert.deepEqual(await checkGoldDropCode(stealth, { code: 'ABC123', name: 'Rahul Kumar', mobile: '9876543210' }), { status: 'otp_sent', message: 'fake:ABC123' });
+  assert.equal((await checkGoldDropCode(stealth, { code: 'XYZ987', name: 'Rahul Kumar', mobile: '9876543210' })).message, 'fake:XYZ987');
+  await stealth.close();
+  assert.equal(stealth.closed, true);
+
+  // Worker crash → pending + baad ke checks dono saaf reject hote hain.
+  const crashing = await launchGoldDropStealthChecker({ pythonPath: python3, workerPath: fakeWorker });
+  await assert.rejects(checkGoldDropCode(crashing, { code: 'CRASH', name: 'x', mobile: '9876543210' }), /band ho gaya/);
+  await assert.rejects(checkGoldDropCode(crashing, { code: 'ABC123', name: 'x', mobile: '9876543210' }), /band hai/);
+  await crashing.close();
+
+  // Asal worker protocol smoke test — ping/pong/close bina browser ke chalta
+  // hai (seleniumbase/playwright sirf launch par import hote hain).
+  const real = spawn(python3, ['-u', 'gold_drop_stealth.py', '--serve'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  let realBuffer = '';
+  const lineWaiters = [];
+  real.stdout.setEncoding('utf8');
+  real.stdout.on('data', chunk => {
+    realBuffer += chunk;
+    let index;
+    while ((index = realBuffer.indexOf('\n')) >= 0) {
+      const line = realBuffer.slice(0, index).trim();
+      realBuffer = realBuffer.slice(index + 1);
+      if (line && lineWaiters.length) lineWaiters.shift()(line);
+    }
+  });
+  const nextLine = () => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('worker response timeout')), 15000);
+    lineWaiters.push(line => { clearTimeout(timer); resolve(line); });
+  });
+  const pongPromise = nextLine();
+  real.stdin.write(JSON.stringify({ cmd: 'ping' }) + '\n');
+  assert.deepEqual(JSON.parse(await pongPromise), { type: 'pong' });
+  const exitPromise = new Promise(resolve => real.once('exit', resolve));
+  real.stdin.write(JSON.stringify({ cmd: 'close' }) + '\n');
+  assert.equal(await Promise.race([exitPromise, new Promise((_, reject) => setTimeout(() => reject(new Error('close timeout')), 15000))]), 0);
+}
+
+// Engine selection: GOLD_DROP_STEALTH=0 → seedha puppeteer (Chromium zaroori).
+process.env.GOLD_DROP_STEALTH = '0';
+await assert.rejects(launchGoldDropChecker(''), /Chromium nahi mila/);
+// STRICT stealth (1): worker na chale to error hi milta hai, fallback nahi.
+process.env.GOLD_DROP_STEALTH = '1';
+await assert.rejects(launchGoldDropChecker('', { pythonPath: '/nonexistent-python-gold-drop' }), /start nahi hua/);
+// auto (default): stealth fail → puppeteer-real-browser fallback.
+delete process.env.GOLD_DROP_STEALTH;
+await assert.rejects(launchGoldDropChecker('', { pythonPath: '/nonexistent-python-gold-drop' }), /Chromium nahi mila/);
+
+console.log('Gold Drop client, reward, checker and stealth-bridge tests passed');
