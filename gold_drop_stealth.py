@@ -346,6 +346,7 @@ class GoldDropStealthBrowser:
 
     def __init__(self):
         self.sb = None
+        self.sb_cm = None
         self.pw = None
         self.browser = None
         self.context = None
@@ -371,13 +372,17 @@ class GoldDropStealthBrowser:
             sb_kwargs["xvfb"] = True
         else:
             sb_kwargs["headless2"] = True
+        # Docker/Render root container me Chrome ke liye zaroori flags.
+        sb_kwargs["chromium_arg"] = "--no-sandbox --disable-dev-shm-usage --disable-gpu"
 
         # Step 1+2: SeleniumBase stealthy browser + endpoint_url.
+        # SB(...) ek _GeneratorContextManager return karta hai — ASLI sb object
+        # sirf __enter__() ka return value hota hai (yehi AttributeError tha).
         # SeleniumBase/UC apne messages stdout par print karta hai — protocol
         # channel saaf rakhne ke liye launch ke dauraan stdout redirect karo.
         with contextlib.redirect_stdout(io.StringIO()):
-            self.sb = SB(**sb_kwargs)
-            self.sb.__enter__()
+            self.sb_cm = SB(**sb_kwargs)
+            self.sb = self.sb_cm.__enter__()
             # CDP mode activate karo — iske baad browser pure CDP par chalta hai.
             self.sb.activate_cdp_mode("about:blank")
             endpoint_url = self.sb.get_endpoint_url()
@@ -570,7 +575,7 @@ class GoldDropStealthBrowser:
         for closer in (
             lambda: self.browser and self.browser.close(),
             lambda: self.pw and self.pw.stop(),
-            lambda: self.sb and self.sb.__exit__(None, None, None),
+            lambda: self.sb_cm and self.sb_cm.__exit__(None, None, None),
         ):
             try:
                 closer()
@@ -579,6 +584,7 @@ class GoldDropStealthBrowser:
         self.browser = None
         self.pw = None
         self.sb = None
+        self.sb_cm = None
         self.context = None
 
 

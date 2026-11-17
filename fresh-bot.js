@@ -1712,9 +1712,12 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
           },
         };
       } catch (error) {
-        console.warn('[GoldDrop] Stealth browser nahi chala, API fallback:', String(error?.message || error).slice(0, 160));
+        console.warn('[GoldDrop] Stealth browser nahi chala:', String(error?.message || error).slice(0, 160));
         stealthBroken = true;
         if (stealthBrowser) { await stealthBrowser.close().catch(() => {}); stealthBrowser = null; }
+        // Silent API fallback ab NAHI — use pata hai usi se security check aata
+        // hai. Run yahin rok kar saaf reason batao taaki fix ho sake.
+        throw new Error(`Stealth browser nahi chala: ${String(error?.message || error).slice(0, 140)}`);
       }
     }
     return new GoldDropClient();
