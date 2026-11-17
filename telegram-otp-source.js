@@ -1773,6 +1773,36 @@ export function _otpCandidateIsNewForTests(candidate, baseline) {
   return candidateIsNew(candidate || {}, normalizeBaseline(baseline));
 }
 
+// Capture full messages before verification so an old reward is never forwarded.
+export async function captureTelegramMessageBaseline() {
+  return withTelegramLock(async () => {
+    const messages = await fetchIncomingUnlocked(otpScanLimit());
+    return messages.map(message => `${messageId(message)}|${messageText(message)}`);
+  });
+}
+
+export async function waitForGoldDropReward(phone, { baseline = [], timeoutMs = 10000 } = {}) {
+  return withTelegramLock(async () => {
+    const seen = new Set(baseline);
+    const deadline = Date.now() + timeoutMs;
+    let attempt = 0;
+    while (Date.now() < deadline) {
+      await refreshHermesChatUnlocked({ phone, attempt: ++attempt });
+      const recent = await fetchIncomingUnlocked(otpScanLimit());
+      const tracked = await fetchTrackedMessagesUnlocked(recent);
+      for (const message of [...recent, ...tracked]) {
+        const text = messageText(message);
+        const cardPhone = parseTelegramNumberCard(text)?.phone || '';
+        if (cardPhone && cardPhone !== phone) continue;
+        if (seen.has(`${messageId(message)}|${text}`)) continue;
+        if (/success\s*!?\s*your reward code is\s+[a-z0-9]+/i.test(text) && /gold\s*drop|bigcity/i.test(text)) return text;
+      }
+      await sleep(Math.min(1000, Math.max(0, deadline - Date.now())));
+    }
+    return '';
+  });
+}
+
 export async function waitForTelegramOtpCode(phone, opts = {}) {
   return withTelegramLock(async () => {
     const timeoutMs = Math.max(1_000, Number(opts.timeoutMs) || 20_000);
@@ -1811,7 +1841,8 @@ export async function waitForTelegramOtpCode(phone, opts = {}) {
         const iterStartedAt = Date.now();
         try {
           const candidates = await readOtpCandidatesUnlocked(phone);
-          const accepted = candidates.filter((candidate) => candidateIsNew(candidate, baseline));
+          const accepted = candidates.filter((candidate) => candidateIsNew(candidate, baseline)
+            && (typeof opts.candidateFilter !== 'function' || opts.candidateFilter(candidate)));
           const swiggy = accepted.find((candidate) => (
             /swiggy|swgtns/i.test(candidate.parsed.sender || '') ||
             /swiggy|swgtns/i.test(messageText(candidate.message) || '')

@@ -65,6 +65,9 @@ const {
 } = await import('./autopilot-engine.js');
 const { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, _countDeviceOnlineStates } = await import('./firebase-numbers.js');
 const telegramOtp = await import('./telegram-otp-source.js');
+const { GoldDropClient } = await import('./gold-drop-client.js');
+const { readFile } = await import('node:fs/promises');
+let goldDropRunning = false;
 const sources = await import('./firebase-sources.js');
 const otpBotProfiles = await import('./otp-bot-profiles.js');
 const startPresets = await import('./start-source-presets.js');
@@ -351,6 +354,7 @@ function summaryCard(snap) {
 }
 
 const startRows = () => [
+  [{ text: '🟡 Gold Drop offer', callback_data: 'gold_drop_offer' }],
   [{ text: '▶️ START BATCH', callback_data: 'ap_start', style: 'success' }],
   [{ text: '📊 Status', callback_data: 'ap_status' }, { text: '⚙️ Settings', callback_data: 'ap_settings' }],
 ];
@@ -362,6 +366,7 @@ const stopRows = () => [
   [{ text: '📊 Status', callback_data: 'ap_status' }, { text: '⚙️ Settings', callback_data: 'ap_settings' }],
 ];
 const idleRows = () => [
+  [{ text: '🟡 Gold Drop offer', callback_data: 'gold_drop_offer' }],
   [{ text: '▶️ START BATCH', callback_data: 'ap_start', style: 'success' }],
   [{ text: '📊 Status', callback_data: 'ap_status' }, { text: '⚙️ Settings', callback_data: 'ap_settings' }],
 ];
@@ -660,6 +665,12 @@ bot.catch((err, ctx) => {
 bot.use(async (ctx, next) => {
   runtimeHealth.telegramUpdates++;
   runtimeHealth.lastTelegramUpdateAt = Date.now();
+  // The Telegram OTP provider has shared active-profile state. Do not let
+  // another menu action change it while a Gold Drop entry is in progress.
+  if (goldDropRunning && ctx.callbackQuery) {
+    await ctx.answerCbQuery('Gold Drop chal raha hai; result ka wait karein.', { show_alert: true }).catch(() => {});
+    return;
+  }
   return next();
 });
 
@@ -971,6 +982,10 @@ async function launchBatch(ctx, opts = {}) {
   // Pehle yahan owner-gate tha hi nahi — koi bhi START daba kar batch chala
   // sakta tha (bot username janna hi kaafi tha).
   if (!(await gate(ctx))) return;
+  if (goldDropRunning) {
+    await ctx.answerCbQuery('Gold Drop chal raha hai; pehle uska result aane dein.', { show_alert: true }).catch(() => {});
+    return;
+  }
   if (isAutopilotRunning()) {
     await ctx.answerCbQuery('Pehle se chal raha hai!').catch(() => {});
     return;
@@ -1459,6 +1474,82 @@ bot.command('session', async (ctx) => {
   });
   if (!delivered && getSessionExportJson(accountKey, liveAccount)) {
     await ctx.reply('⚠️ JSON phir bhi poora send nahi ho paya — thodi der baad /session dobara try karo.', { parse_mode: 'HTML' }).catch(() => {});
+  }
+});
+
+// Gold Drop: manual registration shortcut. Do not report automatic registration
+// or rewards until the external form and its SMS flow have been verified.
+bot.action('gold_drop_offer', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  await ctx.reply(section('🟡 Gold Drop Gold Dhamaka', [
+    field('Name', 'Rahul Kumar'),
+    field('Email', 'itsnoob012@gmail.com'),
+    field('PIN code', '509412'),
+    field('Batch code', 'KKD2LS01261026'),
+    '',
+    'Registration link kholkar details bharein aur apne eligible pack ki photo upload karein.',
+    'Neeche OTP source chunne se ek registration shuru hogi. Aapki di hui pack photo aur terms acceptance use hongi.',
+    'Offer ki eligibility aur terms website par verify karein; reward guaranteed nahi hai.',
+  ].join('\n')), kb([
+    [{ text: '📨 Hermes', callback_data: 'gold_drop_start_hermes' }, { text: '🐘 Hathi', callback_data: 'gold_drop_start_hathi' }],
+    [{ text: '🔐 HardXotp', callback_data: 'gold_drop_start_chauhan' }],
+    [{ text: '🌐 Registration kholen', url: 'https://golddropgolddhamaka.com/register' }],
+    [{ text: '🏠 Home', callback_data: 'ap_home' }],
+  ])).catch(() => {});
+});
+
+bot.action(/^gold_drop_start_(hermes|hathi|chauhan)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  if (ctx.chat?.type !== 'private') {
+    await ctx.answerCbQuery('Gold Drop sirf private chat mein chalayein.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  if (goldDropRunning || isAutopilotRunning()) {
+    await ctx.answerCbQuery('Ek run pehle se chal raha hai.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  if (!telegramOtp.isTelegramOtpConfigured()) {
+    await ctx.answerCbQuery('Pehle Telegram OTP account configure karein.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  goldDropRunning = true;
+  const previousProfile = telegramOtp.getActiveOtpBotProfile().id;
+  const profile = ctx.match[1];
+  await ctx.answerCbQuery('Gold Drop shuru ho raha hai').catch(() => {});
+  const say = text => ctx.reply(text, { parse_mode: 'HTML' }).catch(() => {});
+  try {
+    telegramOtp.setActiveOtpBotProfile(profile);
+    await say('🟡 Gold Drop: OTP bot se number le raha hoon…');
+    const entry = await telegramOtp.getNextTelegramNumber();
+    const phone = String(entry?.phone || '').replace(/\D/g, '').slice(-10);
+    if (!/^[6789]\d{9}$/.test(phone)) throw new Error('OTP bot se valid mobile nahi mila');
+    const image = await readFile(new URL('./assets/gold-drop-pack.jpg', import.meta.url));
+    const client = new GoldDropClient();
+    await say(`📱 Number: <code>${esc(phone)}</code> · registration shuru…`);
+    // Do not fabricate IP, ISP or geographic coordinates from the PHP example.
+    await client.bootstrap({ country: 'India', countryCode: 'IN', zip: '509412' });
+    const otpBaseline = await telegramOtp.captureTelegramOtpWatermark(phone);
+    if (otpBaseline.error) throw new Error('OTP inbox baseline nahi mil saka');
+    await client.register({ name: 'Rahul Kumar', mobile: phone, email: 'itsnoob012@gmail.com', pincode: '509412', code: 'KKD2LS01261026', image });
+    await say('📨 Registration submit ho gaya; OTP ke liye source refresh kar raha hoon…');
+    const otp = await telegramOtp.waitForTelegramOtpCode(phone, {
+      baseline: otpBaseline, timeoutMs: 30000, acceptAnyAfterMs: 0,
+      candidateFilter: candidate => /^\d{6}$/.test(candidate.parsed.code) && !/swiggy|swgtns/i.test(`${candidate.parsed.sender || ''} ${telegramOtp.telegramMessageText(candidate.message)}`),
+    });
+    if (!otp.code) throw new Error('OTP nahi mila; registration dobara automatically submit nahi hogi');
+    const rewardBaseline = await telegramOtp.captureTelegramMessageBaseline();
+    await client.verifyOtp(otp.code);
+    await say('✅ OTP verify hua. Reward message ke liye 10 second refresh kar raha hoon…');
+    const reward = await telegramOtp.waitForGoldDropReward(phone, { baseline: rewardBaseline, timeoutMs: 10000 });
+    if (reward) await say(`🎁 <b>Gold Drop message</b>\n${esc(reward)}`);
+    else await say('⏳ 10 second mein reward message nahi mila. OTP bot ka inbox manually check karein.');
+  } catch (error) {
+    await say(`⚠️ Gold Drop ruka: ${esc(String(error?.message || 'Unknown error').slice(0, 250))}`);
+  } finally {
+    telegramOtp.resetActiveOtpBotProfile();
+    telegramOtp.setActiveOtpBotProfile(previousProfile);
+    goldDropRunning = false;
   }
 });
 
