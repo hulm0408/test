@@ -83,6 +83,47 @@ assert.match(warmJar.header('https://golddropgolddhamaka.com/api/users'), /sessi
 assert.doesNotMatch(warmJar.header('https://golddropgolddhamaka.com/api/users'), /foreign|parent|expired_one|bad name/);
 assert.equal(warmJar.header('https://other.example.com/api/users'), '');
 assert.equal(warmJar.header('http://golddropgolddhamaka.com/api/users'), ''); // secure cookies http par nahi
+
+// 🛡️ Security-check flow: register reject → sitekey site se → NoCaptchaAI
+// solve → 1 retry jisme cf-turnstile-response field ke saath token jaata hai.
+{
+  const seen = [];
+  let regAttempts = 0;
+  const nocapClient = new GoldDropClient({
+    nocapApiKey: 'nocap_testkey',
+    fetchImpl: async (url, options = {}) => {
+      const u = String(url);
+      seen.push(u);
+      if (options.method === 'POST' && u.endsWith('/api/users')) {
+        return new Response(JSON.stringify({ userKey: 'u', dataKey: key }), { status: 200 });
+      }
+      if (options.method === 'POST' && u.includes('/api/users/register/')) {
+        regAttempts++;
+        const body = options.body.toString();
+        if (!body.includes('cf-turnstile-response')) {
+          return new Response(JSON.stringify({ message: 'Please complete the security check to continue' }), { status: 400 });
+        }
+        assert.match(body, /name="cf-turnstile-response"\r\n\r\ntok123/);
+        return new Response(JSON.stringify({ statusCode: 200, message: 'OTP sent' }), { status: 200 });
+      }
+      if (u === 'https://golddropgolddhamaka.com/register') { // sitekey fetch (GET page)
+        return new Response('<html><script>window.sk="0x4AAAAAAABkMYinukE8nvUc7h";</script></html>', { status: 200 });
+      }
+      if (u.endsWith('/createTask')) {
+        return new Response(JSON.stringify({ errorId: 0, status: 'idle', taskId: 't1' }), { status: 200 });
+      }
+      if (u.endsWith('/getTaskResult')) {
+        return new Response(JSON.stringify({ errorId: 0, status: 'ready', solution: { token: 'tok123' } }), { status: 200 });
+      }
+      throw new Error(`unexpected ${u}`);
+    },
+  });
+  await nocapClient.bootstrap();
+  const secured = await nocapClient.register({ name: 'Rahul Kumar', mobile: '9876543210', email: 'x@example.com', pincode: '509412', code: 'KKD2LS01261026', image: Buffer.from('photo') });
+  assert.equal(secured.statusCode, 200);
+  assert.equal(regAttempts, 2); // pehla bina token (reject), doosra token ke saath
+  assert.ok(seen.includes('https://golddropgolddhamaka.com/register'));
+}
 await assert.rejects(client.verifyOtp('123'), /six digits/);
 const sample = '▪️ ʟᴀꜱᴛ ꜱᴍꜱ\n[VK-BGCITY-S] Success! Your Reward Code is 7E8RJ9MMYFWA. Please visit https://www.go\nᴛɪᴍᴇ: 17-11-2026 | 05:21 pm';
 assert.deepEqual(extractGoldDropReward(sample), { code: '7E8RJ9MMYFWA', sms: '[VK-BGCITY-S] Success! Your Reward Code is 7E8RJ9MMYFWA. Please visit https://www.go' });
@@ -130,10 +171,11 @@ const securityMessage = 'Please complete the security check to continue.';
 assert.equal(isGoldDropSecurityCheck(new Error(`Gold Drop HTTP 400: ${securityMessage}`)), true);
 assert.equal(isGoldDropSecurityCheck(new Error('fetch failed')), false);
 for (const status of [200, 400]) {
-  const blocked = new GoldDropClient({ fetchImpl: async () => new Response(JSON.stringify({ statusCode: 400, message: securityMessage }), { status }) });
-  await assert.rejects(blocked.bootstrap({ zip: '509412' }), isGoldDropSecurityCheck);
+  const blocked = new GoldDropClient({ nocapApiKey: 'off', fetchImpl: async () => new Response(JSON.stringify({ statusCode: 400, message: securityMessage }), { status }) });
+  await assert.rejects(blocked.bootstrap(), isGoldDropSecurityCheck);
   blocked.userKey = 'u'; blocked.dataKey = key;
-  await assert.rejects(blocked.register({ name: 'Rahul Kumar', mobile: '9876543210', email: 'x@example.com', pincode: '509412', code: 'KKD2LS01261026', image: Buffer.from('photo') }), isGoldDropSecurityCheck);
+  // Security rejection par NoCaptchaAI retry hota hai; key OFF hone par loud error.
+  await assert.rejects(blocked.register({ name: 'Rahul Kumar', mobile: '9876543210', email: 'x@example.com', pincode: '509412', code: 'KKD2LS01261026', image: Buffer.from('photo') }), /NoCaptchaAI key OFF/);
 }
 assert.deepEqual(parseWinningCodes('ABC123\nxyz987 ABC123'), ['ABC123', 'XYZ987']);
 assert.throws(() => parseWinningCodes('bad/code'), /letters\/digits/);

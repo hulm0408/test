@@ -10,6 +10,72 @@ const b64 = value => Buffer.from(value, 'utf8').toString('base64');
 // accept headers jaate hain — isi shape par site bina captcha ke accept karti hai.
 const GOLD_DROP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
+// ─── NoCaptchaAI — security check (Cloudflare Turnstile) solver ───
+// Register par "Please complete the security check" aaye tabhi use hota hai.
+// NOCAP_API_KEY env / bot Settings se override; 'off' = disabled.
+const NOCAP_API = 'https://api.nocaptchaai.com';
+const NOCAP_KEY_DEFAULT = 'nocap_eVBzrYeejjgKLoikEErH6lbP';
+
+async function nocapPost(pathname, apiKey, body, fetchImpl) {
+  const res = await fetchImpl(`${NOCAP_API}${pathname}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ clientKey: apiKey, ...body }),
+    signal: AbortSignal.timeout(30000),
+  });
+  return res.json().catch(() => ({}));
+}
+
+// createTask → getTaskResult poll → token. Loud error on failure.
+export async function nocapSolveTurnstile(apiKey, sitekey, pageUrl, { fetchImpl = fetch, timeoutMs = 50000, sleepFn = ms => new Promise(r => setTimeout(r, ms)) } = {}) {
+  let lastError = '';
+  for (const type of ['CloudflareTurnstileTaskProxyLess', 'TurnstileTaskProxyLess']) {
+    let created;
+    try {
+      created = await nocapPost('/createTask', apiKey, { task: { type, websiteURL: pageUrl, websiteKey: sitekey } }, fetchImpl);
+    } catch (error) { lastError = String(error?.message || error).slice(0, 120); continue; }
+    if ((created.errorId ?? 0) !== 0 || !created.taskId) {
+      lastError = String(created.errorDescription || created.msg || 'createTask fail').slice(0, 120);
+      continue;
+    }
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await sleepFn(2000);
+      let result;
+      try { result = await nocapPost('/getTaskResult', apiKey, { taskId: created.taskId }, fetchImpl); } catch { continue; }
+      const status = String(result.status || '').toLowerCase();
+      if (status === 'ready') {
+        const token = result.solution?.token || '';
+        if (token) return token;
+        throw new Error('NoCaptchaAI ne ready par khali token diya');
+      }
+      if (status === 'failed') throw new Error(`NoCaptchaAI task failed: ${String(result.errorDescription || result.errorCode || 'unknown').slice(0, 120)}`);
+    }
+    throw new Error(`NoCaptchaAI task ${created.taskId} ${Math.round(timeoutMs / 1000)}s me ready nahi hua`);
+  }
+  throw new Error(`NoCaptchaAI createTask fail: ${lastError || 'unknown'}`);
+}
+
+// Sitekey runtime par site ke HTML/JS bundle se nikalo (kabhi guess nahi).
+export async function fetchTurnstileSitekey(fetchImpl = fetch, pageUrl = 'https://golddropgolddhamaka.com/register') {
+  const read = async url => {
+    const res = await fetchImpl(url, { headers: { 'user-agent': GOLD_DROP_UA }, signal: AbortSignal.timeout(20000) });
+    return res.text();
+  };
+  const html = await read(pageUrl);
+  let match = /0x4[0-9A-Za-z_-]{21,}/.exec(html);
+  if (match) return match[0];
+  const scripts = [...html.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)].map(x => x[1]);
+  for (const src of scripts.slice(0, 6)) {
+    try {
+      const js = await read(new URL(src, pageUrl).href);
+      match = /0x4[0-9A-Za-z_-]{21,}/.exec(js);
+      if (match) return match[0];
+    } catch { /* agla bundle */ }
+  }
+  return '';
+}
+
 // Gmail plus addressing keeps delivery in the original inbox while using six
 // randomly selected digits from the current mobile number for each entry.
 export function goldDropEmailForMobile(email, mobile, randomIndex = randomInt) {
@@ -88,12 +154,16 @@ export function unwrapGoldDropResponse(value) {
 }
 
 export class GoldDropClient {
-  constructor({ fetchImpl = fetch, base = BASE } = {}) {
+  constructor({ fetchImpl = fetch, base = BASE, nocapApiKey = '', onStatus = null } = {}) {
     this.fetch = fetchImpl;
     this.base = base.replace(/\/$/, '');
     this.cookieJar = new GoldDropCookieJar(this.base);
     this.userKey = '';
     this.dataKey = '';
+    const key = String(nocapApiKey || '').trim();
+    this.nocapApiKey = ['off', '0', 'none'].includes(key.toLowerCase()) ? '' : (key || NOCAP_KEY_DEFAULT);
+    this.onStatus = typeof onStatus === 'function' ? onStatus : () => {};
+    this._sitekey = '';
   }
 
   async request(path, body, contentType, referer = 'https://golddropgolddhamaka.com/register') {
@@ -129,13 +199,43 @@ export class GoldDropClient {
   async register({ name, mobile, email, pincode, code, image }) {
     if (!this.userKey || !this.dataKey) throw new Error('Bootstrap required');
     if (!/^[6789]\d{9}$/.test(mobile) || !/^\d{6}$/.test(pincode) || !name || !email || !code || !image?.length) throw new Error('Invalid registration details');
+    // Attempt 1: drop.py exact (bina captcha token). Sirf "security check"
+    // rejection par NoCaptchaAI se Turnstile solve karke 1 retry.
+    try {
+      return await this._registerOnce({ name, mobile, email, pincode, code, image }, '');
+    } catch (error) {
+      if (!isGoldDropSecurityCheck(error)) throw error;
+      const token = await this._solveSecurityToken();
+      return await this._registerOnce({ name, mobile, email, pincode, code, image }, token);
+    }
+  }
+
+  async _registerOnce({ name, mobile, email, pincode, code, image }, captchaToken) {
     const t = String(Date.now());
     const signed = signGoldDropPayload({ name, mobile, email, pincode, code, terms_accepted: '1' }, this.dataKey, this.userKey, t);
     const boundary = `----GoldDrop${randomBytes(16).toString('hex')}`;
-    const chunks = [Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="data"\r\n\r\n${signed}\r\n--${boundary}\r\nContent-Disposition: form-data; name="img"; filename="sample.jpg"\r\nContent-Type: image/jpeg\r\n\r\n`), Buffer.from(image), Buffer.from(`\r\n--${boundary}--\r\n`)];
+    const captchaPart = captchaToken
+      ? `\r\n--${boundary}\r\nContent-Disposition: form-data; name="cf-turnstile-response"\r\n\r\n${captchaToken}`
+      : '';
+    const chunks = [Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="data"\r\n\r\n${signed}${captchaPart}\r\n--${boundary}\r\nContent-Disposition: form-data; name="img"; filename="sample.jpg"\r\nContent-Type: image/jpeg\r\n\r\n`), Buffer.from(image), Buffer.from(`\r\n--${boundary}--\r\n`)];
     const result = await this.request(`/users/register/${encodeURIComponent(this.userKey)}?t=${t}`, Buffer.concat(chunks), `multipart/form-data; boundary=${boundary}`);
     if (result?.statusCode !== 200) throw new Error(String(result?.message || 'Registration failed'));
     return result;
+  }
+
+  // Security check aaya → sitekey site se (cache) → NoCaptchaAI se token.
+  async _solveSecurityToken() {
+    if (!this.nocapApiKey) {
+      throw new Error('Security check maanga par NoCaptchaAI key OFF hai — Settings → 🛡️ NoCaptchaAI me key daalo.');
+    }
+    this.onStatus('Security check aaya — NoCaptchaAI se solve ho raha hai…');
+    if (!this._sitekey) {
+      this._sitekey = await fetchTurnstileSitekey(this.fetch).catch(() => '');
+      if (!this._sitekey) throw new Error('Site par Turnstile sitekey nahi mili — site ka structure badla hai, report karo.');
+    }
+    const token = await nocapSolveTurnstile(this.nocapApiKey, this._sitekey, 'https://golddropgolddhamaka.com/register', { fetchImpl: this.fetch });
+    this.onStatus('Security check solved (NoCaptchaAI) ✅ — register dobara bhej rahe hain');
+    return token;
   }
 
   async verifyOtp(otp) {

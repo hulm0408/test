@@ -1666,7 +1666,10 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
   // signed token hi site ka security proof hai → register multipart (data+img)
   // → verify-otp JSON. Koi browser/stealth launch NAHI — "browser atak gaya"
   // wali problem hi khatam. Koi security rejection aaye to turant loud error.
-  const getGoldDropDriver = async () => new GoldDropClient();
+  const getGoldDropDriver = async () => new GoldDropClient({
+    nocapApiKey: bs.getSetting('nocapApiKey'),
+    onStatus: text => render(text).catch(() => {}),
+  });
   try {
     telegramOtp.setActiveOtpBotProfile(source);
     const image = await readFile(new URL('./assets/gold-drop-pack.jpg', import.meta.url));
