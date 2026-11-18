@@ -33,7 +33,7 @@ export async function launchGoldDropStealthChecker({
   headed = process.env.GOLD_DROP_HEADED === '1',
   turnstileTimeoutMs = Number(process.env.GOLD_DROP_TURNSTILE_MS || 30000),
   launchTimeoutMs = Number(process.env.GOLD_DROP_LAUNCH_TIMEOUT_MS || 240000),
-  peakApiKey = '', // bot Settings se aa sakta hai; '' = worker ka env/built-in default
+  nocapApiKey = '', // bot Settings se aa sakta hai; '' = worker ka env/built-in default
 } = {}) {
   const proc = spawn(pythonPath, ['-u', workerPath, '--serve'], { stdio: ['pipe', 'pipe', 'inherit'] });
   const handle = {
@@ -134,7 +134,7 @@ export async function launchGoldDropStealthChecker({
     }, launchTimeoutMs);
     handle.pending.set(0, { resolve, reject, timer });
     try {
-      proc.stdin.write(JSON.stringify({ cmd: 'launch', id: 0, chromePath, headed, turnstileTimeoutMs, peakApiKey: String(peakApiKey || '') }) + '\n');
+      proc.stdin.write(JSON.stringify({ cmd: 'launch', id: 0, chromePath, headed, turnstileTimeoutMs, nocapApiKey: String(nocapApiKey || '') }) + '\n');
     } catch (error) {
       settlePending(0, 'reject', error);
     }
