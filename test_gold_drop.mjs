@@ -20,20 +20,24 @@ assert.deepEqual(JSON.parse(Buffer.from(payload, 'base64')), { otp: '123456', us
 assert.deepEqual(unwrapGoldDropResponse({ resp: Buffer.from('{"ok":true}').toString('base64') }), { ok: true });
 
 const calls = [];
-const replies = [{ userKey: 'u', dataKey: key }, { statusCode: 200 }, { statusCode: 200 }, { statusCode: 200 }];
+const replies = [{ userKey: 'u', dataKey: key }, { statusCode: 200 }, { statusCode: 200 }];
 const client = new GoldDropClient({ fetchImpl: async (url, options) => {
   calls.push({ url, options });
   return new Response(JSON.stringify(replies.shift()), { status: 200 });
 } });
-await client.bootstrap({ zip: '509412' });
+await client.bootstrap();
 await client.register({ name: 'Rahul Kumar', mobile: '9876543210', email: 'x@example.com', pincode: '509412', code: 'KKD2LS01261026', image: Buffer.from('photo') });
 await client.verifyOtp('123456');
-assert.equal(calls.length, 4);
-// Bina stealth warmup ke koi browser User-Agent nahi jaata (purana behavior).
-assert.equal(calls[0].options.headers['User-Agent'], undefined);
-assert.equal(calls[2].options.headers.Cookie, 'gold-drop-id=u');
-assert.match(calls[2].options.body.toString(), /name="img"; filename="pack.jpg"/);
-assert.match(calls[3].url, /\/users\/verify-otp\/u\?t=/);
+// drop.py method: sirf 3 calls — users (session keys) → register → verify-otp.
+// Koi get-start call nahi, koi browser/warmup nahi.
+assert.equal(calls.length, 3);
+// Har call par fixed desktop-Chrome UA jaata hai (drop.py shape).
+assert.match(calls[0].options.headers['user-agent'], /Chrome\/120\.0\.0\.0/);
+assert.equal(calls[0].options.headers['X-Requested-With'], undefined);
+assert.equal(calls[1].options.headers.Cookie, 'gold-drop-id=u');
+assert.match(calls[1].options.body.toString(), /name="img"; filename="sample.jpg"/);
+assert.match(calls[2].url, /\/users\/verify-otp\/u\?t=/);
+assert.equal(calls[2].options.headers.referer, 'https://golddropgolddhamaka.com/otp');
 
 const cookieCalls = [];
 const sessionClient = new GoldDropClient({ fetchImpl: async (url, opts) => {
@@ -47,13 +51,14 @@ const sessionClient = new GoldDropClient({ fetchImpl: async (url, opts) => {
   }
   return new Response(JSON.stringify(first ? { userKey: 'u', dataKey: key } : { statusCode: 200 }), { status: 200, headers });
 } });
-await sessionClient.bootstrap({ zip: '509412' });
+await sessionClient.bootstrap();
 await sessionClient.register({ name: 'Rahul Kumar', mobile: '9876543210', email: 'x@example.com', pincode: '509412', code: 'KKD2LS01261026', image: Buffer.from('photo') });
+// Ab get-start call nahi hoti — cookieCalls[0] = users (bootstrap), [1] = register.
+// narrow cookie ka Path=/api/users/get-start tha, isliye kahin nahi jaata.
+assert.equal(cookieCalls.length, 2);
 assert.match(cookieCalls[1].opts.headers.Cookie, /session=one/);
-assert.match(cookieCalls[1].opts.headers.Cookie, /narrow=private/);
-assert.match(cookieCalls[2].opts.headers.Cookie, /session=one/);
-assert.doesNotMatch(cookieCalls[2].opts.headers.Cookie, /narrow=private|foreign=ignored/);
-assert.match(cookieCalls[2].opts.headers.Cookie, /gold-drop-id=u/);
+assert.doesNotMatch(cookieCalls[1].opts.headers.Cookie, /narrow=private|foreign=ignored/);
+assert.match(cookieCalls[1].opts.headers.Cookie, /gold-drop-id=u/);
 const jar = new GoldDropCookieJar('https://example.com/api');
 const hdr = new Headers(); hdr.append('set-cookie', 'x=1; Path=/api; Secure');
 jar.store(hdr, 'https://example.com/api/users');
@@ -242,24 +247,13 @@ sys.exit(0)
   await assert.rejects(checkGoldDropCode(crashing, { code: 'ABC123', name: 'x', mobile: '9876543210' }), /band hai/);
   await crashing.close();
 
-  // Warmup: clearance cookies + browser UA wapas aate hain, foreign cookie
-  // jar reject karti hai, aur API client unke saath security-check-free chalta hai.
+  // Warmup: clearance cookies + browser UA wapas aate hain (checker bridge).
+  // (Registration ka direct drop.py API flow ab warmup cookies use nahi karta.)
   const warming = await launchGoldDropStealthChecker({ pythonPath: python3, workerPath: fakeWorker });
   const warm = await warmupGoldDropStealth(warming);
   assert.equal(warm.ok, true);
   assert.equal(warm.userAgent, 'FakeStealthUA/9.9');
   assert.equal(warm.cookies.length, 2);
-  const warmHeaders = [];
-  const warmClient = new GoldDropClient({ fetchImpl: async (url, options) => {
-    warmHeaders.push(options.headers);
-    return new Response(JSON.stringify({ userKey: 'u', dataKey: key }), { status: 200 });
-  } });
-  assert.equal(warmClient.importSessionCookies(warm.cookies), 1); // foreign rejected
-  warmClient.setUserAgent(warm.userAgent);
-  await warmClient.bootstrap({ zip: '509412' });
-  assert.equal(warmHeaders[0]['User-Agent'], 'FakeStealthUA/9.9');
-  assert.equal(warmHeaders[0]['Accept-Language'], 'en-US,en;q=0.9');
-  assert.match(warmHeaders[0].Cookie, /cf_clearance=abc123/);
 
   // Browser-native registration: site ke messages verbatim aate hain, taaki
   // daily-limit / invalid-OTP classification bilkul API flow jaisa rahe.

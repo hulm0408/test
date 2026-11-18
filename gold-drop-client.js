@@ -6,6 +6,9 @@ import { GoldDropCookieJar } from './gold-drop-cookies.js';
 const BASE = 'https://golddropgolddhamaka.com/api';
 const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 const b64 = value => Buffer.from(value, 'utf8').toString('base64');
+// drop.py method: har request par fixed desktop-Chrome UA + browser jaise
+// accept headers jaate hain — isi shape par site bina captcha ke accept karti hai.
+const GOLD_DROP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 // Gmail plus addressing keeps delivery in the original inbox while using six
 // randomly selected digits from the current mobile number for each entry.
@@ -85,32 +88,23 @@ export function unwrapGoldDropResponse(value) {
 }
 
 export class GoldDropClient {
-  constructor({ fetchImpl = fetch, base = BASE, userAgent = '' } = {}) {
+  constructor({ fetchImpl = fetch, base = BASE } = {}) {
     this.fetch = fetchImpl;
     this.base = base.replace(/\/$/, '');
     this.cookieJar = new GoldDropCookieJar(this.base);
     this.userKey = '';
     this.dataKey = '';
-    // Stealth warmup ka browser User-Agent — WAF clearance cookies UA-bound
-    // hoti hain, isliye browser aur API client ka UA same rakhna zaroori hai.
-    this.userAgent = String(userAgent || '');
   }
 
-  setUserAgent(userAgent) {
-    this.userAgent = String(userAgent || '');
-  }
-
-  importSessionCookies(cookies) {
-    return this.cookieJar.importCookies(cookies);
-  }
-
-  async request(path, body, contentType) {
-    const headers = { Accept: 'application/json', Origin: 'https://golddropgolddhamaka.com', Referer: 'https://golddropgolddhamaka.com/register', 'X-Requested-With': 'lodu.hehe.com' };
-    if (this.userAgent) {
-      headers['User-Agent'] = this.userAgent;
-      headers['Accept-Language'] = 'en-US,en;q=0.9';
-    }
-    if (contentType) headers['Content-Type'] = contentType;
+  async request(path, body, contentType, referer = 'https://golddropgolddhamaka.com/register') {
+    const headers = {
+      'accept': '*/*',
+      'accept-language': 'en-US,en;q=0.9',
+      'origin': 'https://golddropgolddhamaka.com',
+      'referer': referer,
+      'user-agent': GOLD_DROP_UA,
+    };
+    if (contentType) headers['content-type'] = contentType;
     const url = `${this.base}${path}`;
     const cookie = this.cookieJar.header(url, this.userKey);
     if (cookie) headers.Cookie = cookie;
@@ -123,12 +117,13 @@ export class GoldDropClient {
     return data;
   }
 
-  async bootstrap(ipInfo = {}) {
-    const body = await this.request('/users', JSON.stringify({ ipInfo }), 'application/json');
+  // drop.py init_session: sirf POST /api/users {} → userKey + dataKey.
+  // Koi get-start call nahi, koi browser/warmup nahi.
+  async bootstrap() {
+    const body = await this.request('/users', JSON.stringify({}), 'application/json');
     if (!body?.userKey || !body?.dataKey) throw new Error(String(body?.message || 'Gold Drop bootstrap did not return session keys'));
     this.userKey = String(body.userKey);
     this.dataKey = String(body.dataKey);
-    await this.request(`/users/get-start/${encodeURIComponent(this.userKey)}`, '', 'application/json');
   }
 
   async register({ name, mobile, email, pincode, code, image }) {
@@ -137,7 +132,7 @@ export class GoldDropClient {
     const t = String(Date.now());
     const signed = signGoldDropPayload({ name, mobile, email, pincode, code, terms_accepted: '1' }, this.dataKey, this.userKey, t);
     const boundary = `----GoldDrop${randomBytes(16).toString('hex')}`;
-    const chunks = [Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="data"\r\n\r\n${signed}\r\n--${boundary}\r\nContent-Disposition: form-data; name="img"; filename="pack.jpg"\r\nContent-Type: image/jpeg\r\n\r\n`), Buffer.from(image), Buffer.from(`\r\n--${boundary}--\r\n`)];
+    const chunks = [Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="data"\r\n\r\n${signed}\r\n--${boundary}\r\nContent-Disposition: form-data; name="img"; filename="sample.jpg"\r\nContent-Type: image/jpeg\r\n\r\n`), Buffer.from(image), Buffer.from(`\r\n--${boundary}--\r\n`)];
     const result = await this.request(`/users/register/${encodeURIComponent(this.userKey)}?t=${t}`, Buffer.concat(chunks), `multipart/form-data; boundary=${boundary}`);
     if (result?.statusCode !== 200) throw new Error(String(result?.message || 'Registration failed'));
     return result;
@@ -148,7 +143,7 @@ export class GoldDropClient {
     if (!/^\d{6}$/.test(otp)) throw new Error('OTP must be six digits');
     const t = String(Date.now());
     const data = signGoldDropPayload({ otp }, this.dataKey, this.userKey, t);
-    const result = await this.request(`/users/verify-otp/${encodeURIComponent(this.userKey)}?t=${t}`, JSON.stringify({ data }), 'application/json');
+    const result = await this.request(`/users/verify-otp/${encodeURIComponent(this.userKey)}?t=${t}`, JSON.stringify({ data }), 'application/json', 'https://golddropgolddhamaka.com/otp');
     if (result?.statusCode !== 200) throw new Error(String(result?.message || 'OTP verification failed'));
     return result;
   }
