@@ -32,9 +32,13 @@ ENV NODE_ENV=production \
 # Playwright ko APNA browser download karne ki zaroorat NAHI hai — wo isi
 # image ke google-chrome-stable se CDP par judta hai. xvfb optional headed
 # mode ke liye (GOLD_DROP_HEADED=1), jo Turnstile ke liye zyada human lagta hai.
+# libatomic1 ZAROORI hai: Playwright ka embedded node driver (driver/node)
+# slim image par bina iske crash hota hai — "error while loading shared
+# libraries: libatomic.so.1" → phir "Connection closed while reading from the
+# driver". (Render deploy 2026-11-18 me yahi aaya tha — mat hatana.)
 RUN set -eux; \
     apt-get -o Acquire::Retries=3 update; \
-    apt-get install -y --no-install-recommends python3 python3-venv xvfb; \
+    apt-get install -y --no-install-recommends python3 python3-venv xvfb libatomic1; \
     rm -rf /var/lib/apt/lists/*; \
     python3 -m venv /opt/golddrop-venv; \
     /opt/golddrop-venv/bin/pip install --no-cache-dir --upgrade pip; \
