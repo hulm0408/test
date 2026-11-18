@@ -1,0 +1,17 @@
+{
+  "name": "gold-drop-local",
+  "version": "1.0.0",
+  "description": "Gold Drop registration — poora system tumhare PC par, live browser ke saath",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node gold-drop-local.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "puppeteer-core": "^25.14.0",
+    "puppeteer-real-browser": "^1.4.4"
+  }
+}

@@ -37,3 +37,4 @@ data/session-files/
 .venv-golddrop/
 __pycache__/
 downloaded_files/
+gold-drop-local.zip
