@@ -437,8 +437,8 @@ const settingsRows = () => {
       { text: `📨 Telegram: ${bs.fmtSetting('telegramOtpMode')}`, callback_data: 'ap_toggle_telegram', style: 'primary' },
       { text: `🤖 ${bs.fmtSetting('otpBotProfile')}`, callback_data: 'ap_pick_otp_bot', style: 'primary' },
     ],
-    // 🛡️ peak.fo — Gold Drop security check (Turnstile) auto-solve key
-    [{ text: `🛡️ Peak.fo: ${bs.fmtSetting('peakApiKey')}`, callback_data: 'ap_peak_key', style: 'primary' }],
+    // 🛡️ NoCaptchaAI — Gold Drop security check (Turnstile) auto-solve key
+    [{ text: `🛡️ NoCaptchaAI: ${bs.fmtSetting('nocapApiKey')}`, callback_data: 'ap_nocap_key', style: 'primary' }],
     [
       { text: '🔥 Firebase Sources', callback_data: 'ap_sources', style: 'primary' },
       // 🌍 World Bot aur Toing Pro mode me proxy ka koi button/wording nahi.
@@ -1687,7 +1687,7 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
         if (stealthBrowser?.closed) stealthBrowser = null;
         if (!stealthBrowser) {
           await render('Stealth browser khul raha hai');
-          stealthBrowser = await stealthLaunchFn({ chromePath: findChromePath(), peakApiKey: bs.getSetting('peakApiKey') });
+          stealthBrowser = await stealthLaunchFn({ chromePath: findChromePath(), nocapApiKey: bs.getSetting('nocapApiKey') });
           console.log(`[GoldDrop] Stealth browser ready (${stealthBrowser.mode || 'unknown'}) ${stealthBrowser.endpointUrl}`);
         }
         const handle = stealthBrowser;
@@ -2702,36 +2702,36 @@ bot.action('ap_px_add', async (ctx) => {
   ].join('\n')), [[{ text: '↩️ Cancel', callback_data: 'ap_proxies', style: 'primary' }]]);
 });
 
-// ===== 🛡️ PEAK.FO KEY — Gold Drop security check auto-solve =====
-// peak.fo key ka live balance/status — key set karte hi confirm.
-async function peakBalanceLine(key) {
+// ===== 🛡️ NOCAPTCHAAI KEY — Gold Drop security check auto-solve =====
+// NoCaptchaAI key ka live balance/status — key set karte hi confirm.
+async function nocapBalanceLine(key) {
   try {
-    const res = await fetch('https://api.peak.fo/balance', {
-      headers: { 'X-API-Key': key },
+    const res = await fetch(`https://api.nocaptchaai.com/balance?apiKey=${encodeURIComponent(key)}`, {
       signal: AbortSignal.timeout(15000),
     });
     const data = await res.json().catch(() => ({}));
-    if (!data?.success) return { ok: false, text: String(data?.error || `HTTP ${res.status}`).slice(0, 120) };
-    const d = data.data || {};
-    return {
-      ok: true,
-      text: d.type === 'package' ? `package "${d.package_name}" — ${d.remaining_solves} solves bache` : `balance $${d.balance}`,
-    };
+    if (String(data?.status || '').toLowerCase() !== 'ok') {
+      return { ok: false, text: String(data?.error || data?.msg || `HTTP ${res.status}`).slice(0, 120) };
+    }
+    const plan = data.plan || {};
+    const extra = plan.dailyLimit ? ` · aaj ${plan.dailyLimitUsed}/${plan.dailyLimit} used` : '';
+    return { ok: true, text: `balance $${data.balance}${extra}` };
   } catch (error) {
     return { ok: null, text: String(error?.message || error).slice(0, 120) };
   }
 }
 
-bot.action('ap_peak_key', async (ctx) => {
+bot.action('ap_nocap_key', async (ctx) => {
   if (!(await gate(ctx))) return;
   await ctx.answerCbQuery().catch(() => {});
-  pending.set(String(ctx.from.id), { action: 'peak_api_key' });
-  await editOrSend(ctx, section('🛡️ Peak.fo API Key', [
-    `Abhi: <b>${esc(bs.fmtSetting('peakApiKey'))}</b>`,
+  pending.set(String(ctx.from.id), { action: 'nocap_api_key' });
+  await editOrSend(ctx, section('🛡️ NoCaptchaAI Key', [
+    `Abhi: <b>${esc(bs.fmtSetting('nocapApiKey'))}</b>`,
     ``,
-    'Ye key Gold Drop ka <b>security check (Cloudflare Turnstile)</b> ~1 second me auto-solve karti hai — "1 min wait, retry" wala phase nahi aata. Sirf successful solves ka charge lagta hai.',
+    'Ye key Gold Drop ka <b>security check (Cloudflare Turnstile)</b> auto-solve karti hai — "1 min wait, retry" wala phase nahi aata.',
+    'Key yahan se lo: nocaptchaai.com → sign up → API key (<code>nocap_...</code> se shuru).',
     ``,
-    'Ab <b>nayi key bhejo</b> (<code>pk_...</code> se shuru):',
+    'Ab <b>nayi key bhejo</b> (<code>nocap_...</code>):',
     '• <code>off</code> = auto-solve band',
     '• <code>default</code> = built-in key par wapas',
     ``,
@@ -4351,7 +4351,7 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  if (st.action === 'peak_api_key') {
+  if (st.action === 'nocap_api_key') {
     pending.delete(uid);
     const input = txt.trim();
     // Key wala message chat se turant hatao (secret).
@@ -4362,40 +4362,40 @@ bot.on('text', async (ctx) => {
     } catch {}
     const low = input.toLowerCase();
     if (low === 'default' || low === 'auto' || low === 'reset') {
-      bs.clearSetting('peakApiKey');
+      bs.clearSetting('nocapApiKey');
       await ctx.reply(
-        section('🛡️ Peak.fo Key', 'Built-in key par wapas ✅ — security check auto-solve chalu rahega.'),
+        section('🛡️ NoCaptchaAI Key', 'Built-in key par wapas ✅ — security check auto-solve chalu rahega.'),
         kb([[{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]]),
       ).catch(() => {});
       return;
     }
     if (low === 'off') {
-      bs.setSetting('peakApiKey', 'off');
+      bs.setSetting('nocapApiKey', 'off');
       await ctx.reply(
-        section('🛡️ Peak.fo Key', 'Auto-solve <b>OFF</b> kar diya — security check ka purana passive wait chalega.'),
+        section('🛡️ NoCaptchaAI Key', 'Auto-solve <b>OFF</b> kar diya — security check ka purana passive wait chalega.'),
         kb([[{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]]),
       ).catch(() => {});
       return;
     }
-    if (!/^pk_[a-z0-9]{16,}$/i.test(input)) {
+    if (!/^nocap_[A-Za-z0-9]{10,}$/.test(input)) {
       await ctx.reply(
-        section('❌ Peak.fo Key Invalid', 'Key <code>pk_...</code> se shuru hoti hai. Sahi key bhejo, ya <code>default</code> / <code>off</code> likho.'),
+        section('❌ NoCaptchaAI Key Invalid', 'Key <code>nocap_...</code> se shuru hoti hai (nocaptchaai.com → API key). Sahi key bhejo, ya <code>default</code> / <code>off</code> likho.'),
         kb([[{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]]),
       ).catch(() => {});
       return;
     }
-    bs.setSetting('peakApiKey', input);
-    const bal = await peakBalanceLine(input);
+    bs.setSetting('nocapApiKey', input);
+    const bal = await nocapBalanceLine(input);
     const lines = ['Key save ✅ — agle Gold Drop launch se yehi key use hogi.', ''];
     if (bal.ok === false) {
-      lines.push(`⚠️ Balance check: ${esc(bal.text)} — key save ho gayi hai, par peak.fo ne use accept nahi kiya. Key dobara check karo.`);
+      lines.push(`⚠️ Balance check: ${esc(bal.text)} — key save ho gayi hai, par NoCaptchaAI ne use accept nahi kiya. Key dobara check karo.`);
     } else if (bal.ok === null) {
       lines.push(`⚠️ Balance check abhi nahi ho paya (${esc(bal.text)}) — key save hai; Gold Drop launch log me status dikh jayega.`);
     } else {
-      lines.push(`✅ peak.fo confirm: <b>${esc(bal.text)}</b>`);
+      lines.push(`✅ NoCaptchaAI confirm: <b>${esc(bal.text)}</b>`);
     }
     await ctx.reply(
-      section('🛡️ Peak.fo Key Set', lines.join('\n')),
+      section('🛡️ NoCaptchaAI Key Set', lines.join('\n')),
       kb([[{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]]),
     ).catch(() => {});
     return;

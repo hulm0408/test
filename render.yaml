@@ -37,9 +37,10 @@ services:
       - key: HEADLESS
         value: "1"
       # --- Gold Drop security check (Cloudflare Turnstile) auto-solve ---
-      # PEAK_API_KEY set karne ki ZAROORAT NAHI — key code me built-in hai
-      # (gold_drop_stealth.py). Boot log me "peak.fo OK — …" line dikhna =
-      # auto-solve live hai. Apni alag key lagani ho tabhi yahan add karo.
+      # NoCaptchaAI key code me built-in hai (gold_drop_stealth.py) — kuch set
+      # karne ki ZAROORAT NAHI. Boot log me "nocaptchaai OK — …" line dikhna =
+      # auto-solve live hai. Apni alag key: NOCAP_API_KEY env ya bot ke
+      # Settings → 🛡️ NoCaptchaAI se.
       # --- Optional: cloud vault (accounts GitHub par encrypted backup) ---
       - key: GITHUB_VAULT_TOKEN
         sync: false
