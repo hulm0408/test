@@ -8,9 +8,10 @@
 //   3. phir:          npm start     (ya Windows par start-windows.bat double-click)
 //   4. browser me kholo: http://localhost:3737
 //
-// Security boundary (repo ke baaki code jaisi): site ka captcha/security
-// challenge solve ya auto-click NAHI kiya jata. Tumhara asli desktop Chrome +
-// ghar ka IP aksar challenge ko bina interaction ke paas kara deta hai.
+// Security check (Cloudflare Turnstile) ab peak.fo API se AUTO-SOLVE hota hai —
+// tumhari apni key, sirf successful solves ka charge lagta hai. Key UI me
+// prefilled hai; PEAK_API_KEY env se override kar sakte ho; khali kar doge to
+// purana tareeqa (asli Chrome + ghar ka IP se passive pass / manual checkbox).
 import http from 'node:http';
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
@@ -20,6 +21,10 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.GOLD_DROP_LOCAL_PORT || 3737);
 const SITE_URL = process.env.GOLD_DROP_SITE_URL || 'https://golddropgolddhamaka.com/register';
 const MOCK = process.env.GOLD_DROP_LOCAL_NO_BROWSER === '1'; // sirf testing
+
+// ─── peak.fo (Cloudflare Turnstile solver API) ───
+const PEAK_API = 'https://api.peak.fo';
+const PEAK_KEY_DEFAULT = process.env.PEAK_API_KEY || 'pk_b93eafb1f7d9c9911b27fa4f18ebd5658f9eebb6445b8b20';
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -48,6 +53,122 @@ function emailForMobile(email, mobile) {
   let suffix = '';
   for (let i = 0; i < 6 && digits.length; i++) suffix += digits.splice(Math.floor(Math.random() * digits.length), 1)[0];
   return `${match[1]}+${suffix}@${match[2]}`;
+}
+
+// ─── peak.fo client + Turnstile solver ───
+async function peakApi(pathname, apiKey, body) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 35000);
+  try {
+    const res = await fetch(`${PEAK_API}${pathname}`, {
+      method: body ? 'POST' : 'GET',
+      headers: { 'X-API-Key': apiKey, 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
+    });
+    const data = await res.json().catch(() => ({}));
+    return { http: res.status, ...data };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function peakBalanceText(apiKey) {
+  try {
+    const r = await peakApi('/balance', apiKey);
+    if (!r.success) return `⚠️ peak.fo balance check fail: ${r.error || `HTTP ${r.http}`} — key sahi hai? (security check auto-solve nahi chalega)`;
+    const d = r.data || {};
+    if (d.type === 'package') return `peak.fo key OK — package "${d.package_name}": ${d.remaining_solves} solves bache hain`;
+    return `peak.fo key OK — balance $${d.balance}`;
+  } catch (error) {
+    return `⚠️ peak.fo tak pahunch nahi paya: ${String(error?.message || error).slice(0, 120)} (internet check karo)`;
+  }
+}
+
+// Page load se pehle turnstile hook laga do — site jo bhi callback/getResponse
+// use kare, humara solved token wahin se milega.
+async function installTurnstileHook(pg) {
+  await pg.evaluateOnNewDocument(() => {
+    const store = { renders: [], callback: null, token: '' };
+    window.__peakStore = store;
+    const hook = () => {
+      const t = window.turnstile;
+      if (!t) { setTimeout(hook, 250); return; }
+      if (t.__peakHooked) return;
+      t.__peakHooked = true;
+      const origRender = t.render && t.render.bind(t);
+      if (origRender) {
+        t.render = (el, params) => {
+          try {
+            store.renders.push({ sitekey: (params && params.sitekey) || '', action: (params && params.action) || '', cdata: (params && params.cdata) || '' });
+            if (params && typeof params.callback === 'function') store.callback = params.callback;
+          } catch (e) {}
+          return origRender(el, params);
+        };
+      }
+      const origGet = t.getResponse && t.getResponse.bind(t);
+      t.getResponse = (...args) => (store.token || (origGet ? origGet(...args) : ''));
+    };
+    hook();
+  }).catch(() => {});
+}
+
+// Page par Turnstile widget dikhe to peak.fo se token laakar inject karo.
+// true = solve ho gaya; false = widget nahi tha ya solve nahi hua (manual fallback).
+async function solveTurnstileIfPresent(pg) {
+  const apiKey = (state.details && state.details.peakKey) || PEAK_KEY_DEFAULT;
+  if (!apiKey || !pg || pg.__peakSolved) return false;
+  const info = await pg.evaluate(() => {
+    const el = document.querySelector('.cf-turnstile[data-sitekey], [data-sitekey]');
+    const store = window.__peakStore || { renders: [] };
+    const last = store.renders[store.renders.length - 1] || {};
+    return {
+      sitekey: (el && el.getAttribute('data-sitekey')) || last.sitekey || '',
+      action: (el && el.getAttribute('data-action')) || last.action || '',
+      cdata: (el && el.getAttribute('data-cdata')) || last.cdata || '',
+      widget: !!(el || document.querySelector('iframe[src*="challenges.cloudflare.com"]') || store.renders.length),
+    };
+  }).catch(() => null);
+  if (!info || !info.widget) return false;
+  if (!info.sitekey) {
+    logLine('Turnstile widget mila par sitekey nahi mili — agar checkbox aaye to khud click karna.');
+    return false;
+  }
+  const u = new URL(pg.url());
+  let pageUrl = u.origin + u.pathname;
+  if (!pageUrl.endsWith('/')) pageUrl += '/'; // peak.fo ko trailing slash wala URL chahiye
+  logLine(`🛡️ Security check (Turnstile) mila — peak.fo se solve ho raha hai… (sitekey ${info.sitekey.slice(0, 12)}…)`);
+  let resp;
+  try {
+    resp = await peakApi('/solve', apiKey, {
+      task_type: 'TurnstileTaskProxyLess',
+      sitekey: info.sitekey,
+      url: pageUrl,
+      ...(info.action ? { action: info.action } : {}),
+      ...(info.cdata ? { cdata: info.cdata } : {}),
+    });
+  } catch (error) {
+    logLine(`⚠️ peak.fo solve fail (network): ${String(error?.message || error).slice(0, 150)} — manual checkbox fallback.`);
+    return false;
+  }
+  if (!resp.success || !resp.data || !resp.data.token) {
+    logLine(`⚠️ peak.fo solve fail: ${resp.error || `HTTP ${resp.http}`} — manual checkbox fallback.`);
+    return false;
+  }
+  const token = resp.data.token;
+  await pg.evaluate(tok => {
+    const store = window.__peakStore;
+    if (store) store.token = tok;
+    document.querySelectorAll('input[name="cf-turnstile-response"]').forEach(input => {
+      input.value = tok;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    if (store && typeof store.callback === 'function') { try { store.callback(tok); } catch (e) {} }
+  }, token).catch(() => {});
+  pg.__peakSolved = true;
+  logLine('✅ Security check SOLVED (peak.fo) — token inject ho gaya, aage badh rahe hain.');
+  return true;
 }
 
 // ─── Page helpers (browser ke andar evaluate hote hain) ───
@@ -181,6 +302,7 @@ async function fillDetailsAndSubmit(page, details, photoPath, photoState) {
       if (box.getClientRects().length && !box.checked) box.click();
     });
   }).catch(() => {});
+  await solveTurnstileIfPresent(page); // submit se pehle security check solve
   return clickButton(page);
 }
 
@@ -195,8 +317,10 @@ async function browserRegister(page, details, photoPath) {
     return { ok: false, message: 'Site ka security challenge clear nahi hua — page khud dekho aur 1 min baad dobara try karo.' };
   }
   await sleep(1500);
+  await solveTurnstileIfPresent(page);
   const photoState = { uploaded: false };
   let clickedAny = false;
+  let securityRetry = false;
   for (let step = 0; step < 4; step++) {
     const clicked = await fillDetailsAndSubmit(page, details, photoPath, photoState);
     if (!clicked) {
@@ -206,7 +330,15 @@ async function browserRegister(page, details, photoPath) {
     clickedAny = true;
     logLine(`Button click: ${clicked}`);
     const outcome = await waitOutcome(page, 15);
-    if (outcome.type === 'error') return { ok: false, message: outcome.message };
+    if (outcome.type === 'error') {
+      if (!securityRetry && /security|captcha|turnstile|verification|invalid token/i.test(outcome.message)) {
+        securityRetry = true;
+        page.__peakSolved = false; // Turnstile token single-use hota hai — naya solve
+        logLine('Security-check error mila — peak.fo se naya token lekar 1 baar dobara try…');
+        continue;
+      }
+      return { ok: false, message: outcome.message };
+    }
     if (outcome.type === 'otp' || outcome.type === 'done') return { ok: true, stage: outcome.type, message: outcome.message };
     if (outcome.type === 'unclear') break;
   }
@@ -215,6 +347,7 @@ async function browserRegister(page, details, photoPath) {
 
 async function browserVerify(page, otp, details, photoPath) {
   if (!(await fillOtp(page, otp))) return { ok: false, message: 'OTP input nahi mila.' };
+  await solveTurnstileIfPresent(page);
   const clicked = await clickButton(page);
   if (!clicked) return { ok: false, message: 'Verify button nahi mila.' };
   logLine(`Button click: ${clicked}`);
@@ -274,6 +407,7 @@ async function ensureBrowser() {
 async function freshPage() {
   if (page) { await page.close().catch(() => {}); page = null; }
   page = await browser.newPage();
+  await installTurnstileHook(page);
   return page;
 }
 
@@ -370,6 +504,8 @@ button.secondary{background:#232845;color:#e8eaf2}
 <label>Email (Gmail — har number par +suffix apne aap)</label><input id="email" value="itsnoob012@gmail.com">
 <div class="row"><div><label>PIN code</label><input id="pincode" value="509412"></div>
 <div><label>Batch code</label><input id="code" value="KKD2LS01261026"></div></div>
+<label>Peak.fo API key (security check auto-solve — bot jaisa)</label><input id="peakKey" value="${PEAK_KEY_DEFAULT}">
+<div class="sub" id="peakbal">peak.fo balance check ho raha hai…</div>
 <label>Pack photo (optional — na do to default use hogi)</label><input id="photo" type="file" accept="image/*">
 <label>Kitne numbers process karne hain?</label><input id="target" type="number" value="5" min="1" max="100">
 <button id="start">▶ START</button>
@@ -404,7 +540,7 @@ function paint(s){
 function poll(){ fetch('/state').then(function(r){return r.json()}).then(paint).catch(function(){}) }
 $('start').onclick = function(){
   var file = $('photo').files[0];
-  var body = { name:$('name').value.trim(), email:$('email').value, pincode:$('pincode').value, code:$('code').value, target:Number($('target').value)||1 };
+  var body = { name:$('name').value.trim(), email:$('email').value, pincode:$('pincode').value, code:$('code').value, target:Number($('target').value)||1, peakKey:$('peakKey').value.trim() };
   var go = function(){
     post('/start', body).then(function(r){
       if(!r.ok){ alert(r.message||'Error'); return }
@@ -421,6 +557,7 @@ $('sendNumber').onclick = function(){ var m=$('mobile').value.replace(/\\D/g,'')
 $('sendOtp').onclick = function(){ var o=$('otp').value.replace(/\\D/g,''); if(o.length!==6){alert('6-digit OTP daalo');return} $('otp').value=''; post('/otp',{otp:o}).then(poll) };
 $('reset').onclick = function(){ post('/reset').then(function(){ location.reload() }) };
 pollTimer = setInterval(poll, 1200); poll();
+post('/peak-balance',{key:$('peakKey').value.trim()}).then(function(r){ $('peakbal').textContent = r.message || ''; }).catch(function(){ $('peakbal').textContent=''; });
 </script></body></html>`;
 
 // ─── HTTP server ───
@@ -453,7 +590,9 @@ const server = http.createServer(async (req, res) => {
       if (!body.name || !body.email || !/^\d{6}$/.test(body.pincode || '') || !body.code) {
         return sendJson(res, 400, { ok: false, message: 'Naam, email, 6-digit PIN code aur batch code — sab bharna zaroori hai.' });
       }
-      state.details = { name: body.name, email: body.email, pincode: body.pincode, code: body.code };
+      const peakKey = String(body.peakKey || '').trim() || PEAK_KEY_DEFAULT;
+      state.details = { name: body.name, email: body.email, pincode: body.pincode, code: body.code, peakKey };
+      peakBalanceText(peakKey).then(text => logLine(text));
       state.target = Math.min(100, Math.max(1, Number(body.target) || 1));
       state.count = 0; state.results = []; state.log = []; state.mobile = '';
       mkdirSync(path.join(ROOT, 'data'), { recursive: true });
@@ -490,6 +629,11 @@ const server = http.createServer(async (req, res) => {
       state.status = 'idle'; state.message = ''; state.count = 0; state.mobile = '';
       if (browser) { const b = browser; browser = null; page = null; b.close().catch(() => {}); }
       return sendJson(res, 200, { ok: true });
+    }
+    if (req.method === 'POST' && url.pathname === '/peak-balance') {
+      const body = await readBody(req);
+      const key = String(body.key || '').trim() || PEAK_KEY_DEFAULT;
+      return sendJson(res, 200, { ok: true, message: await peakBalanceText(key) });
     }
     sendJson(res, 404, { ok: false, message: 'Not found' });
   } catch (error) {
