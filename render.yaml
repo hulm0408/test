@@ -36,6 +36,10 @@ services:
         value: https://vuvhbjbi-default-rtdb.firebaseio.com/
       - key: HEADLESS
         value: "1"
+      # --- Gold Drop security check (Cloudflare Turnstile) auto-solve ---
+      # PEAK_API_KEY set karne ki ZAROORAT NAHI — key code me built-in hai
+      # (gold_drop_stealth.py). Boot log me "peak.fo OK — …" line dikhna =
+      # auto-solve live hai. Apni alag key lagani ho tabhi yahan add karo.
       # --- Optional: cloud vault (accounts GitHub par encrypted backup) ---
       - key: GITHUB_VAULT_TOKEN
         sync: false
