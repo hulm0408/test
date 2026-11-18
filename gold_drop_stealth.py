@@ -872,6 +872,10 @@ def serve():
             if kind == "ping":
                 send({"type": "pong"})
             elif kind == "launch":
+                # Bot Settings se aayi key (non-empty) env/built-in ko override karti hai.
+                peak_key = str(cmd.get("peakApiKey") or "").strip()
+                if peak_key:
+                    stealth.peak_api_key = "" if peak_key.lower() in ("off", "0", "none") else peak_key
                 endpoint_url = stealth.launch(
                     chrome_path=str(cmd.get("chromePath") or ""),
                     headed=bool(cmd.get("headed")),

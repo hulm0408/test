@@ -437,6 +437,8 @@ const settingsRows = () => {
       { text: `📨 Telegram: ${bs.fmtSetting('telegramOtpMode')}`, callback_data: 'ap_toggle_telegram', style: 'primary' },
       { text: `🤖 ${bs.fmtSetting('otpBotProfile')}`, callback_data: 'ap_pick_otp_bot', style: 'primary' },
     ],
+    // 🛡️ peak.fo — Gold Drop security check (Turnstile) auto-solve key
+    [{ text: `🛡️ Peak.fo: ${bs.fmtSetting('peakApiKey')}`, callback_data: 'ap_peak_key', style: 'primary' }],
     [
       { text: '🔥 Firebase Sources', callback_data: 'ap_sources', style: 'primary' },
       // 🌍 World Bot aur Toing Pro mode me proxy ka koi button/wording nahi.
@@ -1685,7 +1687,7 @@ async function startGoldDropRun(ctx, source, target, cardMessageId) {
         if (stealthBrowser?.closed) stealthBrowser = null;
         if (!stealthBrowser) {
           await render('Stealth browser khul raha hai');
-          stealthBrowser = await stealthLaunchFn({ chromePath: findChromePath() });
+          stealthBrowser = await stealthLaunchFn({ chromePath: findChromePath(), peakApiKey: bs.getSetting('peakApiKey') });
           console.log(`[GoldDrop] Stealth browser ready (${stealthBrowser.mode || 'unknown'}) ${stealthBrowser.endpointUrl}`);
         }
         const handle = stealthBrowser;
@@ -2698,6 +2700,43 @@ bot.action('ap_px_add', async (ctx) => {
     ``,
     sub('Add hote hi rotation ON — bot turant nayi IP se traffic bhejega.'),
   ].join('\n')), [[{ text: '↩️ Cancel', callback_data: 'ap_proxies', style: 'primary' }]]);
+});
+
+// ===== 🛡️ PEAK.FO KEY — Gold Drop security check auto-solve =====
+// peak.fo key ka live balance/status — key set karte hi confirm.
+async function peakBalanceLine(key) {
+  try {
+    const res = await fetch('https://api.peak.fo/balance', {
+      headers: { 'X-API-Key': key },
+      signal: AbortSignal.timeout(15000),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!data?.success) return { ok: false, text: String(data?.error || `HTTP ${res.status}`).slice(0, 120) };
+    const d = data.data || {};
+    return {
+      ok: true,
+      text: d.type === 'package' ? `package "${d.package_name}" — ${d.remaining_solves} solves bache` : `balance $${d.balance}`,
+    };
+  } catch (error) {
+    return { ok: null, text: String(error?.message || error).slice(0, 120) };
+  }
+}
+
+bot.action('ap_peak_key', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  pending.set(String(ctx.from.id), { action: 'peak_api_key' });
+  await editOrSend(ctx, section('🛡️ Peak.fo API Key', [
+    `Abhi: <b>${esc(bs.fmtSetting('peakApiKey'))}</b>`,
+    ``,
+    'Ye key Gold Drop ka <b>security check (Cloudflare Turnstile)</b> ~1 second me auto-solve karti hai — "1 min wait, retry" wala phase nahi aata. Sirf successful solves ka charge lagta hai.',
+    ``,
+    'Ab <b>nayi key bhejo</b> (<code>pk_...</code> se shuru):',
+    '• <code>off</code> = auto-solve band',
+    '• <code>default</code> = built-in key par wapas',
+    ``,
+    sub('Key wala message bot turant delete kar dega (secret). Balance check karke confirm hoga ki key kaam kar rahi hai.'),
+  ].join('\n')), [[{ text: '↩️ Cancel', callback_data: 'ap_settings', style: 'primary' }]]);
 });
 
 // ===== 🧙‍♂️ QUICK SETUP WIZARD — ek tap me saara setup =====
@@ -4309,6 +4348,56 @@ bot.on('text', async (ctx) => {
     } catch (error) {
       await ctx.reply(`⚠️ ${String(error?.message || 'Invalid codes')}`).catch(() => {});
     }
+    return;
+  }
+
+  if (st.action === 'peak_api_key') {
+    pending.delete(uid);
+    const input = txt.trim();
+    // Key wala message chat se turant hatao (secret).
+    try {
+      if (ctx.chat?.id && ctx.message?.message_id) {
+        await bot.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id);
+      }
+    } catch {}
+    const low = input.toLowerCase();
+    if (low === 'default' || low === 'auto' || low === 'reset') {
+      bs.clearSetting('peakApiKey');
+      await ctx.reply(
+        section('🛡️ Peak.fo Key', 'Built-in key par wapas ✅ — security check auto-solve chalu rahega.'),
+        kb([[{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]]),
+      ).catch(() => {});
+      return;
+    }
+    if (low === 'off') {
+      bs.setSetting('peakApiKey', 'off');
+      await ctx.reply(
+        section('🛡️ Peak.fo Key', 'Auto-solve <b>OFF</b> kar diya — security check ka purana passive wait chalega.'),
+        kb([[{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]]),
+      ).catch(() => {});
+      return;
+    }
+    if (!/^pk_[a-z0-9]{16,}$/i.test(input)) {
+      await ctx.reply(
+        section('❌ Peak.fo Key Invalid', 'Key <code>pk_...</code> se shuru hoti hai. Sahi key bhejo, ya <code>default</code> / <code>off</code> likho.'),
+        kb([[{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]]),
+      ).catch(() => {});
+      return;
+    }
+    bs.setSetting('peakApiKey', input);
+    const bal = await peakBalanceLine(input);
+    const lines = ['Key save ✅ — agle Gold Drop launch se yehi key use hogi.', ''];
+    if (bal.ok === false) {
+      lines.push(`⚠️ Balance check: ${esc(bal.text)} — key save ho gayi hai, par peak.fo ne use accept nahi kiya. Key dobara check karo.`);
+    } else if (bal.ok === null) {
+      lines.push(`⚠️ Balance check abhi nahi ho paya (${esc(bal.text)}) — key save hai; Gold Drop launch log me status dikh jayega.`);
+    } else {
+      lines.push(`✅ peak.fo confirm: <b>${esc(bal.text)}</b>`);
+    }
+    await ctx.reply(
+      section('🛡️ Peak.fo Key Set', lines.join('\n')),
+      kb([[{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }]]),
+    ).catch(() => {});
     return;
   }
 

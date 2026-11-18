@@ -49,6 +49,9 @@ const SPECS = {
   otpBotProfile:     { dflt: 'hermes', label: '📨 OTP bot (hermes = @HermeshuOTPROBOT, hathi = @Hathi_otp_bot, chauhan = @HardXotp_Bot, custom_* = aapka trained bot)',
                        enum: ['hermes', 'hathi', 'chauhan'], allowKnownCustom: true },
   toingAccessKey:    { string: true, dflt: 'TNG-M923-VR10-8SQF', label: '🔑 Toing Pro Access Key' },
+  // 🛡️ peak.fo — Gold Drop security check (Cloudflare Turnstile) auto-solve.
+  // '' (unset) = code ki built-in key; 'off' = auto-solve band; 'pk_…' = apni key.
+  peakApiKey:        { string: true, dflt: '', label: '🛡️ Peak.fo API key (Gold Drop security check auto-solve)' },
 };
 
 const ENV_MAP = {
@@ -66,6 +69,7 @@ const ENV_MAP = {
   telegramOtpTimeoutMs: 'TELEGRAM_OTP_TIMEOUT_MS',
   telegramOtpRefreshMs: 'TELEGRAM_OTP_REFRESH_MS',
   toingAccessKey: 'TOING_ACCESS_KEY',
+  peakApiKey: 'PEAK_API_KEY',
 };
 
 function load() {
@@ -147,6 +151,17 @@ export function resetSettings() {
   return { ok: true };
 }
 
+// String setting wapas default/env par laane ke liye (stored value delete).
+export function clearSetting(key) {
+  if (!SPECS[key]) return { ok: false, error: `Unknown setting: ${key}` };
+  const s = load();
+  delete s[key];
+  const db = getDb();
+  db.freshSettings = s;
+  saveDb(db);
+  return { ok: true };
+}
+
 // Engine ko dene ke liye — knobs + spec metadata (UI labels ke liye)
 export function settingsSpecs() {
   return Object.fromEntries(Object.entries(SPECS).map(([k, v]) => [k, { ...v, value: getSetting(k) }]));
@@ -163,6 +178,12 @@ export function fmtSetting(key) {
   if (key === 'accountEngine') {
     if (v === 'toing_pro') return 'Toing Pro Web';
     return v === 'worldbot' ? 'OTP bot + Swiggy World' : 'OTP bot + Chromium';
+  }
+  if (key === 'peakApiKey') {
+    const raw = String(v || '').trim();
+    if (!raw) return 'built-in ✅';
+    if (raw.toLowerCase() === 'off') return 'OFF';
+    return `${raw.slice(0, 6)}…${raw.slice(-4)}`; // key kabhi poori mat dikhao
   }
   if (key === 'gapMs' || key === 'backoffMs' || key === 'otpWaitMs' || key === 'otpTimeoutMs' || key === 'telegramOtpTimeoutMs' || key === 'telegramOtpRefreshMs') {
     return v >= 60000 ? `${Math.round(v / 60000)} min` : `${Math.round(v / 1000)}s`;
