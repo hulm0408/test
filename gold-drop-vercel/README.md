@@ -7,7 +7,7 @@ instance reuse hota hai (Vercel default), warna "Session expire" message ke saat
 ## Deploy
 Vercel Dashboard → New Project → repo `hulm0408/workwr` → **Root Directory: `gold-drop-vercel`** → Deploy.
 
-Env (optional): `NOCAP_API_KEY` — UI field override karti hai.
+Env (optional): `NOCAP_API_KEY` — UI field override karti hai. `APP_PASSWORD` — login password (default `rahul@123`, zaroor badal lo).
 
 ## Local test
 ```

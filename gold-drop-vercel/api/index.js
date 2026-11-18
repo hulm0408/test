@@ -4,6 +4,7 @@
 import http from 'node:http';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { registerGoldDrop, verifyGoldDropOtp } from './_gold-drop.js';
 
@@ -11,6 +12,37 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const NOCAP_API = 'https://api.nocaptchaai.com';
 const NOCAP_KEY_DEFAULT = process.env.NOCAP_API_KEY || 'nocap_eVBzrYeejjgKLoikEErH6lbP';
 const DEFAULT_PHOTO = readFileSync(path.join(ROOT, 'gold-drop-pack.jpg')).toString('base64');
+
+// ─── LOGIN (public Vercel URL hai — password ke bina koi use na kar paye) ───
+const APP_PASSWORD = process.env.APP_PASSWORD || 'rahul@123';
+const AUTH_COOKIE = `gd_auth=${createHash('sha256').update(`golddrop:${APP_PASSWORD}`).digest('hex')}`;
+
+function isAuthed(req) {
+  const cookie = String(req.headers.cookie || '');
+  return cookie.split(';').map(x => x.trim()).includes(AUTH_COOKIE);
+}
+
+const LOGIN_HTML = `<!doctype html>
+<html lang="hi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gold Drop — Login</title>
+<style>
+body{background:#0f1220;color:#e8eaf2;font-family:system-ui,Segoe UI,Roboto,sans-serif;margin:0;padding:24px;min-height:100vh;display:flex;align-items:center;justify-content:center}
+.card{width:100%;max-width:360px;background:#181c2e;border:1px solid #2a3050;border-radius:14px;padding:24px}
+h1{font-size:20px;margin:0 0 4px} .sub{color:#8a90ad;font-size:13px;margin-bottom:16px}
+input,button{width:100%;box-sizing:border-box;padding:10px 12px;border-radius:9px;border:1px solid #2a3050;background:#0f1220;color:#e8eaf2;font-size:15px}
+button{background:#f7b500;color:#191300;font-weight:700;border:none;cursor:pointer;margin-top:14px}
+.err{color:#ff6b6b;font-size:13px;margin-top:10px;display:none}
+</style></head><body><div class="card">
+<h1>🟡 Gold Drop</h1>
+<div class="sub">Login karo — sirf apne log.</div>
+<form method="POST" action="/login">
+<input name="password" type="password" placeholder="Password" autofocus>
+<button type="submit">🔓 Login</button>
+<div class="err" id="err">Galat password</div>
+</form>
+</div>
+<script>if(location.search.indexOf('wrong')>-1)document.getElementById('err').style.display='block';</script>
+</body></html>`;
 
 // ─── Gmail plus addressing: har number par +suffix ───
 function emailForMobile(email, mobile) {
@@ -114,7 +146,7 @@ button.secondary{background:#232845;color:#e8eaf2}
 .badge{display:inline-block;padding:2px 10px;border-radius:99px;background:#232845;font-size:12px}
 </style></head><body><div class="card">
 <h1>🟡 Gold Drop</h1>
-<div class="sub">Direct API method — koi browser nahi, sab cloud par chalta hai. Number apne OTP bot se laao.</div>
+<div class="sub">Direct API method — koi browser nahi, sab cloud par chalta hai. Number apne OTP bot se laao. <a href="/logout" style="color:#f7b500">Logout</a></div>
 <div id="setup">
 <label>Naam</label><input id="name" value="Rahul Kumar">
 <label>Email (Gmail — har number par +suffix apne aap)</label><input id="email" value="itsnoob012@gmail.com">
@@ -194,6 +226,42 @@ function readBody(req) {
 export default async function handler(req, res) {
   const url = new URL(req.url, 'http://localhost');
   try {
+    // Login routes — bina auth ke accessible
+    if (url.pathname === '/login') {
+      if (req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(LOGIN_HTML);
+        return;
+      }
+      if (req.method === 'POST') {
+        let raw = '';
+        await new Promise(resolve => { req.on('data', c => { raw += c; }); req.on('end', resolve); });
+        const params = new URLSearchParams(raw);
+        if (params.get('password') === APP_PASSWORD) {
+          res.writeHead(302, { 'Set-Cookie': `${AUTH_COOKIE}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`, 'Location': '/' });
+          res.end();
+        } else {
+          res.writeHead(302, { 'Location': '/login?wrong=1' });
+          res.end();
+        }
+        return;
+      }
+    }
+    if (url.pathname === '/logout') {
+      res.writeHead(302, { 'Set-Cookie': 'gd_auth=; Path=/; HttpOnly; Max-Age=0', 'Location': '/login' });
+      res.end();
+      return;
+    }
+    // Baaki sab — login zaroori
+    if (!isAuthed(req)) {
+      if (req.method === 'GET') {
+        res.writeHead(302, { 'Location': '/login' });
+        res.end();
+      } else {
+        sendJson(res, 401, { ok: false, message: 'Login karo pehle' });
+      }
+      return;
+    }
     if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(PAGE_HTML);
