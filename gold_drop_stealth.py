@@ -28,9 +28,12 @@ Commands (stdin, ek JSON object per line):
   {"cmd": "ping"}   -> {"type": "pong"}
   {"cmd": "close"}  -> worker safai se band ho kar exit 0 karta hai.
 
-Security boundary: ye worker site ka security check bypass/solve NAHI karta —
-sirf ek saaf stealth browser deta hai. Agar official widget human interaction
-maange to result `security_check` ke saath wapas jata hai (purane checker jaisa).
+Security check (Cloudflare Turnstile) ab peak.fo API se AUTO-SOLVE hota hai
+(PEAK_API_KEY env ya built-in default key; TurnstileTaskProxyLess — proxy ki
+zaroorat nahi; sirf successful solves billed). Solved token page ke widget me
+inject hota hai (hidden input + site ka callback + getResponse wrapper —
+teeno tarike cover). Key off (PEAK_API_KEY=off) ya solve fail hone par purana
+passive behavior: challenge asli browser fingerprint se khud clear hone ka wait.
 """
 
 import argparse
@@ -46,9 +49,101 @@ import sys
 import tempfile
 import time
 import traceback
+import urllib.parse
+import urllib.request
 
 SITE_URL = "https://www.golddropwins.com/"
+REGISTER_URL = "https://golddropgolddhamaka.com/register"  # checker hamesha url bhejta hai; ye sirf safety default hai
 DEFAULT_TURNSTILE_TIMEOUT_MS = 30000
+
+# peak.fo — Cloudflare Turnstile solver API (https://peak.fo/docs).
+# PEAK_API_KEY env se override; "off"/"0" rakho to auto-solve poori tarah band.
+# Sirf successful solves billed hote hain (~$0.0012/solve, proxyless mode).
+PEAK_API = "https://api.peak.fo"
+PEAK_API_KEY_DEFAULT = "pk_b93eafb1f7d9c9911b27fa4f18ebd5658f9eebb6445b8b20"
+
+
+def _peak_api(pathname, api_key, body=None, timeout=35):
+    """peak.fo REST call — stdlib urllib (koi naya pip dep nahi)."""
+    payload = json.dumps(body).encode("utf-8") if body else None
+    req = urllib.request.Request(
+        PEAK_API + pathname,
+        data=payload,
+        headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+        method="POST" if body else "GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as res:
+        return json.loads(res.read().decode("utf-8"))
+
+
+def _peak_balance_text(api_key):
+    """Launch log ke liye key/balance status — key kaam kar rahi hai ya nahi turant pata."""
+    try:
+        resp = _peak_api("/balance", api_key, timeout=15)
+    except Exception as error:
+        return f"peak.fo balance check fail: {str(error)[:120]}"
+    if not resp.get("success"):
+        return f"peak.fo key issue: {resp.get('error') or 'unknown'} — auto-solve nahi chalega"
+    data = resp.get("data") or {}
+    if data.get("type") == "package":
+        return (f"peak.fo OK — package \"{data.get('package_name')}\": "
+                f"{data.get('remaining_solves')} solves bache")
+    return f"peak.fo OK — balance ${data.get('balance')}"
+
+
+# Page load se pehle turnstile hook — site callback/getResponse/hidden input
+# jo bhi use kare, humara solved token wahin se milega.
+TURNSTILE_HOOK_JS = """() => {
+  const store = { renders: [], callback: null, token: '' };
+  window.__peakStore = store;
+  const hook = () => {
+    const t = window.turnstile;
+    if (!t) { setTimeout(hook, 250); return; }
+    if (t.__peakHooked) return;
+    t.__peakHooked = true;
+    const origRender = t.render && t.render.bind(t);
+    if (origRender) {
+      t.render = (el, params) => {
+        try {
+          store.renders.push({
+            sitekey: (params && params.sitekey) || '',
+            action: (params && params.action) || '',
+            cdata: (params && params.cdata) || '',
+          });
+          if (params && typeof params.callback === 'function') store.callback = params.callback;
+        } catch (e) {}
+        return origRender(el, params);
+      };
+    }
+    const origGet = t.getResponse && t.getResponse.bind(t);
+    t.getResponse = (...args) => (store.token || (origGet ? origGet(...args) : ''));
+  };
+  hook();
+}"""
+
+TURNSTILE_INFO_JS = """() => {
+  const el = document.querySelector('.cf-turnstile[data-sitekey], [data-sitekey]');
+  const store = window.__peakStore || { renders: [] };
+  const last = store.renders[store.renders.length - 1] || {};
+  return {
+    sitekey: (el && el.getAttribute('data-sitekey')) || last.sitekey || '',
+    action: (el && el.getAttribute('data-action')) || last.action || '',
+    cdata: (el && el.getAttribute('data-cdata')) || last.cdata || '',
+    widget: !!(el || document.querySelector('iframe[src*="challenges.cloudflare.com"]')
+      || store.renders.length),
+  };
+}"""
+
+TURNSTILE_INJECT_JS = """token => {
+  const store = window.__peakStore;
+  if (store) store.token = token;
+  document.querySelectorAll('input[name="cf-turnstile-response"]').forEach(input => {
+    input.value = token;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  });
+  if (store && typeof store.callback === 'function') { try { store.callback(token); } catch (e) {} }
+}"""
 
 # gold-drop-checker.js ke puppeteer version ke saath same classification.
 OTP_SENT_RE = re.compile(
@@ -357,6 +452,10 @@ class GoldDropStealthBrowser:
         self.pure_proc = None
         self.pure_profile = ""
         self.turnstile_timeout_ms = DEFAULT_TURNSTILE_TIMEOUT_MS
+        # peak.fo auto-solve — env override; "off" rakho to band
+        env_key = (os.environ.get("PEAK_API_KEY") or "").strip()
+        self.peak_api_key = "" if env_key.lower() in ("off", "0", "none") else (env_key or PEAK_API_KEY_DEFAULT)
+        self._peak_solved = False
 
     def launch(self, chrome_path="", headed=False, turnstile_timeout_ms=DEFAULT_TURNSTILE_TIMEOUT_MS):
         try:
@@ -392,6 +491,8 @@ class GoldDropStealthBrowser:
         contexts = self.browser.contexts
         self.context = contexts[0] if contexts else self.browser.new_context()
         log(f"launch ok via {self.mode}: {endpoint_url}")
+        log(_peak_balance_text(self.peak_api_key) if self.peak_api_key
+            else "peak.fo auto-solve OFF (PEAK_API_KEY=off)")
         return endpoint_url
 
     def _launch_seleniumbase_uc(self, chrome_path, headed):
@@ -477,13 +578,70 @@ class GoldDropStealthBrowser:
             shutil.rmtree(self.pure_profile, ignore_errors=True)
             self.pure_profile = ""
 
+    def _new_hooked_page(self):
+        """Naya page + turnstile hook + peak-solve flag reset."""
+        page = self.context.new_page()
+        self._peak_solved = False
+        try:
+            page.add_init_script(TURNSTILE_HOOK_JS)
+        except Exception:
+            pass
+        return page
+
+    def _solve_turnstile(self, page):
+        """Page par Turnstile widget dikhe to peak.fo se token laakar inject karo.
+        True = solve ho gaya; False = widget nahi / key nahi / solve fail."""
+        if not self.peak_api_key or self._peak_solved:
+            return False
+        try:
+            info = page.evaluate(TURNSTILE_INFO_JS)
+        except Exception:
+            return False
+        if not info or not info.get("widget"):
+            return False
+        sitekey = info.get("sitekey") or ""
+        if not sitekey:
+            log("Turnstile widget mila par sitekey nahi mili — passive wait hi rahega")
+            return False
+        page_url = page.url or ""
+        try:
+            parts = urllib.parse.urlsplit(page_url)
+            page_url = f"{parts.scheme}://{parts.netloc}{parts.path or '/'}"
+            if not page_url.endswith("/"):
+                page_url += "/"  # peak.fo ko trailing slash wala URL chahiye
+        except Exception:
+            pass
+        log(f"security check (Turnstile) mila — peak.fo se solve ho raha hai (sitekey {sitekey[:12]}...)")
+        payload = {"task_type": "TurnstileTaskProxyLess", "sitekey": sitekey, "url": page_url}
+        if info.get("action"):
+            payload["action"] = info["action"]
+        if info.get("cdata"):
+            payload["cdata"] = info["cdata"]
+        try:
+            resp = _peak_api("/solve", self.peak_api_key, payload)
+        except Exception as error:
+            log(f"peak.fo solve fail (network): {str(error)[:150]} — passive fallback")
+            return False
+        token = (resp.get("data") or {}).get("token") if resp.get("success") else ""
+        if not token:
+            log(f"peak.fo solve fail: {resp.get('error') or 'unknown'} — passive fallback")
+            return False
+        try:
+            page.evaluate(TURNSTILE_INJECT_JS, token)
+        except Exception as error:
+            log(f"turnstile token inject fail: {str(error)[:120]}")
+            return False
+        self._peak_solved = True
+        log("security check SOLVED via peak.fo — token inject ho gaya")
+        return True
+
     def check(self, code, name, mobile):
         """Step 4: standard Playwright commands se official form check."""
         if self.context is None:
             raise RuntimeError("Browser launch nahi hua — pehle launch command bhejo")
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError  # noqa: PLC0415
 
-        page = self.context.new_page()
+        page = self._new_hooked_page()
         try:
             page.goto(SITE_URL, wait_until="domcontentloaded", timeout=45000)
             page.wait_for_selector("#registrationForm", timeout=15000)
@@ -492,6 +650,17 @@ class GoldDropStealthBrowser:
             page.fill("#mobile", str(mobile))
             if not page.is_checked("#terms"):
                 page.click("#terms")
+            # Pehle thoda passive wait (free), phir peak.fo se auto-solve —
+            # datacenter IP par Turnstile kam hi khud pass hota hai.
+            try:
+                page.wait_for_function(TURNSTILE_TOKEN_JS, timeout=min(6000, self.turnstile_timeout_ms))
+            except PlaywrightTimeoutError:
+                pass
+            try:
+                if not page.evaluate(TURNSTILE_TOKEN_JS):
+                    self._solve_turnstile(page)
+            except Exception:
+                pass
             try:
                 page.wait_for_function(TURNSTILE_TOKEN_JS, timeout=self.turnstile_timeout_ms)
             except PlaywrightTimeoutError:
@@ -559,7 +728,7 @@ class GoldDropStealthBrowser:
         if self.context is None:
             raise RuntimeError("Browser launch nahi hua — pehle launch command bhejo")
         self._close_reg_page()
-        page = self.context.new_page()
+        page = self._new_hooked_page()
         self.reg_page = page
         image_state = {"path": "", "uploaded": False}
         try:
@@ -571,12 +740,15 @@ class GoldDropStealthBrowser:
                 return {"ok": False, "message": "Site ka security challenge abhi bhi active hai; baad me try karein.",
                         "screenshot": _screenshot_b64(page)}
             page.wait_for_timeout(1200)
+            self._solve_turnstile(page)  # widget landing/step-1 par hi ho to turant solve
 
             fields = (("name", name), ("mobile", mobile), ("email", email),
                       ("pincode", pincode), ("code", code))
             clicked_any = False
+            security_retry = False
             for _step in range(4):  # landing CTA + multi-step wizard
                 _fill_details(page, fields, image_b64, image_state)
+                self._solve_turnstile(page)  # submit se pehle security check solve
                 if not _click_submit(page):
                     if not clicked_any:
                         return {"ok": False, "message": "Form ya Get Started/Submit button nahi mila.",
@@ -585,6 +757,13 @@ class GoldDropStealthBrowser:
                 clicked_any = True
                 status, message = _wait_outcome(page, 15)
                 if status == "error":
+                    if not security_retry and re.search(
+                            r"security|captcha|turnstile|verification|invalid token", message, re.IGNORECASE):
+                        # Turnstile token single-use hota hai — naya solve + 1 retry
+                        security_retry = True
+                        self._peak_solved = False
+                        log("security-check error mila — peak.fo se naya token lekar 1 retry")
+                        continue
                     return {"ok": False, "message": message, "screenshot": _screenshot_b64(page)}
                 if status in ("otp", "done"):
                     return {"ok": True, "stage": status, "message": message}
@@ -612,6 +791,7 @@ class GoldDropStealthBrowser:
             if not _fill_otp(page, otp):
                 return {"ok": False, "message": "OTP input nahi mila.",
                         "screenshot": _screenshot_b64(page)}
+            self._solve_turnstile(page)  # verify submit se pehle bhi security check solve
             if not _click_submit(page):
                 return {"ok": False, "message": "Verify button nahi mila.",
                         "screenshot": _screenshot_b64(page)}
@@ -692,6 +872,10 @@ def serve():
             if kind == "ping":
                 send({"type": "pong"})
             elif kind == "launch":
+                # Bot Settings se aayi key (non-empty) env/built-in ko override karti hai.
+                peak_key = str(cmd.get("peakApiKey") or "").strip()
+                if peak_key:
+                    stealth.peak_api_key = "" if peak_key.lower() in ("off", "0", "none") else peak_key
                 endpoint_url = stealth.launch(
                     chrome_path=str(cmd.get("chromePath") or ""),
                     headed=bool(cmd.get("headed")),
