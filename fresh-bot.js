@@ -45,6 +45,7 @@ const {
   getSessionExportJson,
   getDb,
   saveDb,
+  syncCloudVaultNow,
   findAccountKeyByPhone,
 } = await import('./store.js');
 const {
@@ -262,6 +263,9 @@ function grantApprovedUser(userId) {
   if (!list.map(String).includes(uid)) {
     list.push(uid);
     saveDb(getDb());
+    // Approval TURANT vault me bhi — Render restart/deploy par approval na ude
+    // (warna approved user ka /start phir se owner ko request bhejta tha).
+    try { syncCloudVaultNow(getDb()).catch(() => {}); } catch {}
   }
 }
 function revokeApprovedUser(userId) {
@@ -272,6 +276,7 @@ function revokeApprovedUser(userId) {
   if (idx >= 0) {
     list.splice(idx, 1);
     saveDb(db);
+    try { syncCloudVaultNow(db).catch(() => {}); } catch {}
   }
 }
 // Access = owner YA approved user. Saare gates isi se guzarte hain.
@@ -1261,10 +1266,23 @@ bot.action(/^ap_appr_ok_(\d+)$/, async (ctx) => {
     '',
     sub('Access wapas lene ho to /revoke ' + uid + ' bhejein.'),
   ].join('\n'))).catch(() => {});
-  await bot.telegram.sendMessage(uid, section('✅ ACCESS APPROVED', [
-    'Admin ne aapki request approve kar di! 🎉',
-    'Ab /start dabao — saare features (🛒 Zepto Pro signup samet) chal jayenge.',
-  ].join('\n'))).catch(() => {});
+  // ✅ Approve hote hi user ko seedha welcome CARD bhejo — dubara /start maangne
+  // ki zaroorat nahi. Pehle TG account add kare, phir START → Swiggy/Zepto.
+  const tgReady = (() => { try { return Boolean(telegramProviderStatus()?.sessionPresent); } catch { return false; } })();
+  const welcomeRows = [
+    ...(tgReady ? [] : [[{ text: '👤 Add Telegram Account (pehle ye)', callback_data: 'ap_telegram_login_start', style: 'success' }]]),
+    [{ text: '▶️ START — 🍔 Swiggy / 🛒 Zepto Pro', callback_data: 'ap_start', style: 'success' }],
+    [{ text: '📊 Status', callback_data: 'ap_status' }, { text: '⚙️ Settings', callback_data: 'ap_settings' }],
+  ];
+  await bot.telegram.sendMessage(uid, section('✅ ACCESS APPROVED 🎉', [
+    'Admin ne aapki request approve kar di!',
+    '',
+    tgReady
+      ? '1️⃣ Neeche <b>▶️ START</b> dabao → 🍔 Swiggy ya 🛒 Zepto chuno'
+      : '1️⃣ Pehle <b>👤 Add Telegram Account</b> dabao — spare account login karo (number pre-selected milega, ✅ dabana bas)',
+    '2️⃣ Phir <b>OTP bot</b> chuno (🐘 Hathi / 📨 Hermes)',
+    '3️⃣ Batch chalu — fresh session JSON yahin chat me aayega',
+  ].join('\n')), kb(welcomeRows)).catch(() => {});
 });
 
 bot.action(/^ap_appr_no_(\d+)$/, async (ctx) => {
@@ -4568,7 +4586,13 @@ bot.on('document', async (ctx) => {
 
 bot.on('text', async (ctx) => {
   const uid = String(ctx.from?.id);
-  if (!hasAccess(ctx.from?.id)) return;
+  if (!hasAccess(ctx.from?.id)) {
+    // Pehle ye SILENTLY ignore hota tha — user ko "broken" lagta tha (koi
+    // jawab hi nahi). Ab har message par approval card milta hai (anti-spam
+    // ke saath: 10 min me ek hi request owner ko jaati hai).
+    await askAdminForApproval(ctx);
+    return;
+  }
   const st = pending.get(uid);
   if (!st) return;
   const rawMessageText = String(ctx.message?.text || '');
