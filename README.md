@@ -282,17 +282,22 @@ bot ke andar hi hota hai:
 
 1. Bot ki **private chat** me **⚙️ Settings → 👤 Add Telegram Account**
    dabao.
-2. Agar API ID/hash env me saved nahi hain, bot
-   `my.telegram.org → API development tools` wali spare-account API app ki
-   details ek-ek karke maangega.
-3. Phir **spare/faltu Telegram account** ka phone number, Telegram login
-   code, aur 2FA ON ho to password lagega. Har sensitive input message ko
-   bot milte hi delete karne ki koshish karta hai; **session kabhi chat me
-   nahi dikhayi jaati**.
-4. Login success par Hermes mode apne aap ON ho jata hai aur bot
-   @HermeshuOTPROBOT ka connection test karta hai. Manual test ke liye
-   **⚙️ Settings → 🧪 Test Hermes** bhi hai; account hatana ho to
-   **🗑 Remove Telegram** (confirmation ke baad session clear hoti hai).
+2. Telegram API ID/hash source code me bundled nahi hain. Agar aapke private
+   setup me pehle se saved nahi hain, bot `my.telegram.org → API development
+   tools` wali aapki API app ki details ek-ek karke maangega. Naya ID/hash
+   set karne ke liye **⚙️ Settings → 🔑 Telegram API ID / Hash → Reset / Replace**
+   dabao, phir **Add / Login Telegram Account** se dobara login karo.
+3. Phir **spare Telegram account** ka phone number (koi default number
+   pre-filled nahi), Telegram login code, aur 2FA ON ho to password lagega.
+   Sensitive input messages ko bot milte hi delete karne ki koshish hoti hai;
+   session ya API hash chat me dobara display nahi hote.
+4. Login success par Hermes mode ON hota hai aur bot @HermeshuOTPROBOT ka
+   connection test karta hai. Manual test ke liye **⚙️ Settings → 🧪 Test Hermes**
+   hai; account hatana ho to **🗑 Remove Telegram** (confirmation ke baad
+   session clear hoti hai). API credentials alag se remove/replace kiye jaate
+   hain aur local file `data/telegram-api.json` me mode `0600` ke saath rehte
+   hain. Agar `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` hosting environment ya
+   `.env` me bhi set hon, reset ke baad wahan se bhi remove karna hoga.
 
 Batch is mode me ye simple one-shot flow karta hai: pehle lane ki
 proxy/direct route aur WAF token ready → Hermes ki **sabse latest

@@ -18,6 +18,7 @@ import {
   createTelegramUserClient,
   disconnectTelegramUserClient,
   getTelegramOtpConfig,
+  saveTelegramApiCredentials,
   saveTelegramSessionString,
   verifyTelegramOtpConnection,
 } from './telegram-otp-source.js';
@@ -39,6 +40,7 @@ try {
   let config = getTelegramOtpConfig();
   let apiId = config.apiId;
   let apiHash = config.apiHash;
+  const hadApiCredentials = Boolean(apiId && apiHash);
 
   if (!apiId) {
     const raw = String(await input.text('TELEGRAM_API_ID (my.telegram.org se): ')).trim();
@@ -51,6 +53,11 @@ try {
     throw new Error('TELEGRAM_API_ID / TELEGRAM_API_HASH missing hai. Pehle my.telegram.org par spare account se API app banao.');
   }
   config = { ...config, apiId, apiHash };
+  let savedApiCredentials = null;
+  if (!hadApiCredentials) {
+    savedApiCredentials = saveTelegramApiCredentials({ apiId, apiHash });
+    config = getTelegramOtpConfig();
+  }
 
   console.log('🔐 Spare Telegram account login shuru hai…');
   console.log('Telegram app/SMS me login code aayega. Code sirf isi terminal me daalo, chat/GitHub me nahi.');
@@ -86,6 +93,9 @@ try {
   } catch {}
 
   console.log(`✅ Telegram login ho gaya${meLabel ? ` — ${meLabel}` : ''}.`);
+  if (savedApiCredentials?.apiCredentialsFile) {
+    console.log(`🔑 API ID/hash saved privately: ${savedApiCredentials.apiCredentialsFile}`);
+  }
   console.log(`🔐 Session saved: ${sessionFile}`);
   console.log('Render par is file ki poori value ko TELEGRAM_SESSION env me past karo.');
   console.log('Saath me TELEGRAM_API_ID, TELEGRAM_API_HASH aur NUMBER_SOURCE=telegram set karo.');

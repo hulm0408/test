@@ -558,6 +558,7 @@ const settingsRows = () => {
       { text: '👤 Add Telegram Account', callback_data: 'ap_telegram_account', style: 'success' },
       { text: `🧪 Test ${activeOtpBotLabel()}`, callback_data: 'ap_test_hermes' },
     ],
+    [{ text: '🔑 Telegram API ID / Hash', callback_data: 'ap_telegram_api_settings', style: 'primary' }],
     [
       { text: '📦 Shop Stock', callback_data: 'ap_shop_stock', style: 'success' },
       { text: '🔎 World screen', callback_data: 'ap_world_probe' },
@@ -2383,13 +2384,26 @@ function telegramAccountCard() {
     field('Bot', `@${botName}`),
     field('API ID', status.apiIdPresent ? '✅ saved' : '❌ missing'),
     field('API hash', status.apiHashPresent ? '✅ saved' : '❌ missing'),
+    field('Credential source', status.apiCredentialsSource || 'not set'),
     field('Session', status.sessionPresent ? '✅ saved' : '❌ login nahi'),
     status.me ? field('Account', status.me) : '',
     flow ? field('Stage', telegramLoginStageLabel(flow.stage)) : '',
     status.loginInProgress && !flow ? field('Stage', 'provider me login chal raha hai') : '',
     ``,
-    sub('Sirf spare account. Session chat me kabhi nahi dikhegi.'),
+    sub('Sirf spare account. Session chat me kabhi nahi dikhegi; API hash bhi kabhi display nahi hota.'),
   ].filter(Boolean).join('\n'));
+}
+
+function telegramApiCredentialsCard() {
+  const status = telegramProviderStatus();
+  return section('🔑 Telegram API Credentials', [
+    field('API ID', status.apiIdPresent ? '✅ saved' : '❌ not set'),
+    field('API hash', status.apiHashPresent ? '✅ saved (hidden)' : '❌ not set'),
+    field('Source', status.apiCredentialsSource || 'none — setup will ask for your own values'),
+    field('Telegram session', status.sessionPresent ? '✅ retained' : 'not set'),
+    ``,
+    sub('Values are not bundled in source. New API ID/hash are requested during the private Add Telegram Account flow and stored in a 0600 file.'),
+  ].join('\n'));
 }
 
 async function requirePrivateTelegramChat(ctx, actionLabel = 'Telegram account action') {
@@ -3537,6 +3551,87 @@ bot.action(/^ap_set_telegram_refresh_(\d+)$/, async (ctx) => {
   await editOrSend(ctx, settingsCard(), settingsRows());
 });
 
+bot.action('ap_telegram_api_settings', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  if (!(await requirePrivateTelegramChat(ctx, 'Telegram API settings'))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  const status = telegramProviderStatus();
+  await editOrSend(ctx, telegramApiCredentialsCard(), [
+    [{ text: '🔁 Reset / Replace API ID & Hash', callback_data: 'ap_telegram_api_reset', style: 'primary' }],
+    [{ text: status.sessionPresent ? '👤 Login / Reauthorize Account' : '👤 Add Telegram Account', callback_data: 'ap_telegram_login_start', style: 'success' }],
+    [{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }],
+  ]);
+});
+
+bot.action('ap_telegram_api_reset', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  if (!(await requirePrivateTelegramChat(ctx, 'Telegram API reset'))) return;
+  if (goldDropRunning || isAutopilotRunning()) {
+    await ctx.answerCbQuery('⏳ Pehle active run ko stop/finish karein.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  if (telegramLoginFlow || telegramProviderStatus().loginInProgress) {
+    await ctx.answerCbQuery('⏳ Telegram login chal raha hai — reset se pehle complete/cancel karein.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  await ctx.answerCbQuery().catch(() => {});
+  const status = telegramProviderStatus();
+  await editOrSend(ctx, section('🔁 Replace Telegram API ID / Hash?', [
+    field('API ID', status.apiIdPresent ? 'saved' : 'not set'),
+    field('API hash', status.apiHashPresent ? 'saved (hidden)' : 'not set'),
+    field('Telegram session', status.sessionPresent ? 'will be kept' : 'not set'),
+    ``,
+    'Reset will remove the saved API credentials and clear them from this running process.',
+    'After that, Add Telegram Account will ask for your own API ID and hash again.',
+    ``,
+    sub('If TELEGRAM_API_ID / TELEGRAM_API_HASH are set in the hosting dashboard or .env, remove them there too; environment values can return after restart.'),
+  ].join('\n')), [
+    [{ text: '🧹 Remove credentials', callback_data: 'ap_telegram_api_reset_confirm', style: 'danger' }],
+    [{ text: '↩️ Keep credentials', callback_data: 'ap_telegram_api_settings', style: 'primary' }],
+  ]);
+});
+
+bot.action('ap_telegram_api_reset_confirm', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  if (!(await requirePrivateTelegramChat(ctx, 'Telegram API reset'))) return;
+  if (goldDropRunning || isAutopilotRunning()) {
+    await ctx.answerCbQuery('⏳ Pehle active run ko stop/finish karein.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  if (telegramLoginFlow || telegramProviderStatus().loginInProgress) {
+    await ctx.answerCbQuery('⏳ Telegram login chal raha hai — reset se pehle complete/cancel karein.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  try {
+    const result = await telegramOtp.clearTelegramApiCredentials();
+    await ctx.answerCbQuery('🔑 API credentials reset ho gaye.').catch(() => {});
+    await editOrSend(ctx, section('✅ Telegram API Credentials Reset', [
+      field('Saved file', result.removedFile ? 'deleted' : 'not present'),
+      field('Current process', result.removedEnv ? 'credential env values cleared' : 'no credential env values'),
+      field('Telegram session', telegramProviderStatus().sessionPresent ? 'retained' : 'not set'),
+      result.envCredentialsMayReturnAfterRestart
+        ? '⚠️ Host environment / .env se API keys restart par wapas aa sakti hain — wahan se bhi remove karein.'
+        : '',
+      ``,
+      sub('Next: Add Telegram Account / Login dabao. Private setup chat me new API ID aur hash maange jayenge; hash display nahi hoga.'),
+    ].filter(Boolean).join('\n')), [
+      [{ text: '👤 Add / Login Telegram Account', callback_data: 'ap_telegram_login_start', style: 'success' }],
+      [{ text: '🔑 API Settings', callback_data: 'ap_telegram_api_settings', style: 'primary' }],
+      [{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }],
+    ]);
+  } catch (error) {
+    await ctx.answerCbQuery('❌ API credentials reset fail hua.', { show_alert: true }).catch(() => {});
+    await editOrSend(ctx, section('❌ Telegram API Reset Fail', [
+      esc(shortTelegramLoginError(error)),
+      '',
+      sub('Login chal raha ho to pehle complete/cancel karein, phir dobara try karein.'),
+    ].join('\n')), [
+      [{ text: '🔑 API Settings', callback_data: 'ap_telegram_api_settings', style: 'primary' }],
+      [{ text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' }],
+    ]);
+  }
+});
+
 bot.action('ap_telegram_account', async (ctx) => {
   if (!(await gate(ctx))) return;
   if (!(await requirePrivateTelegramChat(ctx, 'Add Telegram Account'))) return;
@@ -3550,9 +3645,10 @@ bot.action('ap_telegram_account', async (ctx) => {
     await ctx.answerCbQuery('👤 Telegram account saved hai.').catch(() => {});
     await editOrSend(ctx, telegramAccountCard(), [
       [
-        { text: '🔁 Dusra Account Login', callback_data: 'ap_telegram_login_start', style: 'success' },
+        { text: status.apiIdPresent && status.apiHashPresent ? '🔁 Dusra Account Login' : '🔑 API setup + Login', callback_data: 'ap_telegram_login_start', style: 'success' },
         { text: '🧪 Test', callback_data: 'ap_test_hermes' },
       ],
+      [{ text: '🔑 Replace API ID / Hash', callback_data: 'ap_telegram_api_reset', style: 'primary' }],
       [
         { text: '🗑 Remove', callback_data: 'ap_remove_telegram', style: 'danger' },
         { text: '↩️ Settings', callback_data: 'ap_settings', style: 'primary' },
