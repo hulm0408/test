@@ -1057,6 +1057,10 @@ export function formatCompactAutopilotCard(snap = state, { stageText = '', final
   const fresh = Number(s.fresh) || 0;
   const target = Number(s.target) || 0;
   const wb = s.accountEngine === 'worldbot' || Boolean(s.worldBotMode);
+  // 🌐 External engines (World/Toing/Zepto Pro): in modes me bot khud WAF/route/
+  // proxy karta hi nahi — card par unka zikr kabhi na aaye.
+  const ext = wb || s.accountEngine === 'toing_pro' || Boolean(s.toingProMode)
+    || s.accountEngine === 'zepto_pro' || Boolean(s.zeptoProMode);
   const reason = {
     target: 'Target complete',
     time: 'Max time complete',
@@ -1083,17 +1087,17 @@ export function formatCompactAutopilotCard(snap = state, { stageText = '', final
   const lines = [
     mono(info.flowText),
     `<b>Abhi:</b> ${esc(now)}`,
-    // 🌍 World Bot mode: kisi bhi stage-text se WAF/route/proxy lafz kabhi
-    // card par na nikle (owner: "ek line bhi nahi").
+    // 🌍 External-engine mode: kisi bhi stage-text se WAF/route/proxy lafz
+    // kabhi card par na nikle (owner: "ek line bhi nahi").
     !final && info.detail && info.detail !== now
-      && !(wb && /waf|route|proxy|solver/i.test(info.detail))
+      && !(ext && /waf|route|proxy|solver/i.test(info.detail))
       ? `<i>${esc(info.detail)}</i>` : '',
     progressBar(fresh, target),
     `📱 ${mono(phoneText)} · ⏱ ${mono(fmtDuration(compactElapsedMs(s)))}${rateText(s) ? ` · ${rateText(s)}` : ''}${s.sourceMode !== 'telegram' && (s.concurrency || 1) > 1 ? ` · ⚡ ${mono(`${Number(s.activeWorkers) || active.length}/${Number(s.concurrency) || 1}`)}` : ''}`,
     compactSourceLine(s),
     s.shardEnabled ? `🧩 ${mono(`SHARE ${s.shardShare || ''}`)} <i>· pool ka apna hissa, koi ladai nahi</i>` : '',
-    // 🌍 World Bot mode me route/proxy ki koi line nahi (owner ka rule).
-    !wb && s.proxyMode === 'direct' ? `🔀 ${mono('DIRECT')} <i>· bina proxy, ek IP — slow par predictable</i>` : '',
+    // 🌍 External-engine mode me route/proxy ki koi line nahi (owner ka rule).
+    !ext && s.proxyMode === 'direct' ? `🔀 ${mono('DIRECT')} <i>· bina proxy, ek IP — slow par predictable</i>` : '',
     !final && s.neverStop
       ? `🔁 ${mono('NEVER-STOP')} <i>· batch sirf TARGET/STOP par rukega${Number(s.timeExtensions) ? ` · ⏱ +${Number(s.timeExtensions)} extend` : ''}${Number(s.poolWaits) ? ` · 🕳 pool-wait #${Number(s.poolWaits)}` : ''}${Date.now() < Number(s.infraPauseUntil || 0) ? ` · ⏸ ${Math.max(1, Math.round((Number(s.infraPauseUntil) - Date.now()) / 1000))}s cool-off` : ''}</i>`
       : '',
@@ -1694,10 +1698,10 @@ export async function startAutopilot(opts = {}) {
     // behavior, koi rukawat nahi.
     const freePromise = (async () => {
       try {
-        // 🌍 World Bot & Toing Pro mode: Swiggy ka kaam external server karta hai — proxy ki zaroorat
+        // 🌍 World Bot / Toing Pro / Zepto Pro mode: Swiggy ka kaam external server karta hai — proxy ki zaroorat
         // hi nahi, isliye fetch/solve bilkul band.
-        if (worldBotMode || toingProMode) {
-          console.log(`[Autopilot] 🌐 ${toingProMode ? 'Toing Pro' : 'World Bot'} mode — koi proxy/WAF solve nahi.`);
+        if (bypassBridgeMode) {
+          console.log(`[Autopilot] 🌐 ${zeptoProMode ? 'Zepto Pro' : (toingProMode ? 'Toing Pro' : 'World Bot')} mode — koi proxy/WAF solve nahi.`);
           return { skipped: true, reason: `${accountEngine}-mode` };
         }
         // Direct mode: proxy fetch/solve bilkul nahi — yahi wo cheez thi jo
@@ -1974,8 +1978,8 @@ export async function startAutopilot(opts = {}) {
       // Chrome hi nahi mila aur saved token bhi nahi → har OTP par 403 pakki
       // hai. Pehle ye sirf console me chup chaap reh jata tha aur user ko
       // lagta tha "bot work nahi kar raha" — ab Telegram card par saaf btao.
-      // 🌍 World Bot & Toing Pro mode me token/proxy ka concept hi nahi — kuch na dikhao.
-      if (!tok && !worldBotMode && !toingProMode) {
+      // 🌍 World Bot / Toing Pro / Zepto Pro mode me token/proxy ka concept hi nahi — kuch na dikhao.
+      if (!tok && !bypassBridgeMode) {
         let chrome = null;
         try { chrome = getChromeStatus(); } catch {}
         if (chrome && !chrome.found) {
@@ -2933,7 +2937,7 @@ export async function startAutopilot(opts = {}) {
     // 🌍 World Bot ek hi Telegram chat par chalta hai — 2 lanes = do flows
     // ek hi screen par = gadbad. Isliye hamesha 1 lane, chahe setting kuch bhi.
     if (worldBotMode) laneCount = 1;
-    if (toingProMode) laneCount = 1;
+    if (toingProMode || zeptoProMode) laneCount = 1;
     state.concurrency = laneCount;
     state.requestedConcurrency = requestedConcurrency;
     lanes = Array.from({ length: laneCount }, (_, i) => ({
@@ -2950,8 +2954,8 @@ export async function startAutopilot(opts = {}) {
       routePrepNoticeAt: 0,
       rawRouteOkKey: '',
     }));
-    // World Bot & Toing Pro me route/proxy ka koi kaam nahi — allocator ko chhedo hi nahi.
-    if (!worldBotMode && !toingProMode) {
+    // World Bot / Toing Pro / Zepto Pro me route/proxy ka koi kaam nahi — allocator ko chhedo hi nahi.
+    if (!bypassBridgeMode) {
       for (const lane of lanes) ensureLaneRoute(lane);
       syncRouteSummaryState();
     } else {
@@ -3058,15 +3062,15 @@ export async function startAutopilot(opts = {}) {
             continue;
           }
 
-          // 🌍 World Bot & Toing Pro mode me IP/route ka koi matlab nahi (Swiggy call hi
+          // 🌍 World Bot / Toing Pro / Zepto Pro mode me IP/route ka koi matlab nahi (Swiggy call hi
           // hum nahi karte) — lane ko proxy/WAF token dene ki koshish skip.
-          if (!worldBotMode && !toingProMode && !ensureLaneRoute(lane)) {
+          if (!bypassBridgeMode && !ensureLaneRoute(lane)) {
             await waitForRouteChange(1_000);
             continue;
           }
           // Hermes number claim karne se pehle is lane ki IP/WAF haalat
           // tayyar karo. Route ready na ho to FIND/NEW bilkul nahi chalega.
-          if (!worldBotMode && !toingProMode && telegramMode && !(await prepareLaneRouteBeforeClaim(lane))) {
+          if (!bypassBridgeMode && telegramMode && !(await prepareLaneRouteBeforeClaim(lane))) {
             await waitForRouteChange(1_000);
             continue;
           }
@@ -3161,7 +3165,7 @@ export async function startAutopilot(opts = {}) {
 
       // WAF warm-up background me chal raha tha — pehla OTP iske baghair na jaye.
       // Owner ne isi beech SKIP kar diya ho to warm-up ka wait bhi mat karo.
-      if (!worldBotMode && !toingProMode && !isAutopilotSkipRequested(entry.phone)) await ensureWarm();
+      if (!bypassBridgeMode && !isAutopilotSkipRequested(entry.phone)) await ensureWarm();
 
       // Scan se aaye number ka prechecked last-seen pipeline ko dedo — wahi
       // device dobara fetch nahi hoga. Agar ye device base window miss ke
@@ -3226,7 +3230,7 @@ export async function startAutopilot(opts = {}) {
         }, {
           owner: lane.owner,
           releaseOnExit: false,
-          wafTokenMode: !worldBotMode && !toingProMode && laneCount > 1 && lane.proxy?.id ? 'defer-until-challenge' : '',
+          wafTokenMode: !bypassBridgeMode && laneCount > 1 && lane.proxy?.id ? 'defer-until-challenge' : '',
         });
       // SKIP kisi lambay bridge step ke bilkul aakhir me aaya ho tab bhi
       // tally se pehle manual outcome hi jeetega — ye number fresh count
