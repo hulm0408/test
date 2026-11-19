@@ -2187,6 +2187,34 @@ console.log('telegram Hermes source + Add Telegram Account primitives:');
   ok(missingStatus.configured === false && missingStatus.sessionPresent === false, 'Telegram setup missing → status not configured');
   ok(['TELEGRAM_API_ID', 'TELEGRAM_API_HASH', 'TELEGRAM_SESSION'].every((k) => missingStatus.missing.includes(k)), 'Telegram status missing keys saaf batata hai');
   ok(tg.telegramOtpSetupHintLines(noTelegramEnv).join('\n').includes('Add Telegram Account'), 'setup hint Add Telegram Account flow batata hai');
+  ok(tg.getTelegramOtpConfig(noTelegramEnv).apiId === 0 && tg.getTelegramOtpConfig(noTelegramEnv).apiHash === '',
+    'Telegram API ID/hash ka source-code default nahi hai');
+  {
+    const fsp = await import('node:fs/promises');
+    const apiTestDir = await fsp.mkdtemp('/tmp/workwr-telegram-api-');
+    const apiEnv = {
+      TELEGRAM_API_CREDENTIALS_FILE: path.join(apiTestDir, 'telegram-api.json'),
+      TELEGRAM_SESSION_FILE: path.join(apiTestDir, 'telegram.session'),
+    };
+    const savedApi = tg.saveTelegramApiCredentials(
+      { apiId: '123456', apiHash: '0123456789abcdef0123456789abcdef' },
+      { env: apiEnv, updateProcessEnv: false },
+    );
+    const mode = (await fsp.stat(apiEnv.TELEGRAM_API_CREDENTIALS_FILE)).mode & 0o777;
+    ok(savedApi.ok && tg.getTelegramOtpConfig(apiEnv).apiId === 123456
+      && tg.getTelegramOtpConfig(apiEnv).apiCredentialsSource === 'file',
+    'custom API ID/hash private credentials file me save hokar config me load hote hain');
+    ok(mode === 0o600, 'Telegram API credentials file permissions 0600');
+    await tg.saveTelegramSessionString('unit-test-session', {
+      env: apiEnv, updateProcessEnv: false,
+    });
+    const resetApi = await tg.clearTelegramApiCredentials({ env: apiEnv, clearProcessEnv: false });
+    const afterApiReset = tg.getTelegramOtpConfig(apiEnv);
+    ok(resetApi.removedFile && afterApiReset.apiId === 0 && afterApiReset.apiHash === '',
+      'Reset API credentials saved ID/hash file ko remove karta hai');
+    ok(afterApiReset.sessionPresent, 'API credential reset Telegram session ko retain karta hai');
+    await fsp.rm(apiTestDir, { recursive: true, force: true });
+  }
   ok(tg.resolveNumberSourceMode({ env: { NUMBER_SOURCE: 'telegram' }, telegramSetting: false }) === 'telegram', 'NUMBER_SOURCE=telegram → Telegram only');
   ok(tg.resolveNumberSourceMode({ env: { NUMBER_SOURCE: 'firebase' }, telegramSetting: true }) === 'telegram', 'Bot Hermes ON stale NUMBER_SOURCE=firebase ko override karta hai — Hermes run me Firebase try nahi');
   ok(tg.resolveNumberSourceMode({ env: { NUMBER_SOURCE: 'firebase' }, telegramSetting: false }) === 'firebase', 'Bot Hermes OFF ho tabhi NUMBER_SOURCE=firebase respect');
@@ -5004,8 +5032,9 @@ Thanks`)),
   'START: Chromium option ka engine direct hai');
   ok(autoResumeSrc.includes('startSourcePresetSettings(preset)'),
     'START: preset dabate hi settings lock (engine + OTP bot)');
-  ok(autoResumeSrc.includes("accountEngine: bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : (bs.getSetting('accountEngine') === 'toing_pro' ? 'toing_pro' : 'direct')"),
-    'START: engine choice batch ke saath lock hota hai');
+  ok(autoResumeSrc.includes("accountEngine: ['worldbot', 'toing_pro', 'zepto_pro', 'swiggy_pro'].includes(bs.getSetting('accountEngine')) ? bs.getSetting('accountEngine') : 'direct'")
+    || autoResumeSrc.includes("accountEngine: bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : (bs.getSetting('accountEngine') === 'toing_pro' ? 'toing_pro' : 'direct')"),
+    'START: engine choice batch ke saath lock hota hai (current engine variants included)');
 
   // World bot mode me Hermes source allowed hai (combined preset).
   ok(src.includes("resolvedSourceMode === 'firebase' ? 'firebase' : 'telegram'"),
@@ -5327,7 +5356,7 @@ Thanks`)),
   ok(wbBotSrc.includes("const diagWorld = bs.getSetting('accountEngine') === 'worldbot'")
     && wbBotSrc.includes('if (!diagWorld) {'),
   'diag: World Bot mode me Chrome/WAF token/proxy fields chhupe rehte hain');
-  ok(wbBotSrc.includes("...(['worldbot', 'toing_pro'].includes(bs.getSetting('accountEngine')) ? [] : [{")
+  ok(wbBotSrc.includes("...(['worldbot', 'toing_pro', 'zepto_pro', 'swiggy_pro'].includes(bs.getSetting('accountEngine')) ? [] : [{")
     && wbBotSrc.includes('🌍 World Bot ON'),
   'settings: World Bot mode me Proxies button nahi, purana button neutral card deta hai');
   ok(!/koi proxy\/WAF nahi/.test(wbBotSrc) && !/koi proxy\/WAF nahi/.test(wbPipelineSrc),
@@ -5587,12 +5616,20 @@ console.log('🎓 CUSTOM BOT TRAINING (owner ka apna bot add + train):');
 
   // ---- Training wiring strings (repo style source check) ----
   const freshSrc = await fsp.readFile(new URL('./fresh-bot.js', import.meta.url), 'utf8');
+  ok(freshSrc.includes("bot.action('ap_telegram_api_reset'")
+    && freshSrc.includes("bot.action('ap_telegram_api_reset_confirm'")
+    && freshSrc.includes('🔑 Telegram API ID / Hash'),
+  'ui: Telegram API ID/hash can be reset and entered again from Settings');
   ok(freshSrc.includes("bot.action('ap_train_bots'") || freshSrc.includes("['ap_train_bots', 'ap_train_list']"), 'ui: ap_train_bots handler registered');
   ok(freshSrc.includes('🎓 Train Custom Bot'), 'ui: Settings me Train Custom Bot button');
   ok(freshSrc.includes('handleCustomBotPending'), 'ui: training text input wired');
   ok(freshSrc.includes('tr_tmpl_yes_') && freshSrc.includes('tr_testc_') && freshSrc.includes('tr_use_'), 'ui: template + test + use-as-otp-bot wiring');
   ok(freshSrc.includes('setCustomBotClaimRunner') && freshSrc.includes('setCustomBotRefreshRunner'), 'ui: claim/refresh runners injected');
   const tgSrc = await fsp.readFile(new URL('./telegram-otp-source.js', import.meta.url), 'utf8');
+  ok(tgSrc.includes('export async function clearTelegramApiCredentials')
+    && !tgSrc.includes('DEFAULT_TELEGRAM_API_ID')
+    && !tgSrc.includes('DEFAULT_TELEGRAM_API_HASH'),
+  'telegram: source has credential reset and no bundled API ID/hash defaults');
   ok(tgSrc.includes('setCustomBotClaimRunner') && tgSrc.includes('custom-claim-failed'), 'claim: custom runner hook');
   ok(tgSrc.includes('customBotRefreshRunner') && tgSrc.includes('refresh-training-'), 'refresh: custom runner hook');
   const bsSrc = await fsp.readFile(new URL('./bot-settings.js', import.meta.url), 'utf8');

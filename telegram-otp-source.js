@@ -35,14 +35,10 @@ import {
 
 export const DEFAULT_TELEGRAM_OTP_BOT_USERNAME = OTP_BOT_PROFILES[DEFAULT_OTP_BOT_PROFILE_ID].username;
 
-// 👤 Owner ka rule (2026-11-19): Telegram API credentials + login phone
-// CODE me hi built-in rahte hain — owner env nahi bana sakta. Env ya saved
-// file mile to wahi jeetegi, warna ye defaults chalenge.
-export const DEFAULT_TELEGRAM_API_ID = 36215289;
-export const DEFAULT_TELEGRAM_API_HASH = '1e59ee5fb756233dc8c2446aac93ff3a';
-// Telegram login ka pre-selected spare number — login flow me "Change Number"
-// button se owner apna dusra number bhi daal sakta hai.
-export const DEFAULT_TELEGRAM_LOGIN_PHONE = '8801322367848';
+// Telegram API ID/hash aur login phone jaan-boojhkar source me default nahi
+// rakhe jaate. Owner apni API app values private setup flow me deta hai.
+// Empty phone default se login hamesha user-entered number maangta hai.
+export const DEFAULT_TELEGRAM_LOGIN_PHONE = '';
 
 // ---------------------------------------------------------------------------
 // Kaunsa OTP bot — Hermes (@HermeshuOTPROBOT) ya HardXotp (@HardXotp_Bot).
@@ -174,11 +170,11 @@ export function getTelegramOtpConfig(env = process.env) {
   const apiCredentialsFile = firstEnv(env, ['TELEGRAM_API_CREDENTIALS_FILE', 'TG_API_CREDENTIALS_FILE'])
     || (env === process.env ? getTelegramApiCredentialsFilePath(env) : '');
   const storedApi = readStoredTelegramApiCredentials(apiCredentialsFile);
-  const apiId = envApiId || storedApi.apiId || DEFAULT_TELEGRAM_API_ID;
-  const apiHash = envApiHash || storedApi.apiHash || DEFAULT_TELEGRAM_API_HASH;
+  const apiId = envApiId || storedApi.apiId || 0;
+  const apiHash = envApiHash || storedApi.apiHash || '';
   const apiCredentialsSource = (envApiId || envApiHash)
     ? ((storedApi.apiId || storedApi.apiHash) ? 'env+file' : 'env')
-    : ((storedApi.apiId || storedApi.apiHash) ? 'file' : 'built-in');
+    : ((storedApi.apiId || storedApi.apiHash) ? 'file' : '');
 
   let session = firstEnv(env, ['TELEGRAM_SESSION', 'TELEGRAM_STRING_SESSION', 'TG_SESSION']);
   let sessionSource = session ? 'env' : '';
@@ -2292,6 +2288,82 @@ export async function clearTelegramSessionString({
       removedEnvKeys,
       previousSessionSource: before.sessionSource || '',
       envSessionMayReturnAfterRestart: before.sessionSource === 'env',
+    };
+  });
+}
+
+export async function clearTelegramApiCredentials({
+  env = process.env,
+  deleteFile = true,
+  clearProcessEnv = true,
+} = {}) {
+  if (providerState.loginInProgress) {
+    throw new Error('Telegram account login chal raha hai — pehle use complete ya cancel karo.');
+  }
+
+  return withTelegramLock(async () => {
+    if (providerState.loginInProgress) {
+      throw new Error('Telegram account login chal raha hai — pehle use complete ya cancel karo.');
+    }
+    const before = getTelegramOtpConfig(env);
+    await disconnectTelegramUserClient();
+
+    const apiCredentialsFile = before.apiCredentialsFile || getTelegramApiCredentialsFilePath(env);
+    let removedFile = false;
+    if (deleteFile && apiCredentialsFile) {
+      const fileExisted = existsSync(apiCredentialsFile);
+      try { rmSync(apiCredentialsFile, { force: true }); } catch {}
+      if (existsSync(apiCredentialsFile)) {
+        throw new Error('Telegram API credentials file remove nahi ho payi. File permissions/path check karein.');
+      }
+      removedFile = fileExisted;
+    }
+
+    const envKeys = [
+      'TELEGRAM_API_ID', 'TG_API_ID', 'TELEGRAM_APP_ID',
+      'TELEGRAM_API_HASH', 'TG_API_HASH', 'TELEGRAM_APP_HASH',
+    ];
+    for (let slot = 2; slot <= roster.MAX_ROSTER_ACCOUNTS; slot++) {
+      envKeys.push(
+        `TELEGRAM_API_ID_${slot}`, `TG_API_ID_${slot}`,
+        `TELEGRAM_API_HASH_${slot}`, `TG_API_HASH_${slot}`,
+      );
+    }
+
+    const removedEnvKeys = [];
+    if (clearProcessEnv) {
+      for (const key of envKeys) {
+        if (Object.prototype.hasOwnProperty.call(process.env, key)) {
+          delete process.env[key];
+          removedEnvKeys.push(key);
+        }
+        if (env && env !== process.env && Object.prototype.hasOwnProperty.call(env, key)) {
+          delete env[key];
+          if (!removedEnvKeys.includes(key)) removedEnvKeys.push(key);
+        }
+      }
+    }
+
+    Object.assign(providerState, {
+      connected: false,
+      authorized: false,
+      meLabel: '',
+      currentPhone: '',
+      currentEntry: null,
+      currentConsumed: false,
+      currentMessageId: 0,
+      lastError: '',
+      lastCheckedAt: Date.now(),
+    });
+
+    return {
+      ok: true,
+      apiCredentialsFile,
+      removedFile,
+      removedEnv: removedEnvKeys.length > 0,
+      removedEnvKeys,
+      previousApiCredentialsSource: before.apiCredentialsSource || '',
+      envCredentialsMayReturnAfterRestart: String(before.apiCredentialsSource || '').includes('env'),
     };
   });
 }
