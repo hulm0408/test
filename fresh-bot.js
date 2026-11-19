@@ -65,6 +65,7 @@ const {
 } = await import('./autopilot-engine.js');
 const { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, _countDeviceOnlineStates } = await import('./firebase-numbers.js');
 const telegramOtp = await import('./telegram-otp-source.js');
+const zeptoPro = await import('./zepto-pro-engine.js');
 const { GoldDropClient, isGoldDropDailyOtpLimit, isGoldDropInvalidOtp, isGoldDropSecurityCheck, goldDropEmailForMobile } = await import('./gold-drop-client.js');
 // Checker is optional at startup: a missing checker dependency must not take
 // the entire bot down. Surface a clear error only when the checker is used.
@@ -441,8 +442,8 @@ const settingsRows = () => {
     [{ text: `🛡️ NoCaptchaAI: ${bs.fmtSetting('nocapApiKey')}`, callback_data: 'ap_nocap_key', style: 'primary' }],
     [
       { text: '🔥 Firebase Sources', callback_data: 'ap_sources', style: 'primary' },
-      // 🌍 World Bot aur Toing Pro mode me proxy ka koi button/wording nahi.
-      ...(['worldbot', 'toing_pro'].includes(bs.getSetting('accountEngine')) ? [] : [{
+      // 🌍 World Bot / Toing Pro / Zepto Pro mode me proxy ka koi button/wording nahi.
+      ...(['worldbot', 'toing_pro', 'zepto_pro'].includes(bs.getSetting('accountEngine')) ? [] : [{
         text: proxySummary.direct ? '🔀 Proxies: DIRECT' : `🔀 Proxies: ${proxySummary.enabledCount}`,
         callback_data: 'ap_proxies',
         style: 'primary',
@@ -906,6 +907,10 @@ function activeStartPresetId() {
     const prof = bs.getSetting('otpBotProfile');
     return prof === 'hathi' ? 'toing_hathi' : 'toing_hermes';
   }
+  if (engine === 'zepto_pro') {
+    const prof = bs.getSetting('otpBotProfile');
+    return prof === 'hathi' ? 'zepto_hathi' : 'zepto_hermes';
+  }
   const normEngine = engine === 'worldbot' ? 'worldbot' : 'direct';
   const tgMode = telegramSettingEnabled();
   // 👤 Owner ke options: OTP bot + Chromium ya OTP bot + Swiggy World ya Toing Pro.
@@ -928,6 +933,7 @@ function otpBotChoiceRows() {
     }];
   };
   return [
+    [{ text: `🛒 ZEPTO PRO SIGNUP`, callback_data: 'ap_start_zepto_pro', style: 'primary' }],
     [{ text: `🌐 TOING PRO WEB SIGNUP`, callback_data: 'ap_start_toing_pro', style: 'primary' }],
     // 👤 Owner: "otp bot + chromium" aur "otp bot + swiggy world" — do saaf option.
     presetRow('otp_chromium'),
@@ -1144,7 +1150,7 @@ async function launchBatch(ctx, opts = {}) {
     source: lockedSourceMode,
     otpBot: lockedOtpBot,
     // Engine choice isi batch ke liye lock — preset/Settings jo kehta hai wahi.
-    accountEngine: bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : (bs.getSetting('accountEngine') === 'toing_pro' ? 'toing_pro' : 'direct'),
+    accountEngine: ['worldbot', 'toing_pro', 'zepto_pro'].includes(bs.getSetting('accountEngine')) ? bs.getSetting('accountEngine') : 'direct',
     ui,
   }).catch((e) => console.error('[FreshBot] autopilot:', e?.stack || e?.message));
 }
@@ -1827,6 +1833,62 @@ bot.action('ap_start_toing_pro', async (ctx) => {
     [{ text: '📨 Hermeshu OTP Bot (@HermeshuOTPROBOT)', callback_data: 'ap_start_go_toing_hermes', style: 'primary' }],
     [{ text: '↩️ Back', callback_data: 'ap_start' }],
   ];
+  await ctx.editMessageText(text, kb(rows))
+    .catch(async () => { await ctx.reply(text, kb(rows)).catch(() => {}); });
+});
+
+// 🛒 Zepto Pro flow (storelex.store/zzbot): key check karo (na ho to capture),
+// phir Hathi/Hermes OTP bot chunne do.
+async function showZeptoProScreen(ctx) {
+  if (isAutopilotRunning()) {
+    await ctx.answerCbQuery('Pehle se chal raha hai!', { show_alert: true }).catch(() => {});
+    return;
+  }
+  await ctx.answerCbQuery().catch(() => {});
+  const keySet = zeptoPro.isZeptoKeySet();
+  const lines = [
+    'Zepto Pro flow (storelex.store/zzbot API):',
+    '• OTP trigger (mobile)',
+    '• Auto OTP verify & Session export (.json)',
+    '',
+    keySet
+      ? '🔑 Access Key: <b>set ✅</b>'
+      : '🔑 Access Key: <b>set nahi hai ⚠️</b> — pehle <b>🔑 Set Access Key</b> dabao aur apni zzbot key bhejo (key bot ke apne Telegram se milegi).',
+    '',
+    ...(keySet ? [sub('Neeche apna Telegram OTP bot chunein jahan se number aur OTP claim karna hai:')] : []),
+  ];
+  const rows = [
+    [{ text: keySet ? '🔑 Zepto Key (set ✅)' : '🔑 Set Access Key', callback_data: 'ap_zepto_key', style: keySet ? 'success' : 'danger' }],
+    ...(keySet ? [
+      [{ text: '🐘 Hathi OTP Bot (@Hathi_otp_bot)', callback_data: 'ap_start_go_zepto_hathi', style: 'success' }],
+      [{ text: '📨 Hermeshu OTP Bot (@HermeshuOTPROBOT)', callback_data: 'ap_start_go_zepto_hermes', style: 'primary' }],
+    ] : []),
+    [{ text: '↩️ Back', callback_data: 'ap_start' }],
+  ];
+  const text = section('🛒 ZEPTO PRO SIGNUP', lines.join('\n'));
+  await ctx.editMessageText(text, kb(rows))
+    .catch(async () => { await ctx.reply(text, kb(rows)).catch(() => {}); });
+}
+
+bot.action('ap_start_zepto_pro', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await showZeptoProScreen(ctx);
+});
+
+// 🔑 Zepto key capture — key private chat me text se aati hai aur message
+// turant delete ho jaata hai (secret chat me pada na rahe).
+bot.action('ap_zepto_key', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  pending.set(String(ctx.from.id), { action: 'zepto_access_key' });
+  const text = section('🔑 ZEPTO PRO ACCESS KEY', [
+    'Apni Zepto Pro (zzbot) access key <b>is chat me reply</b> karke bhejo.',
+    '',
+    '• Key zzbot ke apne Telegram bot / mini app se milti hai',
+    '• Bhejte hi ye message delete ho jayega (secret safe rahega)',
+    '• Key sirf local vault me save hoti hai, kahin bheji nahi jaati',
+  ].join('\n'));
+  const rows = [[{ text: '↩️ Cancel', callback_data: 'ap_start_zepto_pro', style: 'primary' }]];
   await ctx.editMessageText(text, kb(rows))
     .catch(async () => { await ctx.reply(text, kb(rows)).catch(() => {}); });
 });
@@ -4270,6 +4332,48 @@ bot.on('text', async (ctx) => {
   if (!st) return;
   const rawMessageText = String(ctx.message?.text || '');
   const txt = rawMessageText.trim();
+
+  if (st.action === 'zepto_access_key') {
+    pending.delete(uid);
+    const input = txt.trim();
+    // Key wala message chat se turant hatao (secret).
+    try {
+      if (ctx.chat?.id && ctx.message?.message_id) {
+        await bot.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id);
+      }
+    } catch {}
+    const low = input.toLowerCase();
+    const backKb = kb([[{ text: '↩️ Zepto Pro', callback_data: 'ap_start_zepto_pro', style: 'primary' }]]);
+    if (low === 'cancel') {
+      await ctx.reply(section('🛒 Zepto Pro Key', 'Key set nahi ki gayi — cancel kar diya.'), backKb).catch(() => {});
+      return;
+    }
+    if (low === 'reset') {
+      bs.setSetting('zeptoAccessKey', '');
+      await ctx.reply(section('🛒 Zepto Pro Key', 'Saved key hata di ✅ — ab <b>ZEPTO_ACCESS_KEY</b> env (ya nayi key) use hogi.'), backKb).catch(() => {});
+      return;
+    }
+    if (input.length < 6 || input.length > 128 || /\s/.test(input)) {
+      await ctx.reply(section('❌ Key Invalid', 'Key 6–128 chars honi chahiye, bina space ke. Sahi key bhejo, <code>reset</code> likh kar saved key hatao, ya <code>cancel</code> likho.'), backKb).catch(() => {});
+      return;
+    }
+    const setRes = bs.setSetting('zeptoAccessKey', input);
+    if (setRes && setRes.ok === false) {
+      await ctx.reply(section('❌ Key Save Nahi Hui', esc(String(setRes.error || 'unknown error'))), backKb).catch(() => {});
+      return;
+    }
+    const keyTail = input.slice(-4);
+    await ctx.reply(section('🛒 ZEPTO PRO KEY SAVE ✅', [
+      `Key save ho gayi (…${esc(keyTail)}) — ab Zepto Pro signup chal sakta hai.`,
+      '',
+      'Neeche OTP bot chuno aur batch start karo:',
+    ].join('\n')), kb([
+      [{ text: '🐘 Hathi OTP Bot (@Hathi_otp_bot)', callback_data: 'ap_start_go_zepto_hathi', style: 'success' }],
+      [{ text: '📨 Hermeshu OTP Bot (@HermeshuOTPROBOT)', callback_data: 'ap_start_go_zepto_hermes', style: 'primary' }],
+      [{ text: '↩️ Zepto Pro', callback_data: 'ap_start_zepto_pro', style: 'primary' }],
+    ])).catch(() => {});
+    return;
+  }
 
   if (st.action === 'gold_checker_codes') {
     if (ctx.chat?.type !== 'private') return;

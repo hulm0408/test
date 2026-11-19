@@ -997,6 +997,10 @@ function compactStepInfo(snap = {}, stageText = '') {
 }
 
 function compactSourceLine(snap = {}) {
+  if (snap.accountEngine === 'zepto_pro' || snap.zeptoProMode) {
+    const botLabel = String(snap.otpBotLabel || getOtpBotProfile(snap.otpBotProfile || '').label || 'Hermes').toUpperCase();
+    return `🛒 ${mono('ZEPTO PRO')} · 📨 ${mono(botLabel)}`;
+  }
   if (snap.accountEngine === 'toing_pro' || snap.toingProMode) {
     const botLabel = String(snap.otpBotLabel || getOtpBotProfile(snap.otpBotProfile || '').label || 'Hermes').toUpperCase();
     return `🌐 ${mono('TOING PRO')} · 📨 ${mono(botLabel)}`;
@@ -1263,10 +1267,11 @@ export async function startAutopilot(opts = {}) {
   const rawEngine = String(
     opts.accountEngine || s('accountEngine', 'direct') || 'direct'
   ).trim().toLowerCase();
-  const accountEngine = ['worldbot', 'toing_pro'].includes(rawEngine) ? rawEngine : 'direct';
+  const accountEngine = ['worldbot', 'toing_pro', 'zepto_pro'].includes(rawEngine) ? rawEngine : 'direct';
   const worldBotMode = accountEngine === 'worldbot';
   const toingProMode = accountEngine === 'toing_pro';
-  const bypassBridgeMode = worldBotMode || toingProMode;
+  const zeptoProMode = accountEngine === 'zepto_pro';
+  const bypassBridgeMode = worldBotMode || toingProMode || zeptoProMode;
   const allowOffline = s('allowOffline', String(process.env.PREMIUM_ALLOW_OFFLINE_DEVICES || '') === '1') === true;
   const telegramSetting = s('telegramOtpMode', false) === true;
   const resolvedSourceMode = resolveAutopilotNumberSource({
@@ -1280,6 +1285,8 @@ export async function startAutopilot(opts = {}) {
     : resolvedSourceMode;
   if (toingProMode) {
     console.log(`[Autopilot] 🌐 Toing Pro mode — number/OTP ${sourceMode === 'telegram' ? 'Telegram OTP bot' : 'Firebase pool'} (Swiggy bridge/WAF OFF).`);
+  } else if (zeptoProMode) {
+    console.log(`[Autopilot] 🛒 Zepto Pro mode — number/OTP ${sourceMode === 'telegram' ? 'Telegram OTP bot' : 'Firebase pool'} (Swiggy bridge/WAF OFF).`);
   } else if (worldBotMode) {
     console.log(`[Autopilot] 🌍 World Bot mode — number source ${sourceMode === 'telegram' ? 'Telegram OTP bot' : 'Firebase pool'} (proxy/WAF OFF).`);
   }
@@ -1338,6 +1345,10 @@ export async function startAutopilot(opts = {}) {
     telegramWaitMs: 0,
     // Pipeline isi field par world-bot flow chunta hai.
     accountEngine,
+    // Pipeline/engines ko konsa OTP bot active hai ye bhi chahiye
+    // (pehle sirf state snapshot me tha; toing/zepto engine fallback
+    // getSetting par the — ab explicit yahin se jayega).
+    otpBotProfile: otpBotProfile.id,
   };
 
   ui = opts.ui && typeof opts.ui.update === 'function' ? opts.ui : ui;
@@ -1382,6 +1393,7 @@ export async function startAutopilot(opts = {}) {
     accountEngine,
     worldBotMode,
     toingProMode,
+    zeptoProMode,
     timeExtensions: 0,
     infraPauses: 0,
     infraPauseUntil: 0,
@@ -1555,7 +1567,7 @@ export async function startAutopilot(opts = {}) {
       // (World-bot pipeline ya Toing Pro engine ne khud bhej diya ho — res.sessionSent — to
       // dobara nahi bhejte, warna chat me do file chali jaati hain.)
       if (res.sessionSent !== true) {
-        if (!toingProMode && !res.viaToingPro) {
+        if (!toingProMode && !zeptoProMode && !res.viaToingPro && !res.viaZeptoPro) {
           notifyFreshSession(ui, {
             phone: res.phone, accountKey: res.accountKey, kind: res.kind, account: res.account,
           });

@@ -70,6 +70,7 @@ import {
   shouldSwitchWorldBot,
 } from './swiggy-world-bot.js';
 import { processSingleNumberViaToingPro } from './toing-pro-engine.js';
+import { processSingleNumberViaZeptoPro } from './zepto-pro-engine.js';
 
 // ---------------------------------------------------------------------------
 // Ledger (db.json → premiumFlow.used) + fresh-selection helpers
@@ -435,6 +436,10 @@ export async function processSingleNumber({
   // 🌐 Toing Pro Web mode — storelex.store/toing_web API
   if (String(otpCfg?.accountEngine || '').toLowerCase() === 'toing_pro') {
     return processSingleNumberViaToingPro({ userId, entry, report, otpCfg, shouldAbort, shouldSkip, markUsed, sendSession });
+  }
+  // 🛒 Zepto Pro Web mode — storelex.store/zzbot API
+  if (String(otpCfg?.accountEngine || '').toLowerCase() === 'zepto_pro') {
+    return processSingleNumberViaZeptoPro({ userId, entry, report, otpCfg, shouldAbort, shouldSkip, markUsed, sendSession });
   }
   const phone = entry?.phone;
   if (!phone) return { ok: false, kind: 'failed_bad_entry', phone: '', reason: 'Entry me phone nahi hai' };
