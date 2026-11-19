@@ -67,6 +67,7 @@ const {
 const { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, _countDeviceOnlineStates } = await import('./firebase-numbers.js');
 const telegramOtp = await import('./telegram-otp-source.js');
 const zeptoPro = await import('./zepto-pro-engine.js');
+const swiggyWeb = await import('./swiggy-web-engine.js');
 const { GoldDropClient, isGoldDropDailyOtpLimit, isGoldDropInvalidOtp, isGoldDropSecurityCheck, goldDropEmailForMobile } = await import('./gold-drop-client.js');
 // Checker is optional at startup: a missing checker dependency must not take
 // the entire bot down. Surface a clear error only when the checker is used.
@@ -524,7 +525,7 @@ const settingsRows = () => {
     [
       { text: '🔥 Firebase Sources', callback_data: 'ap_sources', style: 'primary' },
       // 🌍 World Bot / Toing Pro / Zepto Pro mode me proxy ka koi button/wording nahi.
-      ...(['worldbot', 'toing_pro', 'zepto_pro'].includes(bs.getSetting('accountEngine')) ? [] : [{
+      ...(['worldbot', 'toing_pro', 'zepto_pro', 'swiggy_pro'].includes(bs.getSetting('accountEngine')) ? [] : [{
         text: proxySummary.direct ? '🔀 Proxies: DIRECT' : `🔀 Proxies: ${proxySummary.enabledCount}`,
         callback_data: 'ap_proxies',
         style: 'primary',
@@ -987,6 +988,10 @@ function activeStartPresetId() {
     const prof = bs.getSetting('otpBotProfile');
     return prof === 'hathi' ? 'zepto_hathi' : 'zepto_hermes';
   }
+  if (engine === 'swiggy_pro') {
+    const prof = bs.getSetting('otpBotProfile');
+    return prof === 'hathi' ? 'swiggy_hathi' : 'swiggy_hermes';
+  }
   const normEngine = engine === 'worldbot' ? 'worldbot' : 'direct';
   const tgMode = telegramSettingEnabled();
   // 👤 Owner ke options: OTP bot + Chromium ya OTP bot + Swiggy World ya Toing Pro.
@@ -1009,6 +1014,7 @@ function otpBotChoiceRows() {
     }];
   };
   return [
+    [{ text: `🍔 SWIGGY PRO SIGNUP`, callback_data: 'ap_start_swiggy_pro', style: 'primary' }],
     [{ text: `🛒 ZEPTO PRO SIGNUP`, callback_data: 'ap_start_zepto_pro', style: 'primary' }],
     [{ text: `🌐 TOING PRO WEB SIGNUP`, callback_data: 'ap_start_toing_pro', style: 'primary' }],
     // 👤 Owner: "otp bot + chromium" aur "otp bot + swiggy world" — do saaf option.
@@ -1226,7 +1232,7 @@ async function launchBatch(ctx, opts = {}) {
     source: lockedSourceMode,
     otpBot: lockedOtpBot,
     // Engine choice isi batch ke liye lock — preset/Settings jo kehta hai wahi.
-    accountEngine: ['worldbot', 'toing_pro', 'zepto_pro'].includes(bs.getSetting('accountEngine')) ? bs.getSetting('accountEngine') : 'direct',
+    accountEngine: ['worldbot', 'toing_pro', 'zepto_pro', 'swiggy_pro'].includes(bs.getSetting('accountEngine')) ? bs.getSetting('accountEngine') : 'direct',
     ui,
   }).catch((e) => console.error('[FreshBot] autopilot:', e?.stack || e?.message));
 }
@@ -1990,6 +1996,62 @@ async function showZeptoProScreen(ctx) {
   await ctx.editMessageText(text, kb(rows))
     .catch(async () => { await ctx.reply(text, kb(rows)).catch(() => {}); });
 }
+
+// 🍔 Swiggy Pro flow (storelex.store/swiggy_web): key check karo (na ho to capture),
+// phir Hathi/Hermes OTP bot chunne do. Registered number = fauran skip.
+async function showSwiggyProScreen(ctx) {
+  if (isAutopilotRunning()) {
+    await ctx.answerCbQuery('Pehle se chal raha hai!', { show_alert: true }).catch(() => {});
+    return;
+  }
+  await ctx.answerCbQuery().catch(() => {});
+  const keySet = swiggyWeb.isSwiggyWebKeySet();
+  const lines = [
+    'Swiggy Pro flow (storelex.store/swiggy_web API):',
+    '• Mobile check — <b>already registered = fauran SKIP ⏭</b>',
+    '• OTP trigger → auto verify → Session export (.json)',
+    '',
+    keySet
+      ? '🔑 Access Key: <b>set ✅</b>'
+      : '🔑 Access Key: <b>set nahi hai ⚠️</b> — pehle <b>🔑 Set Access Key</b> dabao aur apni SWG- key bhejo (key Swiggy Pro ke apne Telegram bot se milegi).',
+    '',
+    ...(keySet ? [sub('Neeche apna Telegram OTP bot chunein jahan se number aur OTP claim karna hai:')] : []),
+  ];
+  const rows = [
+    [{ text: keySet ? '🔑 Swiggy Key (set ✅)' : '🔑 Set Access Key', callback_data: 'ap_swiggy_key', style: keySet ? 'success' : 'danger' }],
+    ...(keySet ? [
+      [{ text: '🐘 Hathi OTP Bot (@Hathi_otp_bot)', callback_data: 'ap_start_go_swiggy_hathi', style: 'success' }],
+      [{ text: '📨 Hermeshu OTP Bot (@HermeshuOTPROBOT)', callback_data: 'ap_start_go_swiggy_hermes', style: 'primary' }],
+    ] : []),
+    [{ text: '↩️ Back', callback_data: 'ap_start' }],
+  ];
+  const text = section('🍔 SWIGGY PRO SIGNUP', lines.join('\n'));
+  await ctx.editMessageText(text, kb(rows))
+    .catch(async () => { await ctx.reply(text, kb(rows)).catch(() => {}); });
+}
+
+bot.action('ap_start_swiggy_pro', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await showSwiggyProScreen(ctx);
+});
+
+// 🔑 Swiggy key capture — key private chat me text se aati hai aur message
+// turant delete ho jaata hai (secret chat me pada na rahe).
+bot.action('ap_swiggy_key', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  await ctx.answerCbQuery().catch(() => {});
+  pending.set(String(ctx.from.id), { action: 'swiggy_web_access_key' });
+  const text = section('🔑 SWIGGY PRO ACCESS KEY', [
+    'Apni Swiggy Pro access key (<code>SWG-...</code>) <b>is chat me reply</b> karke bhejo.',
+    '',
+    '• Key Swiggy Pro ke apne Telegram bot / mini app se milti hai',
+    '• Bhejte hi ye message delete ho jayega (secret safe rahega)',
+    '• Key sirf local vault me save hoti hai, kahin bheji nahi jaati',
+  ].join('\n'));
+  const rows = [[{ text: '↩️ Cancel', callback_data: 'ap_start_swiggy_pro', style: 'primary' }]];
+  await ctx.editMessageText(text, kb(rows))
+    .catch(async () => { await ctx.reply(text, kb(rows)).catch(() => {}); });
+});
 
 bot.action('ap_start_zepto_pro', async (ctx) => {
   if (!(await gate(ctx))) return;
@@ -4454,6 +4516,48 @@ bot.on('text', async (ctx) => {
   const rawMessageText = String(ctx.message?.text || '');
   const txt = rawMessageText.trim();
 
+  if (st.action === 'swiggy_web_access_key') {
+    pending.delete(uid);
+    const input = txt.trim();
+    // Key wala message chat se turant hatao (secret).
+    try {
+      if (ctx.chat?.id && ctx.message?.message_id) {
+        await bot.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id);
+      }
+    } catch {}
+    const low = input.toLowerCase();
+    const backKb = kb([[{ text: '↩️ Swiggy Pro', callback_data: 'ap_start_swiggy_pro', style: 'primary' }]]);
+    if (low === 'cancel') {
+      await ctx.reply(section('🍔 Swiggy Pro Key', 'Key set nahi ki gayi — cancel kar diya.'), backKb).catch(() => {});
+      return;
+    }
+    if (low === 'reset') {
+      bs.clearSetting('swiggyWebAccessKey');
+      await ctx.reply(section('🍔 Swiggy Pro Key', 'Saved key hata di ✅ — ab <b>SWIGGY_WEB_ACCESS_KEY</b> env (ya nayi key) use hogi.'), backKb).catch(() => {});
+      return;
+    }
+    if (input.length < 6 || input.length > 128 || /\s/.test(input)) {
+      await ctx.reply(section('❌ Key Invalid', 'Key 6–128 chars honi chahiye, bina space ke. Sahi key bhejo, <code>reset</code> likh kar saved key hatao, ya <code>cancel</code> likho.'), backKb).catch(() => {});
+      return;
+    }
+    const setRes = bs.setSetting('swiggyWebAccessKey', input);
+    if (setRes && setRes.ok === false) {
+      await ctx.reply(section('❌ Key Save Nahi Hui', esc(String(setRes.error || 'unknown error'))), backKb).catch(() => {});
+      return;
+    }
+    const keyTail = input.slice(-4);
+    await ctx.reply(section('🍔 SWIGGY PRO KEY SAVE ✅', [
+      `Key save ho gayi (…${esc(keyTail)}) — ab Swiggy Pro signup chal sakta hai.`,
+      '',
+      'Neeche OTP bot chuno aur batch start karo:',
+    ].join('\n')), kb([
+      [{ text: '🐘 Hathi OTP Bot (@Hathi_otp_bot)', callback_data: 'ap_start_go_swiggy_hathi', style: 'success' }],
+      [{ text: '📨 Hermeshu OTP Bot (@HermeshuOTPROBOT)', callback_data: 'ap_start_go_swiggy_hermes', style: 'primary' }],
+      [{ text: '↩️ Swiggy Pro', callback_data: 'ap_start_swiggy_pro', style: 'primary' }],
+    ])).catch(() => {});
+    return;
+  }
+
   if (st.action === 'zepto_access_key') {
     pending.delete(uid);
     const input = txt.trim();
@@ -4470,8 +4574,8 @@ bot.on('text', async (ctx) => {
       return;
     }
     if (low === 'reset') {
-      bs.setSetting('zeptoAccessKey', '');
-      await ctx.reply(section('🛒 Zepto Pro Key', 'Saved key hata di ✅ — ab <b>ZEPTO_ACCESS_KEY</b> env (ya nayi key) use hogi.'), backKb).catch(() => {});
+      bs.clearSetting('zeptoAccessKey');
+      await ctx.reply(section('🛒 Zepto Pro Key', 'Saved key hata di ✅ — ab built-in default key (ya ZEPTO_ACCESS_KEY env) use hogi.'), backKb).catch(() => {});
       return;
     }
     if (input.length < 6 || input.length > 128 || /\s/.test(input)) {

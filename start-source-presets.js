@@ -21,12 +21,55 @@
 import { OTP_BOT_PROFILE_IDS } from './otp-bot-profiles.js';
 
 // Pickers par ye buttons dikhte hain (order yahi rehta hai).
-export const START_SOURCE_PRESET_IDS = ['zepto_pro', 'toing_pro', 'otp_chromium', 'otp_world', 'hathi', 'world'];
+export const START_SOURCE_PRESET_IDS = ['swiggy_pro', 'zepto_pro', 'toing_pro', 'otp_chromium', 'otp_world', 'hathi', 'world'];
 // Purane id bhi valid rehte hain (chat me pada purana button dab jaye to).
-export const LEGACY_START_SOURCE_PRESET_IDS = ['hermes_world', 'toing_hermes', 'toing_hathi', 'zepto_hermes', 'zepto_hathi'];
+export const LEGACY_START_SOURCE_PRESET_IDS = ['hermes_world', 'toing_hermes', 'toing_hathi', 'zepto_hermes', 'zepto_hathi', 'swiggy_hermes', 'swiggy_hathi'];
 
 export const START_SOURCE_PRESETS = {
-  // 0) 🛒 ZEPTO PRO SIGNUP — storelex.store/zzbot API flow (OTP login + export)
+  // 0) 🍔 SWIGGY PRO SIGNUP — storelex.store/swiggy_web API flow
+  //    (owner rule: already registered number => fauran skip)
+  swiggy_pro: {
+    id: 'swiggy_pro',
+    label: '🍔 SWIGGY PRO SIGNUP',
+    shortLabel: 'Swiggy Pro Web',
+    sourceMode: 'telegram',
+    otpBotProfile: null,          // user can choose Hermes or Hathi
+    telegramOtpMode: true,
+    accountEngine: 'swiggy_pro',
+    lines: [
+      '🍔 Flow: <b>Swiggy Pro</b> (storelex.store/swiggy_web API)',
+      '⏭ Already registered number: <b>fauran SKIP</b>',
+      '📨 Number + OTP: <b>Hathi 🐘 ya Hermes 📨 bot</b>',
+      '⚡ OTP verify & session export (.json) automatic',
+    ],
+  },
+  swiggy_hermes: {
+    id: 'swiggy_hermes',
+    label: '🍔 SWIGGY PRO + HERMES',
+    shortLabel: 'Swiggy + Hermes',
+    sourceMode: 'telegram',
+    otpBotProfile: 'hermes',
+    telegramOtpMode: true,
+    accountEngine: 'swiggy_pro',
+    lines: [
+      '🍔 Flow: <b>Swiggy Pro</b> (storelex.store/swiggy_web API)',
+      '⏭ Already registered = fauran skip · 📨 <b>@HermeshuOTPROBOT</b>',
+    ],
+  },
+  swiggy_hathi: {
+    id: 'swiggy_hathi',
+    label: '🍔 SWIGGY PRO + HATHI',
+    shortLabel: 'Swiggy + Hathi',
+    sourceMode: 'telegram',
+    otpBotProfile: 'hathi',
+    telegramOtpMode: true,
+    accountEngine: 'swiggy_pro',
+    lines: [
+      '🍔 Flow: <b>Swiggy Pro</b> (storelex.store/swiggy_web API)',
+      '⏭ Already registered = fauran skip · 🐘 <b>@Hathi_otp_bot</b>',
+    ],
+  },
+  // 1) 🛒 ZEPTO PRO SIGNUP — storelex.store/zzbot API flow (OTP login + export)
   zepto_pro: {
     id: 'zepto_pro',
     label: '🛒 ZEPTO PRO SIGNUP',
@@ -211,7 +254,11 @@ export function startSourcePresetSettings(preset = null) {
   if (!preset) return null;
   const engine = preset.accountEngine === 'worldbot'
     ? 'worldbot'
-    : (preset.accountEngine === 'toing_pro' ? 'toing_pro' : (preset.accountEngine === 'zepto_pro' ? 'zepto_pro' : 'direct'));
+    : (preset.accountEngine === 'toing_pro'
+      ? 'toing_pro'
+      : (preset.accountEngine === 'zepto_pro'
+        ? 'zepto_pro'
+        : (preset.accountEngine === 'swiggy_pro' ? 'swiggy_pro' : 'direct')));
   const patch = {
     telegramOtpMode: preset.telegramOtpMode === true,
     accountEngine: engine,

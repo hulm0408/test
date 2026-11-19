@@ -71,6 +71,7 @@ import {
 } from './swiggy-world-bot.js';
 import { processSingleNumberViaToingPro } from './toing-pro-engine.js';
 import { processSingleNumberViaZeptoPro } from './zepto-pro-engine.js';
+import { processSingleNumberViaSwiggyWeb } from './swiggy-web-engine.js';
 
 // ---------------------------------------------------------------------------
 // Ledger (db.json → premiumFlow.used) + fresh-selection helpers
@@ -440,6 +441,10 @@ export async function processSingleNumber({
   // 🛒 Zepto Pro Web mode — storelex.store/zzbot API
   if (String(otpCfg?.accountEngine || '').toLowerCase() === 'zepto_pro') {
     return processSingleNumberViaZeptoPro({ userId, entry, report, otpCfg, shouldAbort, shouldSkip, markUsed, sendSession });
+  }
+  // 🍔 Swiggy Pro Web mode — storelex.store/swiggy_web API
+  if (String(otpCfg?.accountEngine || '').toLowerCase() === 'swiggy_pro') {
+    return processSingleNumberViaSwiggyWeb({ userId, entry, report, otpCfg, shouldAbort, shouldSkip, markUsed, sendSession });
   }
   const phone = entry?.phone;
   if (!phone) return { ok: false, kind: 'failed_bad_entry', phone: '', reason: 'Entry me phone nahi hai' };
