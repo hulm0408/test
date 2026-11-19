@@ -866,6 +866,12 @@ export function buildCloudVaultSnapshot(data = null) {
     freshSettings: (src?.freshSettings && typeof src.freshSettings === 'object')
       ? { ...src.freshSettings }
       : {},
+    // ✅ Approved users (ask-admin-for-approval flow) — restart/deploy par
+    // approval na ude, warna approved user ka /start phir se owner ke paas
+    // request bhejta hai (2026-11-19 ka bug).
+    approvedUserIds: Array.isArray(src?.config?.approvedUserIds)
+      ? src.config.approvedUserIds.map(String).filter(Boolean).slice(0, 500)
+      : [],
     // Shared WAF token (encrypted at rest by the vault transport) so a fresh
     // Render deploy starts WARM — no cold-start challenge storm on scans.
     waf: (src?.waf && typeof src.waf.token === 'string' && src.waf.token.length > 50)
@@ -982,6 +988,22 @@ function mergeRemoteSnapshotIntoDb(remote) {
 
     const firebaseRestore = mergeVaultFirebaseState(db, remote);
     if (firebaseRestore.mutated) mutated = true;
+
+    // ✅ Approved users wapas laao (union — local + remote dono chale;
+    // revoke sirf local remove karta hai, vault kisi ko wapas nahi laata
+    // jo local se hataya gaya ho... isliye sirf NAYE ids merge hote hain).
+    if (Array.isArray(remote.approvedUserIds) && remote.approvedUserIds.length) {
+      if (!Array.isArray(db.config.approvedUserIds)) db.config.approvedUserIds = [];
+      const have = new Set(db.config.approvedUserIds.map(String));
+      for (const rawId of remote.approvedUserIds) {
+        const rid = String(rawId || '').trim();
+        if (rid && !have.has(rid)) {
+          db.config.approvedUserIds.push(rid);
+          have.add(rid);
+          mutated = true;
+        }
+      }
+    }
 
     for (const [k, remAcc] of Object.entries(remote.accounts || {})) {
       if (!remAcc || remAcc.isLoggedIn === false) continue;
