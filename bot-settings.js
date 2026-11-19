@@ -40,8 +40,9 @@ const SPECS = {
   //   worldbot  = @SwiggyByWorldBot ke buttons click karke (koi proxy nahi)
   //   toing_pro = Toing Pro Web flow (storelex.store/toing_web API: check_mobile -> send_otp -> verify_otp -> export)
   //   zepto_pro = Zepto Pro Web flow (storelex.store/zzbot API: login/otp -> login/verify -> export)
-  accountEngine:     { dflt: 'direct', label: '🌍 Account engine (Chromium / Swiggy World / Toing Pro Web / Zepto Pro Web)',
-                       enum: ['direct', 'worldbot', 'toing_pro', 'zepto_pro'] },
+  //   swiggy_pro = Swiggy Pro Web flow (storelex.store/swiggy_web API: check_mobile (registered = skip) -> send_otp -> verify_otp -> export)
+  accountEngine:     { dflt: 'direct', label: '🌍 Account engine (Chromium / Swiggy World / Toing Pro Web / Zepto Pro Web / Swiggy Pro Web)',
+                       enum: ['direct', 'worldbot', 'toing_pro', 'zepto_pro', 'swiggy_pro'] },
   telegramOtpMode:   { bool: true, dflt: false, label: '📨 Telegram Hermes mode (number + OTP Telegram bot se)' },
   telegramOtpTimeoutMs: { min: 5000, max: 180000, dflt: 20000, label: 'Hermes OTP Refresh budget (ms)' },
   telegramOtpRefreshMs: { min: 1000, max: 15000, dflt: 2500, label: 'Hermes Refresh interval (ms)' },
@@ -56,6 +57,11 @@ const SPECS = {
   // isko override kar sakti hai; 'reset' karne par wapas yehi default aata hai.
   zeptoAccessKey:    { string: true, dflt: 'ZPT-BW9Z-PLMB-1H1W-9HSD', label: '🔑 Zepto Pro Access Key' },
   zeptoBaseUrl:      { string: true, dflt: 'https://storelex.store/zzbot', label: '🛒 Zepto Pro Base URL' },
+  // 🍔 Swiggy Pro (storelex.store/swiggy_web) — owner ka rule: SWG key HAMESHA
+  // yehi built-in default rahegi (Zepto ZPT key ki tarah). Chat se override /
+  // 'reset' karne par wapas yehi aati hai. Env: SWIGGY_WEB_ACCESS_KEY.
+  swiggyWebAccessKey: { string: true, dflt: 'SWG-WZEY-9089-69ZS', label: '🔑 Swiggy Pro Access Key' },
+  swiggyWebBaseUrl:  { string: true, dflt: 'https://storelex.store/swiggy_web', label: '🍔 Swiggy Pro Base URL' },
   // 🛡️ NoCaptchaAI — Gold Drop security check (Cloudflare Turnstile) auto-solve.
   // '' (unset) = code ki built-in key; 'off' = auto-solve band; 'nocap_…' = apni key.
   nocapApiKey:       { string: true, dflt: '', label: '🛡️ NoCaptchaAI key (Gold Drop security check auto-solve)' },
@@ -78,6 +84,8 @@ const ENV_MAP = {
   toingAccessKey: 'TOING_ACCESS_KEY',
   zeptoAccessKey: 'ZEPTO_ACCESS_KEY',
   zeptoBaseUrl: 'ZEPTO_PRO_BASE_URL',
+  swiggyWebAccessKey: 'SWIGGY_WEB_ACCESS_KEY',
+  swiggyWebBaseUrl: 'SWIGGY_WEB_BASE_URL',
   nocapApiKey: 'NOCAP_API_KEY',
 };
 
@@ -187,9 +195,10 @@ export function fmtSetting(key) {
   if (key === 'accountEngine') {
     if (v === 'toing_pro') return 'Toing Pro Web';
     if (v === 'zepto_pro') return 'Zepto Pro Web';
+    if (v === 'swiggy_pro') return 'Swiggy Pro Web';
     return v === 'worldbot' ? 'OTP bot + Swiggy World' : 'OTP bot + Chromium';
   }
-  if (key === 'zeptoAccessKey') {
+  if (key === 'zeptoAccessKey' || key === 'swiggyWebAccessKey') {
     const raw = String(v || '').trim();
     if (!raw) return '⚠️ set nahi hai';
     return `${raw.slice(0, 6)}…${raw.slice(-4)}`; // key kabhi poori mat dikhao

@@ -35,6 +35,15 @@ import {
 
 export const DEFAULT_TELEGRAM_OTP_BOT_USERNAME = OTP_BOT_PROFILES[DEFAULT_OTP_BOT_PROFILE_ID].username;
 
+// 👤 Owner ka rule (2026-11-19): Telegram API credentials + login phone
+// CODE me hi built-in rahte hain — owner env nahi bana sakta. Env ya saved
+// file mile to wahi jeetegi, warna ye defaults chalenge.
+export const DEFAULT_TELEGRAM_API_ID = 36215289;
+export const DEFAULT_TELEGRAM_API_HASH = '1e59ee5fb756233dc8c2446aac93ff3a';
+// Telegram login ka pre-selected spare number — login flow me "Change Number"
+// button se owner apna dusra number bhi daal sakta hai.
+export const DEFAULT_TELEGRAM_LOGIN_PHONE = '8801322367848';
+
 // ---------------------------------------------------------------------------
 // Kaunsa OTP bot — Hermes (@HermeshuOTPROBOT) ya HardXotp (@HardXotp_Bot).
 // START par owner source chunta hai; us waqt yahan explicit profile set hoti
@@ -165,11 +174,11 @@ export function getTelegramOtpConfig(env = process.env) {
   const apiCredentialsFile = firstEnv(env, ['TELEGRAM_API_CREDENTIALS_FILE', 'TG_API_CREDENTIALS_FILE'])
     || (env === process.env ? getTelegramApiCredentialsFilePath(env) : '');
   const storedApi = readStoredTelegramApiCredentials(apiCredentialsFile);
-  const apiId = envApiId || storedApi.apiId || 0;
-  const apiHash = envApiHash || storedApi.apiHash || '';
+  const apiId = envApiId || storedApi.apiId || DEFAULT_TELEGRAM_API_ID;
+  const apiHash = envApiHash || storedApi.apiHash || DEFAULT_TELEGRAM_API_HASH;
   const apiCredentialsSource = (envApiId || envApiHash)
     ? ((storedApi.apiId || storedApi.apiHash) ? 'env+file' : 'env')
-    : ((storedApi.apiId || storedApi.apiHash) ? 'file' : '');
+    : ((storedApi.apiId || storedApi.apiHash) ? 'file' : 'built-in');
 
   let session = firstEnv(env, ['TELEGRAM_SESSION', 'TELEGRAM_STRING_SESSION', 'TG_SESSION']);
   let sessionSource = session ? 'env' : '';
