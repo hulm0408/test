@@ -2239,6 +2239,7 @@ function telegramLoginStageLabel(stage) {
     api_hash: 'API hash ka wait',
     connecting: 'connect ho raha hai',
     phone: 'phone ka wait',
+    phone_choice: 'number choice ka wait',
     code: 'login code ka wait',
     password: '2FA password ka wait',
     name: 'naam ka wait',
@@ -2310,7 +2311,7 @@ async function sendTelegramLoginMessage(flow, text, rows = telegramLoginRows()) 
   });
 }
 
-async function waitForTelegramLoginInput(flow, stage, prompt) {
+async function waitForTelegramLoginInput(flow, stage, prompt, rows = telegramLoginRows()) {
   if (!flow || flow.cancelled || telegramLoginFlow !== flow) throw telegramLoginAbortError();
   if (flow.resolveInput) throw new Error('Telegram login input pehle se pending hai.');
 
@@ -2333,7 +2334,7 @@ async function waitForTelegramLoginInput(flow, stage, prompt) {
   }, TELEGRAM_LOGIN_INPUT_TIMEOUT_MS);
   flow.timer.unref?.();
 
-  const sent = await sendTelegramLoginMessage(flow, prompt);
+  const sent = await sendTelegramLoginMessage(flow, prompt, rows);
   if (!sent && flow.resolveInput === resolveInput) {
     clearTelegramLoginWait(flow);
     throw new Error('Telegram login prompt nahi bhej paya — bot chat check karke dobara try karo.');
@@ -2432,6 +2433,36 @@ async function runTelegramLoginFlow(flow) {
 
     const result = await telegramOtp.loginTelegramUserInteractive({
       phoneNumber: async () => {
+        // 👤 Owner ka rule: pre-selected spare number hamesha ready rahe;
+        // "Change Number" dabane par hi apna number poochha jayega.
+        const defPhone = String(telegramOtp.DEFAULT_TELEGRAM_LOGIN_PHONE || '').trim();
+        if (defPhone) {
+          const choice = await waitForTelegramLoginInput(flow, 'phone_choice', section('📱 Telegram Login Number', [
+            field('Pre-selected', maskTelegramLoginPhone(defPhone)),
+            ``,
+            '<b>✅ Isi number se login</b> dabao — kuch type karne ki zaroorat nahi.',
+            sub('Apna dusra spare number use karna ho to 📱 Change Number dabao.'),
+          ].join('\n')), [
+            [{ text: `✅ Isi number se login (${maskTelegramLoginPhone(defPhone)})`, callback_data: 'ap_tglogin_default', style: 'success' }],
+            [{ text: '📱 Change Number', callback_data: 'ap_tglogin_change', style: 'primary' }],
+            ...telegramLoginRows(),
+          ]);
+          if (String(choice || '').trim() === '__default__') {
+            flow.phone = defPhone;
+            await sendTelegramLoginMessage(flow, section('📱 Telegram Login Number', [
+              field('Number', maskTelegramLoginPhone(defPhone)),
+              sub('Login code isi number par jayega — code aate hi yahan bhejna.'),
+            ].join('\n')));
+            return defPhone;
+          }
+          // '__change__' — neeche apna number poochha jayega.
+          // Button ke bajaye koi seedha number type kar de to use hi use karo.
+          const typed = telegramOtp.normalizeTelegramLoginPhone?.(choice) || '';
+          if (String(choice || '').trim() !== '__change__' && typed) {
+            flow.phone = typed;
+            return typed;
+          }
+        }
         const phone = await askTelegramLoginValue(
           flow,
           'phone',
@@ -3517,6 +3548,33 @@ bot.action('ap_telegram_account', async (ctx) => {
 bot.action('ap_telegram_login_start', async (ctx) => {
   if (!(await gate(ctx))) return;
   await startTelegramLoginFlow(ctx);
+});
+
+// 📱 Telegram login — pre-selected number choice buttons.
+// "✅ Isi number se login" → built-in spare number se seedha login.
+// "📱 Change Number" → apna spare number type karne ka prompt aayega.
+async function resolveTelegramLoginPhoneChoice(ctx, token) {
+  const flow = telegramLoginFlow;
+  if (!flow || flow.ownerId !== String(ctx.from?.id)) {
+    await ctx.answerCbQuery('Koi Telegram login flow chal nahi raha.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  if (flow.stage !== 'phone_choice' || !flow.resolveInput) {
+    await ctx.answerCbQuery('Abhi number-choice step nahi hai.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  const resolve = flow.resolveInput;
+  clearTelegramLoginWait(flow);
+  await ctx.answerCbQuery(token === '__default__' ? '✅ Pre-selected number se login…' : '📱 Apna number bhejo').catch(() => {});
+  resolve(token);
+}
+
+bot.action('ap_tglogin_default', async (ctx) => {
+  await resolveTelegramLoginPhoneChoice(ctx, '__default__');
+});
+
+bot.action('ap_tglogin_change', async (ctx) => {
+  await resolveTelegramLoginPhoneChoice(ctx, '__change__');
 });
 
 bot.action('ap_telegram_login_cancel', async (ctx) => {

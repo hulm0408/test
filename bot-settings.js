@@ -57,9 +57,10 @@ const SPECS = {
   // isko override kar sakti hai; 'reset' karne par wapas yehi default aata hai.
   zeptoAccessKey:    { string: true, dflt: 'ZPT-BW9Z-PLMB-1H1W-9HSD', label: '🔑 Zepto Pro Access Key' },
   zeptoBaseUrl:      { string: true, dflt: 'https://storelex.store/zzbot', label: '🛒 Zepto Pro Base URL' },
-  // 🍔 Swiggy Pro (storelex.store/swiggy_web) — SWG- key; owner START → Swiggy
-  // Pro screen se set kare ya SWIGGY_WEB_ACCESS_KEY env de.
-  swiggyWebAccessKey: { string: true, dflt: '', label: '🔑 Swiggy Pro Access Key' },
+  // 🍔 Swiggy Pro (storelex.store/swiggy_web) — owner ka rule: SWG key HAMESHA
+  // yehi built-in default rahegi (Zepto ZPT key ki tarah). Chat se override /
+  // 'reset' karne par wapas yehi aati hai. Env: SWIGGY_WEB_ACCESS_KEY.
+  swiggyWebAccessKey: { string: true, dflt: 'SWG-WZEY-9089-69ZS', label: '🔑 Swiggy Pro Access Key' },
   swiggyWebBaseUrl:  { string: true, dflt: 'https://storelex.store/swiggy_web', label: '🍔 Swiggy Pro Base URL' },
   // 🛡️ NoCaptchaAI — Gold Drop security check (Cloudflare Turnstile) auto-solve.
   // '' (unset) = code ki built-in key; 'off' = auto-solve band; 'nocap_…' = apni key.
