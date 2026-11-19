@@ -44,6 +44,7 @@ const {
   getUsedNumbersSummary,
   getSessionExportJson,
   getDb,
+  saveDb,
   findAccountKeyByPhone,
 } = await import('./store.js');
 const {
@@ -236,6 +237,86 @@ function isOwner(userId) {
   try { if (isBoss(Number(userId))) return true; } catch {}
   try { if (isBoss(uid)) return true; } catch {}
   return uid === '5393396812';
+}
+
+// ---------------------------------------------------------------------------
+// ✅ Approved users — owner ka rule (2026-11-17):
+//   "Mera dusra account se bot start karu to wo bhi feature access kar paye."
+//   Naya user /start dabayega → "Ask admin for approval" card → owner ke paas
+//   Approve ✅ / Deny ❌ buttons → approve hone par user ID vault me save hoti
+//   hai aur wo poora bot (Zepto Pro samet, wahi fixed key ke saath) use kar
+//   sakta hai. Owner kabhi bhi list se hata sakta hai.
+// ---------------------------------------------------------------------------
+function approvedUserIds() {
+  const db = getDb();
+  if (!Array.isArray(db.config.approvedUserIds)) db.config.approvedUserIds = [];
+  return db.config.approvedUserIds;
+}
+function isApprovedUser(userId) {
+  return approvedUserIds().map(String).includes(String(userId));
+}
+function grantApprovedUser(userId) {
+  const uid = String(userId);
+  const list = approvedUserIds();
+  if (!list.map(String).includes(uid)) {
+    list.push(uid);
+    saveDb(getDb());
+  }
+}
+function revokeApprovedUser(userId) {
+  const db = getDb();
+  const uid = String(userId);
+  const list = approvedUserIds();
+  const idx = list.map(String).indexOf(uid);
+  if (idx >= 0) {
+    list.splice(idx, 1);
+    saveDb(db);
+  }
+}
+// Access = owner YA approved user. Saare gates isi se guzarte hain.
+function hasAccess(userId) {
+  return isOwner(userId) || isApprovedUser(userId);
+}
+
+// Pending approval requests — spam rokne ke liye 10 min me ek hi request.
+const approvalRequests = new Map(); // uid -> requestedAt
+const APPROVAL_REREQUEST_MS = 10 * 60 * 1000;
+
+async function askAdminForApproval(ctx) {
+  const uid = String(ctx.from?.id || '');
+  if (!uid) return;
+  const name = [ctx.from?.first_name, ctx.from?.last_name].filter(Boolean).join(' ') || 'User';
+  const uname = ctx.from?.username ? `@${ctx.from.username}` : '—';
+  const last = Number(approvalRequests.get(uid) || 0);
+  const alreadyPending = last && Date.now() - last < APPROVAL_REREQUEST_MS;
+
+  await ctx.reply(section('⏳ ASK ADMIN FOR APPROVAL', [
+    `Aapki Telegram ID: <code>${esc(uid)}</code>`,
+    alreadyPending
+      ? 'Aapki access request pehle hi admin ko bheji ja chuki hai — approve hote hi bot chal jayega.'
+      : 'Access request admin ko bhej di gayi hai. ✅ Approve hote hi aap bot ke saare features (🛒 Zepto Pro samet) use kar paoge.',
+  ].join('\n'))).catch(() => {});
+
+  if (alreadyPending) return;
+  approvalRequests.set(uid, Date.now());
+
+  // Saare owners ko approval card bhejo (Approve / Deny buttons ke saath).
+  const ids = ownerIds();
+  const ownerList = ids ? [...ids] : ['5393396812'];
+  const text = section('🛂 ACCESS REQUEST — APPROVAL CHAHIYE', [
+    `👤 Naam: <b>${esc(name)}</b>`,
+    `🆔 ID: <code>${esc(uid)}</code>`,
+    `🔗 Username: ${esc(uname)}`,
+    '',
+    sub('Approve karne par ye user bot ke saare features (Zepto Pro signup samet) use kar payega. Access kabhi bhi wapas li ja sakti hai.'),
+  ].join('\n'));
+  const rows = [[
+    { text: '✅ Approve', callback_data: `ap_appr_ok_${uid}`, style: 'success' },
+    { text: '❌ Deny', callback_data: `ap_appr_no_${uid}`, style: 'danger' },
+  ]];
+  for (const ownerId of ownerList) {
+    await bot.telegram.sendMessage(ownerId, text, kb(rows)).catch(() => {});
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -697,14 +778,9 @@ startHealthServer();
 
 const gate = async (ctx) => {
   const uid = ctx.from?.id;
-  if (!isOwner(uid)) {
-    await ctx.answerCbQuery?.('⛔ Sirf owner.', { show_alert: true }).catch(() => {});
-    await ctx.reply(section('⛔ Ye bot sirf owner ke liye hai', [
-      `Aapki Telegram ID: <code>${uid}</code>`,
-      ``,
-      sub('Is ID ko .env me OWNER_IDS me daalein aur bot restart karein:'),
-      `<code>OWNER_IDS=${uid}</code>`,
-    ].join('\n'))).catch(() => {});
+  if (!hasAccess(uid)) {
+    await ctx.answerCbQuery?.('⏳ Ask admin for approval', { show_alert: true }).catch(() => {});
+    await askAdminForApproval(ctx);
     return false;
   }
   return true;
@@ -1156,17 +1232,62 @@ async function launchBatch(ctx, opts = {}) {
 }
 
 bot.start(async (ctx) => {
-  if (!isOwner(ctx.from?.id)) {
-    return ctx.reply(section('⛔ Ye bot sirf owner ke liye hai', [
-      `Aapki Telegram ID: <code>${ctx.from?.id}</code>`,
-      ``,
-      sub('Bot band karke .env me ye line daalein:'),
-      `<code>OWNER_IDS=${ctx.from?.id}</code>`,
-      ``,
-      sub('Phir dobara chalayein (npm start) aur /start dabayein.'),
-    ].join('\n'))).catch(() => {});
+  if (!hasAccess(ctx.from?.id)) {
+    // Naya user → "Ask admin for approval" flow (owner ko Approve/Deny card).
+    await askAdminForApproval(ctx);
+    return;
   }
   await ctx.reply(startCard(), kb(isAutopilotRunning() ? stopRows() : startRows())).catch(() => {});
+});
+
+// 🛂 Access request — sirf OWNER approve/deny kar sakta hai.
+bot.action(/^ap_appr_ok_(\d+)$/, async (ctx) => {
+  if (!isOwner(ctx.from?.id)) {
+    await ctx.answerCbQuery('⛔ Sirf admin approve kar sakta hai.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  const uid = ctx.match[1];
+  grantApprovedUser(uid);
+  approvalRequests.delete(uid);
+  await ctx.answerCbQuery('✅ Approved!').catch(() => {});
+  await ctx.editMessageText(section('🛂 ACCESS REQUEST — ✅ APPROVED', [
+    `User <code>${esc(uid)}</code> ab bot ke saare features use kar sakta hai.`,
+    '',
+    sub('Access wapas lene ho to /revoke ' + uid + ' bhejein.'),
+  ].join('\n'))).catch(() => {});
+  await bot.telegram.sendMessage(uid, section('✅ ACCESS APPROVED', [
+    'Admin ne aapki request approve kar di! 🎉',
+    'Ab /start dabao — saare features (🛒 Zepto Pro signup samet) chal jayenge.',
+  ].join('\n'))).catch(() => {});
+});
+
+bot.action(/^ap_appr_no_(\d+)$/, async (ctx) => {
+  if (!isOwner(ctx.from?.id)) {
+    await ctx.answerCbQuery('⛔ Sirf admin decide kar sakta hai.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  const uid = ctx.match[1];
+  revokeApprovedUser(uid);
+  approvalRequests.delete(uid);
+  await ctx.answerCbQuery('❌ Denied').catch(() => {});
+  await ctx.editMessageText(section('🛂 ACCESS REQUEST — ❌ DENIED', [
+    `User <code>${esc(uid)}</code> ko access nahi di gayi.`,
+  ].join('\n'))).catch(() => {});
+  await bot.telegram.sendMessage(uid, section('❌ ACCESS DENIED', [
+    'Admin ne abhi access approve nahi ki. Baad me dobara /start karke request bhej sakte ho.',
+  ].join('\n'))).catch(() => {});
+});
+
+// /revoke <id> — owner approved user ka access wapas le sakta hai.
+bot.command('revoke', async (ctx) => {
+  if (!isOwner(ctx.from?.id)) return;
+  const uid = String(ctx.message?.text || '').split(/\s+/)[1] || '';
+  if (!/^\d+$/.test(uid)) {
+    await ctx.reply('Use: <code>/revoke 123456789</code>', { parse_mode: 'HTML' }).catch(() => {});
+    return;
+  }
+  revokeApprovedUser(uid);
+  await ctx.reply(`🚫 Access revoked: <code>${esc(uid)}</code>`, { parse_mode: 'HTML' }).catch(() => {});
 });
 
 bot.help((ctx) => ctx.reply([
@@ -1404,7 +1525,7 @@ async function diagCard() {
 }
 
 bot.command('diag', async (ctx) => {
-  if (!isOwner(ctx.from?.id)) return;
+  if (!hasAccess(ctx.from?.id)) return;
   const wait = await ctx.reply('🩺 Check kar raha hoon… (pool test me ~15s lag sakta hai)').catch(() => null);
   const text = await diagCard();
   if (wait) {
@@ -1417,7 +1538,7 @@ bot.command('diag', async (ctx) => {
 });
 
 bot.command('status', async (ctx) => {
-  if (!isOwner(ctx.from?.id)) return;
+  if (!hasAccess(ctx.from?.id)) return;
   const snap = getAutopilotSnapshot();
   await ctx.reply(snap.running || snap.finishedAt ? summaryCard(snap) : startCard(),
     kb(snap.running ? stopRows() : idleRows())).catch(() => {});
@@ -1430,7 +1551,7 @@ bot.command('status', async (ctx) => {
 // JSON bhejta hai. Isiliye 2–3 ghante baad naya number/account banane ki
 // zaroorat nahi — pehle /session se refreshed JSON lo.
 bot.command('session', async (ctx) => {
-  if (!isOwner(ctx.from?.id)) return;
+  if (!hasAccess(ctx.from?.id)) return;
   const query = String(ctx.message?.text || '').trim().split(/\s+/)[1] || '';
   if (!query) {
     await ctx.reply('Usage: <code>/session 9876543210</code> ya <code>/session acc_9876543210</code>', { parse_mode: 'HTML' }).catch(() => {});
@@ -3138,7 +3259,7 @@ async function showShopStock(ctx) {
 }
 
 bot.command(['shopstock', 'shopbot', 'stock'], async (ctx) => {
-  if (!isOwner(ctx.from?.id)) return;
+  if (!hasAccess(ctx.from?.id)) return;
   const text = shopStockCard();
   const rows = shopStockRows();
   await ctx.reply(text, kb(rows)).catch(() => {});
@@ -3167,7 +3288,7 @@ bot.action('ap_shop_flush', async (ctx) => {
 });
 
 bot.command('world', async (ctx) => {
-  if (!isOwner(ctx.from?.id)) return;
+  if (!hasAccess(ctx.from?.id)) return;
   const wait = await ctx.reply('🌍 World Bot se baat kar raha hoon…').catch(() => null);
   const text = await worldProbeCard();
   const rows = [[{ text: '⚙️ Settings', callback_data: 'ap_settings', style: 'primary' }]];
@@ -4301,7 +4422,7 @@ bot.action(/^tr_testr_(custom_[a-z0-9]+)$/, async (ctx) => {
 
 bot.on('document', async (ctx) => {
   const uid = String(ctx.from?.id);
-  if (!isOwner(ctx.from?.id) || ctx.chat?.type !== 'private') return;
+  if (!hasAccess(ctx.from?.id) || ctx.chat?.type !== 'private') return;
   const st = pending.get(uid);
   if (st?.action !== 'gold_checker_codes') return;
   const doc = ctx.message?.document;
@@ -4327,7 +4448,7 @@ bot.on('document', async (ctx) => {
 
 bot.on('text', async (ctx) => {
   const uid = String(ctx.from?.id);
-  if (!isOwner(ctx.from?.id)) return;
+  if (!hasAccess(ctx.from?.id)) return;
   const st = pending.get(uid);
   if (!st) return;
   const rawMessageText = String(ctx.message?.text || '');
@@ -4623,7 +4744,7 @@ bot.on('text', async (ctx) => {
 
 // Unhandled engine callback kahin na phase — catch-all answer
 bot.on('callback_query', async (ctx) => {
-  if (!isOwner(ctx.from?.id)) return;
+  if (!hasAccess(ctx.from?.id)) return;
   await ctx.answerCbQuery().catch(() => {});
 });
 

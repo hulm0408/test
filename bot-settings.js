@@ -51,9 +51,10 @@ const SPECS = {
                        enum: ['hermes', 'hathi', 'chauhan'], allowKnownCustom: true },
   toingAccessKey:    { string: true, dflt: 'TNG-M923-VR10-8SQF', label: '🔑 Toing Pro Access Key' },
   toingBaseUrl:      { string: true, dflt: 'https://storelex.store/toing_web', label: '🌐 Toing Pro Base URL' },
-  // 🛒 Zepto Pro (storelex.store/zzbot) — key intentionally blank; owner sets it
-  // via START → Zepto Pro screen (chat text) ya ZEPTO_ACCESS_KEY env se.
-  zeptoAccessKey:    { string: true, dflt: '', label: '🔑 Zepto Pro Access Key' },
+  // 🛒 Zepto Pro (storelex.store/zzbot) — owner ka rule: key HAMESHA yehi
+  // default rahegi (Toing TNG key ki tarah built-in). Chat se set ki hui key
+  // isko override kar sakti hai; 'reset' karne par wapas yehi default aata hai.
+  zeptoAccessKey:    { string: true, dflt: 'ZPT-BW9Z-PLMB-1H1W-9HSD', label: '🔑 Zepto Pro Access Key' },
   zeptoBaseUrl:      { string: true, dflt: 'https://storelex.store/zzbot', label: '🛒 Zepto Pro Base URL' },
   // 🛡️ NoCaptchaAI — Gold Drop security check (Cloudflare Turnstile) auto-solve.
   // '' (unset) = code ki built-in key; 'off' = auto-solve band; 'nocap_…' = apni key.
