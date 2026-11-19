@@ -21,12 +21,53 @@
 import { OTP_BOT_PROFILE_IDS } from './otp-bot-profiles.js';
 
 // Pickers par ye buttons dikhte hain (order yahi rehta hai).
-export const START_SOURCE_PRESET_IDS = ['toing_pro', 'otp_chromium', 'otp_world', 'hathi', 'world'];
+export const START_SOURCE_PRESET_IDS = ['zepto_pro', 'toing_pro', 'otp_chromium', 'otp_world', 'hathi', 'world'];
 // Purane id bhi valid rehte hain (chat me pada purana button dab jaye to).
-export const LEGACY_START_SOURCE_PRESET_IDS = ['hermes_world', 'toing_hermes', 'toing_hathi'];
+export const LEGACY_START_SOURCE_PRESET_IDS = ['hermes_world', 'toing_hermes', 'toing_hathi', 'zepto_hermes', 'zepto_hathi'];
 
 export const START_SOURCE_PRESETS = {
-  // 0) 🌐 TOING PRO WEB SIGNUP — storelex.store/toing_web API flow
+  // 0) 🛒 ZEPTO PRO SIGNUP — storelex.store/zzbot API flow (OTP login + export)
+  zepto_pro: {
+    id: 'zepto_pro',
+    label: '🛒 ZEPTO PRO SIGNUP',
+    shortLabel: 'Zepto Pro Web',
+    sourceMode: 'telegram',
+    otpBotProfile: null,          // user can choose Hermes or Hathi
+    telegramOtpMode: true,
+    accountEngine: 'zepto_pro',
+    lines: [
+      '🛒 Flow: <b>Zepto Pro</b> (storelex.store/zzbot API)',
+      '📨 Number + OTP: <b>Hathi 🐘 ya Hermes 📨 bot</b>',
+      '⚡ OTP verify & session export (.json) automatic',
+    ],
+  },
+  zepto_hermes: {
+    id: 'zepto_hermes',
+    label: '🛒 ZEPTO PRO + HERMES',
+    shortLabel: 'Zepto + Hermes',
+    sourceMode: 'telegram',
+    otpBotProfile: 'hermes',
+    telegramOtpMode: true,
+    accountEngine: 'zepto_pro',
+    lines: [
+      '🛒 Flow: <b>Zepto Pro</b> (storelex.store/zzbot API)',
+      '📨 Number + OTP: <b>@HermeshuOTPROBOT</b>',
+    ],
+  },
+  zepto_hathi: {
+    id: 'zepto_hathi',
+    label: '🛒 ZEPTO PRO + HATHI',
+    shortLabel: 'Zepto + Hathi',
+    sourceMode: 'telegram',
+    otpBotProfile: 'hathi',
+    telegramOtpMode: true,
+    accountEngine: 'zepto_pro',
+    lines: [
+      '🛒 Flow: <b>Zepto Pro</b> (storelex.store/zzbot API)',
+      '🐘 Number + OTP: <b>@Hathi_otp_bot</b>',
+    ],
+  },
+  // 1) 🌐 TOING PRO WEB SIGNUP — storelex.store/toing_web API flow
   toing_pro: {
     id: 'toing_pro',
     label: '🌐 TOING PRO WEB SIGNUP',
@@ -170,7 +211,7 @@ export function startSourcePresetSettings(preset = null) {
   if (!preset) return null;
   const engine = preset.accountEngine === 'worldbot'
     ? 'worldbot'
-    : (preset.accountEngine === 'toing_pro' ? 'toing_pro' : 'direct');
+    : (preset.accountEngine === 'toing_pro' ? 'toing_pro' : (preset.accountEngine === 'zepto_pro' ? 'zepto_pro' : 'direct'));
   const patch = {
     telegramOtpMode: preset.telegramOtpMode === true,
     accountEngine: engine,

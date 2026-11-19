@@ -39,8 +39,9 @@ const SPECS = {
   //   direct    = is bot ka apna Swiggy API/bridge flow (proxy + WAF solver)
   //   worldbot  = @SwiggyByWorldBot ke buttons click karke (koi proxy nahi)
   //   toing_pro = Toing Pro Web flow (storelex.store/toing_web API: check_mobile -> send_otp -> verify_otp -> export)
-  accountEngine:     { dflt: 'direct', label: '🌍 Account engine (Chromium / Swiggy World / Toing Pro Web)',
-                       enum: ['direct', 'worldbot', 'toing_pro'] },
+  //   zepto_pro = Zepto Pro Web flow (storelex.store/zzbot API: login/otp -> login/verify -> export)
+  accountEngine:     { dflt: 'direct', label: '🌍 Account engine (Chromium / Swiggy World / Toing Pro Web / Zepto Pro Web)',
+                       enum: ['direct', 'worldbot', 'toing_pro', 'zepto_pro'] },
   telegramOtpMode:   { bool: true, dflt: false, label: '📨 Telegram Hermes mode (number + OTP Telegram bot se)' },
   telegramOtpTimeoutMs: { min: 5000, max: 180000, dflt: 20000, label: 'Hermes OTP Refresh budget (ms)' },
   telegramOtpRefreshMs: { min: 1000, max: 15000, dflt: 2500, label: 'Hermes Refresh interval (ms)' },
@@ -49,6 +50,12 @@ const SPECS = {
   otpBotProfile:     { dflt: 'hermes', label: '📨 OTP bot (hermes = @HermeshuOTPROBOT, hathi = @Hathi_otp_bot, chauhan = @HardXotp_Bot, custom_* = aapka trained bot)',
                        enum: ['hermes', 'hathi', 'chauhan'], allowKnownCustom: true },
   toingAccessKey:    { string: true, dflt: 'TNG-M923-VR10-8SQF', label: '🔑 Toing Pro Access Key' },
+  toingBaseUrl:      { string: true, dflt: 'https://storelex.store/toing_web', label: '🌐 Toing Pro Base URL' },
+  // 🛒 Zepto Pro (storelex.store/zzbot) — owner ka rule: key HAMESHA yehi
+  // default rahegi (Toing TNG key ki tarah built-in). Chat se set ki hui key
+  // isko override kar sakti hai; 'reset' karne par wapas yehi default aata hai.
+  zeptoAccessKey:    { string: true, dflt: 'ZPT-BW9Z-PLMB-1H1W-9HSD', label: '🔑 Zepto Pro Access Key' },
+  zeptoBaseUrl:      { string: true, dflt: 'https://storelex.store/zzbot', label: '🛒 Zepto Pro Base URL' },
   // 🛡️ NoCaptchaAI — Gold Drop security check (Cloudflare Turnstile) auto-solve.
   // '' (unset) = code ki built-in key; 'off' = auto-solve band; 'nocap_…' = apni key.
   nocapApiKey:       { string: true, dflt: '', label: '🛡️ NoCaptchaAI key (Gold Drop security check auto-solve)' },
@@ -69,6 +76,8 @@ const ENV_MAP = {
   telegramOtpTimeoutMs: 'TELEGRAM_OTP_TIMEOUT_MS',
   telegramOtpRefreshMs: 'TELEGRAM_OTP_REFRESH_MS',
   toingAccessKey: 'TOING_ACCESS_KEY',
+  zeptoAccessKey: 'ZEPTO_ACCESS_KEY',
+  zeptoBaseUrl: 'ZEPTO_PRO_BASE_URL',
   nocapApiKey: 'NOCAP_API_KEY',
 };
 
@@ -177,7 +186,13 @@ export function fmtSetting(key) {
   }
   if (key === 'accountEngine') {
     if (v === 'toing_pro') return 'Toing Pro Web';
+    if (v === 'zepto_pro') return 'Zepto Pro Web';
     return v === 'worldbot' ? 'OTP bot + Swiggy World' : 'OTP bot + Chromium';
+  }
+  if (key === 'zeptoAccessKey') {
+    const raw = String(v || '').trim();
+    if (!raw) return '⚠️ set nahi hai';
+    return `${raw.slice(0, 6)}…${raw.slice(-4)}`; // key kabhi poori mat dikhao
   }
   if (key === 'nocapApiKey') {
     const raw = String(v || '').trim();
