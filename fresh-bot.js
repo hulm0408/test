@@ -104,6 +104,9 @@ const { startKeepAlive } = await import('./keep-alive.js');
 const instanceInfo = await import('./instance-info.js');
 const instanceShard = await import('./instance-shard.js');
 const worldBot = await import('./swiggy-world-bot.js');
+// 🔗 Gold Drop bot (@rajafuckbot) ko OTP bot se jodne wala bridge —
+// MANUAL CLAIM (3x FLOW) me OTP khud OTP bot se aa jata hai.
+const goldDropBridge = await import('./gold-drop-bridge.js');
 // 🎓 Custom trained OTP bots — claim/refresh hooks telegram-otp-source me
 // inject karo (coding wala Hermes/Hathi flow jab custom profile active ho to
 // owner ki training se replace ho jata hai). Custom profiles provider custom-
@@ -1661,6 +1664,7 @@ bot.action('gold_drop_offer', async (ctx) => {
   ].join('\n')), kb([
     [{ text: '📨 Hermes', callback_data: 'gold_drop_start_hermes' }, { text: '🐘 Hathi', callback_data: 'gold_drop_start_hathi' }],
     [{ text: '🔐 HardXotp', callback_data: 'gold_drop_start_chauhan' }],
+    [{ text: '🔗 @rajafuckbot 3x claim', callback_data: 'gold_drop_bridge_open' }],
     [{ text: '🌐 Registration kholen', url: 'https://golddropgolddhamaka.com/register' }],
     [{ text: '🏠 Home', callback_data: 'ap_home' }],
   ])).catch(() => {});
@@ -1784,6 +1788,135 @@ bot.action('gold_drop_stop', async (ctx) => {
   goldDropRun.stop = true;
   await ctx.answerCbQuery('Stop requested; current safe step ke baad rukega.').catch(() => {});
 });
+
+// 🔗 Gold Drop bot (@rajafuckbot) ko OTP bot se jodna — MANUAL CLAIM (3x
+// FLOW) me number bhejo, OTP khud OTP bot ke chat se aa jata hai.
+// Pehle source chuno (Hermes/Hathi/HardXotp — wahi wahi OTP bots), phir
+// 10-digit number.
+bot.action('gold_drop_bridge_open', async (ctx) => {
+  if (!(await gate(ctx))) return;
+  if (ctx.chat?.type !== 'private') {
+    await ctx.answerCbQuery('Gold Drop bridge sirf private chat mein chalayein.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  if (goldDropRunning || isAutopilotRunning()) {
+    await ctx.answerCbQuery('Ek run pehle se chal raha hai.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  if (!telegramOtp.isTelegramOtpConfigured()) {
+    await ctx.answerCbQuery('Pehle Telegram OTP account configure karein.', { show_alert: true }).catch(() => {});
+    return;
+  }
+  await ctx.answerCbQuery().catch(() => {});
+  await ctx.reply(section('🔗 Gold Drop Bridge — @rajafuckbot', [
+    '@rajafuckbot ke MANUAL CLAIM (3x FLOW) me OTP khud OTP bot se aayega — number aur OTP dono copy-paste nahi karna.',
+    'Claim 1 of 3 → OTP → claim 2 → OTP → claim 3 → summary, sab auto.',
+    'OTP bot chunein (wahi number par SMS aayega):',
+  ].join('\n')), kb([
+    [{ text: '📨 Hermes', callback_data: 'gold_drop_bridge_source_hermes' }, { text: '🐘 Hathi', callback_data: 'gold_drop_bridge_source_hathi' }],
+    [{ text: '🔐 HardXotp', callback_data: 'gold_drop_bridge_source_chauhan' }],
+    [{ text: '↩️ Back', callback_data: 'gold_drop_offer' }],
+    [{ text: '🏠 Home', callback_data: 'ap_home' }],
+  ])).catch(() => {});
+});
+
+bot.action(/^gold_drop_bridge_source_(hermes|hathi|chauhan)$/, async (ctx) => {
+  if (!(await gate(ctx))) return;
+  if (ctx.chat?.type !== 'private') return ctx.answerCbQuery('Private chat mein chunein.', { show_alert: true }).catch(() => {});
+  if (goldDropRunning || isAutopilotRunning()) return ctx.answerCbQuery('Ek run pehle se chal raha hai.', { show_alert: true }).catch(() => {});
+  if (!telegramOtp.isTelegramOtpConfigured()) return ctx.answerCbQuery('Pehle Telegram OTP account configure karein.', { show_alert: true }).catch(() => {});
+  pending.set(String(ctx.from.id), { action: 'gold_drop_bridge_phone', source: ctx.match[1] });
+  await ctx.answerCbQuery().catch(() => {});
+  await ctx.reply('🔗 Ab 10-digit mobile number bhejo (jaise 9876543210) — OTP is number par aayega aur khud type ho jayega.', kb([
+    [{ text: '↩️ Cancel', callback_data: 'gold_drop_offer' }],
+  ])).catch(() => {});
+});
+
+async function startGoldDropBridgeRun(ctx, source, phone, cardMessageId) {
+  if (goldDropRunning || isAutopilotRunning()) throw new Error('Ek run pehle se chal raha hai.');
+  if (!telegramOtp.isTelegramOtpConfigured()) throw new Error('Pehle Telegram OTP account configure karein.');
+  const cleanPhone = String(phone || '').replace(/\D/g, '').slice(-10);
+  if (!/^[6789]\d{9}$/.test(cleanPhone)) throw new Error('10-digit valid mobile number hona chahiye (6/7/8/9 se shuru)');
+  const run = { owner: String(ctx.from.id), chatId: ctx.chat.id, source, stop: false, stage: 'Shuru ho raha hai', phone: cleanPhone };
+  goldDropRunning = true;
+  goldDropRun = run;
+  const previousProfile = telegramOtp.getActiveOtpBotProfile().id;
+  const render = async (html, finished = false) => {
+    await ctx.telegram.editMessageText(run.chatId, cardMessageId, undefined, html, kb(
+      finished
+        ? [[{ text: '🏠 Home', callback_data: 'ap_home' }]]
+        : [[{ text: '⏹ STOP', callback_data: 'gold_drop_stop' }]])).catch(error => {
+      console.warn('[GoldDropBridge] Card update failed:', error?.message || error);
+    });
+  };
+  const checkStop = () => { if (run.stop) throw new Error('STOP requested'); };
+  // OTP provider — number-pipeline waisa hi: watermark pehle se diya, phir
+  // OTP bot chat me refresh dabate hue 6-digit code ka intezaar.
+  const makeOtpProvider = () => async (otpCtx = {}) => {
+    if (run.stop) return { code: '', aborted: true };
+    let baseline = otpCtx?.watermark || null;
+    if (!baseline) {
+      try { baseline = await telegramOtp.captureTelegramOtpWatermark(cleanPhone); } catch {
+        try { baseline = await telegramOtp.snapshotTelegramOtpState(cleanPhone); } catch {}
+      }
+    }
+    return telegramOtp.waitForTelegramOtpCode(cleanPhone, {
+      waitMs: 0,
+      timeoutMs: 30_000,
+      refreshMs: 1_000,
+      acceptAnyAfterMs: 0,
+      baseline,
+      shouldAbort: () => run.stop,
+      candidateFilter: candidate => /^\d{6}$/.test(candidate.parsed.code)
+        && !/swiggy|swgtns/i.test(`${candidate.parsed.sender || ''} ${telegramOtp.telegramMessageText(candidate.message)}`),
+    });
+  };
+  try {
+    telegramOtp.setActiveOtpBotProfile(source);
+    await render(section('🔗 Gold Drop Bridge — @rajafuckbot', [
+      field('OTP bot', source.toUpperCase()),
+      field('Number', `<code>${esc(cleanPhone)}</code>`),
+      field('Status', 'Shuru ho raha hai…'),
+    ].join('\n')));
+    const result = await goldDropBridge.runGoldDropManualClaim({
+      phone: cleanPhone,
+      otpProvider: makeOtpProvider(),
+      otpWatermark: () => telegramOtp.captureTelegramOtpWatermark(cleanPhone).catch(() => null),
+      report: html => render(html),
+      shouldAbort: () => run.stop,
+    });
+    checkStop();
+    if (result?.ok) {
+      await ctx.telegram.sendMessage(run.chatId, section('✅ Gold Drop Bridge — Result', [
+        `📱 <code>${esc(cleanPhone)}</code> · @rajafuckbot`,
+        `✅ Claims completed: <b>${result.claimsCompleted}/${result.claimsTotal || 3}</b>`,
+        `🎁 Rewards won: <b>${result.rewardsWon}</b>`,
+        result.prizes ? `Prizes: ${esc(JSON.stringify(result.prizes))}` : '',
+      ].filter(Boolean).join('\n')), kb([[{ text: '🔗 Aur claim', callback_data: 'gold_drop_bridge_open' }, { text: '🏠 Home', callback_data: 'ap_home' }]])).catch(() => {});
+      await render(section('✅ Gold Drop Bridge — Khatam', [
+        field('Number', `<code>${esc(cleanPhone)}</code>`),
+        field('Claims', `${result.claimsCompleted}/${result.claimsTotal || 3}`),
+        field('Rewards', String(result.rewardsWon)),
+      ].join('\n')), true);
+    } else {
+      await render(section('⚠️ Gold Drop Bridge — Ruka', [
+        field('Number', `<code>${esc(cleanPhone)}</code>`),
+        field('Reason', esc(String(result?.reason || 'unknown error').slice(0, 160))),
+        'Agla number/claim ke liye wahi button se dobara shuru karein.',
+      ].join('\n')), true);
+    }
+  } catch (error) {
+    if (render) await render(section('⚠️ Gold Drop Bridge — Error', [
+      field('Number', `<code>${esc(cleanPhone)}</code>`),
+      field('Error', esc(String(error?.message || 'Unknown error').slice(0, 180))),
+    ].join('\n')), true).catch(() => {});
+  } finally {
+    telegramOtp.resetActiveOtpBotProfile();
+    telegramOtp.setActiveOtpBotProfile(previousProfile);
+    goldDropRun = null;
+    goldDropRunning = false;
+  }
+}
 
 async function startGoldDropRun(ctx, source, target, cardMessageId) {
   if (goldDropRunning || isAutopilotRunning()) throw new Error('Ek run pehle se chal raha hai.');
@@ -4857,6 +4990,34 @@ bot.on('text', async (ctx) => {
     startGoldDropRun(ctx, st.source, Number(txt), card.message_id).catch(error => {
       ctx.telegram.editMessageText(ctx.chat.id, card.message_id, undefined, `⚠️ ${String(error?.message || 'Run start failed')}`).catch(() => {});
     });
+    return;
+  }
+
+  if (st.action === 'gold_drop_bridge_phone') {
+    pending.delete(uid);
+    const source = st.source;
+    // Number wala message chat se turant hatao.
+    try {
+      if (ctx.chat?.id && ctx.message?.message_id) {
+        await bot.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id);
+      }
+    } catch {}
+    const phone = txt.replace(/\D/g, '').slice(-10);
+    if (!/^[6789]\d{9}$/.test(phone)) {
+      await ctx.reply(section('❌ Number Invalid', '10-digit valid mobile number hona chahiye (6/7/8/9 se shuru). Jaise: <code>9876543210</code>'), kb([
+        [{ text: '🔗 Dobara shuru', callback_data: 'gold_drop_bridge_open' }],
+        [{ text: '🏠 Home', callback_data: 'ap_home' }],
+      ])).catch(() => {});
+      return;
+    }
+    try {
+      const card = await ctx.reply('🔗 @rajafuckbot 3x claim shuru ho raha hai…', kb([[{ text: '⏹ STOP', callback_data: 'gold_drop_stop' }]])).catch(() => null);
+      await startGoldDropBridgeRun(ctx, source, phone, card?.message_id).catch(error => {
+        console.error('[GoldDropBridge] run error:', error?.stack || error);
+      });
+    } catch (error) {
+      await ctx.reply(section('⚠️ Gold Drop Bridge', `Shuru nahi ho saka: ${esc(String(error?.message || 'Unknown error').slice(0, 160))}`), kb([[{ text: '🏠 Home', callback_data: 'ap_home' }]])).catch(() => {});
+    }
     return;
   }
 
