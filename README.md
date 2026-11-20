@@ -140,23 +140,24 @@ se uska budget (default 90s) — dono optional.
 ### 🔗 Gold Drop bot (@rajafuckbot) ko OTP bot se jodna
 
 Gold Drop bot `@rajafuckbot` (GOLD DROP AUTOMATION) ke **MANUAL CLAIM (3x
-FLOW)** me pehle owner khud number + OTP type karte the (dono chat ek saath
-khole hua dikhe the). Ab Swiggy World Bot wala system is bot par lagta hai —
-ek hi spare Telegram user session se `@rajafuckbot` ke buttons click hote
-hain, aur jab bot OTP maangta hai, OTP bot ke chat me code khud aa jata hai:
+FLOW)** — **pura auto**, Swiggy waisa: number OTP bot se khud aata hai,
+`@rajafuckbot` pe khud bhej jata hai, claim 1→2→3 aur OTP sab khud chalte
+hain. Kisi bhi number/OTP copy-paste nahi karna:
 
 | Step | Bot (@rajafuckbot) | Code |
 |---|---|---|
 | Menu | `/start` → **MANUAL CLAIM (3x)** | `goldDropBridgeButtonRole` / `triggerGoldDropButton` |
-| Number | 10-digit mobile bhejo | `runGoldDropManualClaim` |
+| Number | **OTP bot se auto-fetch** (NEW NUMBER → number card) | `getNextTelegramNumber` |
 | Claim 1 | `STARTING CLAIM 1 OF 3` → `OTP SENT SUCCESSFULLY! [1/3]` → OTP → `CLAIM #1 COMPLETED!` | OTP bot se `waitForTelegramOtpCode` |
 | Claim 2/3 | `INITIATING CLAIM #n/3` → `OTP SENT FOR CLAIM #n/3!` → OTP → `CLAIM #n COMPLETED!` | wahi, har round ka own watermark |
 | Summary | `MANUAL CLAIMS SUMMARY` — `CLAIMS COMPLETED: 3/3`, `REWARDS WON: n`, `PRIZES: {...}` | `parseGoldDropSummary` |
 
-**Use karna:** Gold Drop offer card se **🔗 @rajafuckbot 3x claim** dabao →
-OTP bot chuno (Hermes/Hathi/HardXotp) → 10-digit number bhejo. Claim 1→2→3
-ek saath chale, OTP khud type ho jata hai. Live card par **⏹ STOP** dikhta
-hai — current safe step (claim terminate / CANCEL CLAIM) ke baad rukta hai.
+**Use karna:** Gold Drop offer card se **🔗 @rajafuckbot 3x claim (auto)**
+dabao → OTP bot chuno (Hermes/Hathi/HardXotp) → target chuno (kitne numbers
+process karni hain: 1/5/10/25 ya custom). Har number ke liye claim 1→2→3
+auto chale, ek number khatam ho to agla number turant. Live card par
+**⏹ STOP** dikhta hai — current safe step ke baad rukta hai. Result card
+par totals dikhte hain: numbers processed, claims completed, rewards won.
 
 **Safety rules:**
 - Har claim ke liye alag **OTP watermark** — number bhejne se thik pehle
