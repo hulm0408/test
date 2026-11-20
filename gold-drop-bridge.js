@@ -1079,3 +1079,124 @@ export async function runGoldDropManualClaim({
     };
   }
 }
+
+// ---------------------------------------------------------------------------
+// 🤖 AUTO BATCH — Swiggy wala fully-auto loop: number OTP bot se khud leh,
+// @rajafuckbot pe khud bhej, 3x claims khud chale, ek number khatam to agla.
+//
+//   getNextNumber({ excludePhones, shouldAbort }) → { phone }   (OTP bot se)
+//   runClaim(phone, { report, shouldAbort }) → runGoldDropManualClaim ka result
+//
+// Ek number ka claim fail ho (OTP miss etc.) to wahi number dobara nahi
+// aata (one-shot) — agla number turant. Target poora hone ya STOP par rukna.
+// ---------------------------------------------------------------------------
+export async function runGoldDropAutoClaims({
+  target,
+  getNextNumber,
+  runClaim,
+  report,
+  shouldAbort,
+  config = {},
+} = {}) {
+  const cfg = { ...goldDropBridgeConfig(), ...(config || {}) };
+  const want = Math.max(1, Math.min(200, Math.trunc(Number(target) || 1)));
+  const usedPhones = new Set();
+  const results = [];
+  let processed = 0;
+  let claimsTotal = 0;
+  let rewardsTotal = 0;
+  let stopped = false;
+  let lastError = '';
+
+  const progressHtml = (phone, note) => [
+    '🤖 <b>Gold Drop Bridge — Auto Batch</b>',
+    `📨 OTP bot se number auto-fetch · @${cfg.username}`,
+    `📊 Processed: <b>${processed}/${want}</b> · Claims: <b>${claimsTotal}</b> · Rewards: <b>${rewardsTotal}</b>`,
+    phone ? `📱 Current: <code>${phone}</code>` : '',
+    note,
+  ].filter(Boolean).join('\n');
+
+  try {
+    while (processed < want) {
+      if (typeof shouldAbort === 'function' && shouldAbort()) {
+        stopped = true;
+        break;
+      }
+      // 1) 🔢 Number auto-fetch — OTP bot se (Swiggy pipeline waisa hi).
+      setPhase(`auto-number-${processed + 1}`);
+      await reportCard(report, progressHtml('', 'OTP bot se number le raha hoon…'));
+      const entry = await getNextNumber({
+        excludePhones: [...usedPhones],
+        shouldAbort: typeof shouldAbort === 'function' ? shouldAbort : null,
+      });
+      const phone = normalizeGoldDropPhone(entry?.phone);
+      if (!isGoldDropPhoneValid(phone)) {
+        throw new Error(`OTP bot se valid mobile number nahi mila: "${String(entry?.phone || '').slice(0, 24)}" — batch ruka`);
+      }
+      if (usedPhones.has(phone)) {
+        throw new Error(`OTP bot ne wahi number dobara diya: ${phone} — batch ruka`);
+      }
+      // Number constraint ho gayi hai (OTP bot se claim ho chuki) — pehle
+      // record kar do, phir claim chalo. STOP is number ke claim ko apne
+      // andar rok lega — number kaam nahi jayega.
+      usedPhones.add(phone);
+      processed += 1;
+      state.phone = phone;
+      console.log(`[GoldDropBridge] 🔢 auto number ${processed}/${want}: ${phone}`);
+
+      // 2) 🔗 3x claims — @rajafuckbot pe khud bhej kar chalo.
+      setPhase(`auto-claim-${processed}`);
+      const result = await runClaim(phone, {
+        report: html => reportCard(report, progressHtml(phone, '')).then(() => reportCard(report, html)),
+        shouldAbort,
+      });
+      const one = {
+        phone,
+        ok: Boolean(result?.ok),
+        claimsCompleted: Number(result?.claimsCompleted) || 0,
+        rewardsWon: Number(result?.rewardsWon) || 0,
+        reason: String(result?.reason || ''),
+      };
+      results.push(one);
+      if (one.ok) {
+        claimsTotal += one.claimsCompleted;
+        rewardsTotal += one.rewardsWon;
+      } else {
+        // ⚠️ Ek number ka claim fail = wahi number khatam (one-shot) — agla
+        // number turant, batch nahi rukti.
+        lastError = one.reason || 'claim fail';
+        console.warn(`[GoldDropBridge] ⚠️ ${phone} claim fail — ${lastError.slice(0, 90)} · agla number`);
+      }
+      await reportCard(report, progressHtml(phone, one.ok
+        ? `✅ claims ${one.claimsCompleted} · rewards ${one.rewardsWon} — agla number…`
+        : `⚠️ claim terminate — agla number…`));
+      if (typeof shouldAbort === 'function' && shouldAbort()) {
+        stopped = true;
+        break;
+      }
+    }
+  } catch (error) {
+    const text = String(error?.message || error);
+    if (/aborted|owner ne stop/i.test(text)) {
+      stopped = true;
+    } else {
+      lastError = text;
+      state.lastError = text;
+    }
+  }
+
+  setPhase(stopped ? 'auto-stopped' : 'auto-done');
+  console.log(`[GoldDropBridge] 🤖 auto batch khatam — processed ${processed}/${want} · claims ${claimsTotal} · rewards ${rewardsTotal}${stopped ? ' · STOP' : ''}`);
+  return {
+    ok: !lastError || processed >= want,
+    processed,
+    target: want,
+    claimsTotal,
+    rewardsTotal,
+    stopped,
+    lastError,
+    phones: [...usedPhones],
+    results,
+    username: cfg.username,
+  };
+}

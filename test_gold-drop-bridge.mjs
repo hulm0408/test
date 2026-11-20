@@ -27,6 +27,7 @@ import {
   goldDropBridgeConfig,
   _setGoldDropBridgeClientOverrideForTests,
   runGoldDropManualClaim,
+  runGoldDropAutoClaims,
 } from './gold-drop-bridge.js';
 
 let passed = 0;
@@ -240,6 +241,79 @@ function makeMockGoldDropBot({ otpCodes = ['111222', '222333', '333444'] } = {})
   ok(result?.ok === false && result?.kind === 'failed_otp_miss', 'engine: OTP miss → failed_otp_miss');
   ok(result?.claim === 1, 'engine: claim 1 par miss hua');
   _setGoldDropBridgeClientOverrideForTests(null);
+}
+
+console.log('— Auto batch (number auto-fetch + 3x claims loop) —');
+
+// Happy path: 3 numbers, sab claims ok — tallies aur phones track hone.
+{
+  const numbers = ['9876543210', '9876543211', '9876543212'];
+  let claimed = 0;
+  const res = await runGoldDropAutoClaims({
+    target: 3,
+    getNextNumber: async ({ excludePhones }) => {
+      assert.ok(!excludePhones.includes(numbers[claimed]), 'number dobara nahi aata');
+      return { phone: numbers[claimed++] };
+    },
+    runClaim: async (phone) => ({
+      ok: true, phone, claimsCompleted: 3, rewardsWon: phone.endsWith('212') ? 2 : 1,
+    }),
+    report: () => {},
+    shouldAbort: () => false,
+  });
+  ok(res?.ok === true, 'auto: batch complete');
+  ok(res?.processed === 3 && res?.target === 3, 'auto: 3 numbers process hue');
+  ok(res?.claimsTotal === 9, 'auto: claims total 9 (3x3)');
+  ok(res?.rewardsTotal === 4, 'auto: rewards total 4 (1+1+2)');
+  ok(res?.phones.length === 3 && res?.phones[0] === '9876543210', 'auto: phones tracked');
+  ok(res?.stopped === false, 'auto: no STOP');
+}
+
+// One-shot rule: ek number ka claim fail ho to batch nahi rukti — agla number.
+{
+  let n = 0;
+  const res = await runGoldDropAutoClaims({
+    target: 3,
+    getNextNumber: async () => ({ phone: `987654321${n++}` }),
+    runClaim: async (phone) => (phone === '9876543210'
+      ? { ok: false, reason: 'OTP bot chat me code nahi mila' }
+      : { ok: true, claimsCompleted: 3, rewardsWon: 1 }),
+    report: () => {},
+    shouldAbort: () => false,
+    config: { maxClaims: 3 },
+  });
+  ok(res?.processed === 3, 'auto: fail ke baad bhi 3 numbers process hue (one-shot)');
+  ok(res?.claimsTotal === 6, 'auto: 2 successful numbers → 6 claims');
+  ok(res?.ok === true, 'auto: fail hone par bhi batch complete');
+}
+
+// Invalid number from OTP bot → batch ruke, saaf error.
+{
+  const res = await runGoldDropAutoClaims({
+    target: 3,
+    getNextNumber: async () => ({ phone: '12345' }),
+    runClaim: async () => ({ ok: true }),
+    report: () => {},
+    shouldAbort: () => false,
+  });
+  ok(res?.ok === false, 'auto: invalid number → batch ruka');
+  ok(/valid mobile number nahi mila/.test(String(res?.lastError)), 'auto: invalid number ka error saaf');
+  ok(res?.processed === 0, 'auto: koi number process nahi hua');
+}
+
+// STOP: pehle number ke baad user ne STOP kiya → ruk jaye.
+{
+  let n = 0;
+  const res = await runGoldDropAutoClaims({
+    target: 5,
+    getNextNumber: async () => ({ phone: `987654321${n++}` }),
+    runClaim: async (phone) => ({ ok: true, phone, claimsCompleted: 3, rewardsWon: 1 }),
+    report: () => {},
+    shouldAbort: () => n >= 2,
+  });
+  ok(res?.stopped === true, 'auto: STOP par ruk gaya');
+  ok(res?.processed === 2, 'auto: STOP se pehle 2 numbers process hue');
+  ok(res?.claimsTotal === 6, 'auto: STOP tak 6 claims');
 }
 
 console.log(`\n✅ ${passed} tests pass`);
