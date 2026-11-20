@@ -137,6 +137,39 @@ na mile/chale to login ke JSON se file banti hai (number nahi jalta).
 `SWIGGY_WORLD_EXPORT_JSON=0` se export step band, `SWIGGY_WORLD_EXPORT_TIMEOUT_MS`
 se uska budget (default 90s) — dono optional.
 
+### 🔗 Gold Drop bot (@rajafuckbot) ko OTP bot se jodna
+
+Gold Drop bot `@rajafuckbot` (GOLD DROP AUTOMATION) ke **MANUAL CLAIM (3x
+FLOW)** me pehle owner khud number + OTP type karte the (dono chat ek saath
+khole hua dikhe the). Ab Swiggy World Bot wala system is bot par lagta hai —
+ek hi spare Telegram user session se `@rajafuckbot` ke buttons click hote
+hain, aur jab bot OTP maangta hai, OTP bot ke chat me code khud aa jata hai:
+
+| Step | Bot (@rajafuckbot) | Code |
+|---|---|---|
+| Menu | `/start` → **MANUAL CLAIM (3x)** | `goldDropBridgeButtonRole` / `triggerGoldDropButton` |
+| Number | 10-digit mobile bhejo | `runGoldDropManualClaim` |
+| Claim 1 | `STARTING CLAIM 1 OF 3` → `OTP SENT SUCCESSFULLY! [1/3]` → OTP → `CLAIM #1 COMPLETED!` | OTP bot se `waitForTelegramOtpCode` |
+| Claim 2/3 | `INITIATING CLAIM #n/3` → `OTP SENT FOR CLAIM #n/3!` → OTP → `CLAIM #n COMPLETED!` | wahi, har round ka own watermark |
+| Summary | `MANUAL CLAIMS SUMMARY` — `CLAIMS COMPLETED: 3/3`, `REWARDS WON: n`, `PRIZES: {...}` | `parseGoldDropSummary` |
+
+**Use karna:** Gold Drop offer card se **🔗 @rajafuckbot 3x claim** dabao →
+OTP bot chuno (Hermes/Hathi/HardXotp) → 10-digit number bhejo. Claim 1→2→3
+ek saath chale, OTP khud type ho jata hai. Live card par **⏹ STOP** dikhta
+hai — current safe step (claim terminate / CANCEL CLAIM) ke baad rukta hai.
+
+**Safety rules:**
+- Har claim ke liye alag **OTP watermark** — number bhejne se thik pehle
+  liya hua, purana OTP kabhi dobara nahi jata.
+- OTP na aaye to current claim **CANCEL CLAIM / FINISH** se terminate ho
+  jata hai, number dobara nahi jalta.
+- Sirf 6-digit code hi bheja jata hai; OTP bot chat se Swiggy wale OTP
+  chhod kar gold drop ka code chuna jata hai.
+
+Config (optional env): `GOLD_DROP_BRIDGE_BOT_USERNAME` (default `rajafuckbot`),
+`GOLD_DROP_BRIDGE_MAX_CLAIMS` (3), `GOLD_DROP_BRIDGE_OTP_INBOX_TIMEOUT_MS`
+(90s), `GOLD_DROP_BRIDGE_STEP_TIMEOUT_MS`, `GOLD_DROP_BRIDGE_TRIGGER`.
+
 ### 🐘 Hathi + 🔐 HardXotp — OTP bots
 
 Teeno OTP bots ek hi spare Telegram account (usi MTProto session) se chalte hain,
@@ -808,12 +841,14 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `bot-settings.js` | **Batch knobs** — target/parallel lanes/time/gap (UI se, validated + clamped) |
 | `proxy-pool.js` | **Proxy pool** — lane reservations, IP rotation, per-proxy WAF token + cooldown |
 | `swiggy-bridge.js` | Swiggy automation + WAF token injection + **lane-local proxy routing** |
+| `gold-drop-bridge.js` | **🔗 Gold Drop bot (@rajafuckbot) + OTP bot join** — MANUAL CLAIM (3x FLOW) driver, OTP khud OTP bot se (pure helpers tested) |
 | `store.js` + `vault-sync.js` | Session DB (`data/db.json`) + cloud vault |
 | `db-link.js` + `db-payload.js` | 💾 **Linked database** — durable store (KV/http/vault) + merge rules (data loss rok) |
 | `scripts/db-doctor.mjs` | 💾 DB link report + live verify — `npm run doctor` |
 | `seed/used-numbers.json` | 📋 Blocklist — jinka OTP dobara nahi lena (30-din cooldown). Sirf mobile numbers |
 | `scripts/seed-used-numbers.mjs` | 📋 List import/apply — `npm run seed:used-numbers -- <file.json>` |
 | `test_fresh_unit.mjs` | Unit tests (mocked fetch) — `npm test` |
+| `test_gold-drop-bridge.mjs` | Gold Drop bridge tests — buttons/screens/summary parse — `npm test` |
 | `test_db_link.mjs` | Linked-DB tests (merge rules + KV round-trip) — `npm test` |
 | `test_used_numbers.mjs` | Blocklist tests (30-din unlock, idempotency) — `npm test` |
 | `scratch/firebase-inspect.mjs` | Firebase ka live structure dump — `npm run inspect` |
