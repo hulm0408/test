@@ -44,7 +44,7 @@ const MOCK_BASE = 'https://storelex.test';
 const mock = {
   validateKey: { valid: true, user_id: 6484999726, access_key: 'BLKP-TEST-KEY-1', accounts_count: 0 },
   sendOtp: { success: true, sid: 'sid-1', tid: 'tid-1', device_id: 'dev-1' },
-  verify: { success: true },
+  verify: { success: true, link: 'https://storelex.store/webapp/session/abc123' },
   export: { mobile: '9876543210', token: 'tk', tid: 'tid-1', deviceId: 'dev-1', cookies: 'a=b' },
   exportFailStatus: 0,
   calls: [],
@@ -109,6 +109,11 @@ console.log('— Engine flow (mock client) —');
   ok(r.accountKey && String(r.accountKey).length > 0, 'accountKey mila');
   ok(sessionPayload !== null && sessionPayload.phone === '9876543210' && sessionPayload.source === 'blinkit-pro-web', 'sendSession payload correct');
   ok(sessionPayload.fileName === 'blinkit-9876543210.json', 'session file name blinkit-<phone>.json');
+  // 🔗 verify-otp se session link capture ho + stored session me bhi ho
+  ok(sessionPayload.jsonText && /storelex\.store\/webapp\/session\/abc123/.test(sessionPayload.jsonText), 'verify-otp session link export JSON me store hui');
+  // 🏷 Account ka naam "Swiggy" nahi hona chahiye — "Blinkit" hona chahiye
+  ok(sessionPayload.account?.name === 'Blinkit 9876543210', 'account name "Blinkit <phone>" (Swiggy nahi)');
+  ok(sessionPayload.account?.link === 'https://storelex.store/webapp/session/abc123', 'account me link field store hui');
   const urls = mock.calls.map((c) => c.url);
   ok(urls.some((u) => u.includes('/api/auth/validate_key/')), 'validate_key preflight call');
   ok(urls.some((u) => u.includes('/api/login/send-otp')), 'send-otp call');

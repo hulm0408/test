@@ -355,6 +355,22 @@ export async function processSingleNumberViaBlinkitPro({
   }
   console.log(`[BlinkitPro] login/verify-otp OK for ${phone} (HTTP ${verifyRes.status})`);
 
+  // 🔗 Session link — verify-otp response me session link aati hai (Zepto
+  // family waisa). Ise capture karke export JSON me bhi dal do, taaki
+  // stored session me link available ho.
+  const sessionLink = String(
+    verifyRes.data?.link ||
+    verifyRes.data?.session_link ||
+    verifyRes.data?.sessionLink ||
+    verifyRes.data?.url ||
+    verifyRes.data?.redirect_url ||
+    verifyRes.data?.redirectUrl ||
+    ''
+  ).trim();
+  if (sessionLink) {
+    console.log(`[BlinkitPro] session link captured: ${sessionLink.slice(0, 80)}`);
+  }
+
   if (aborted()) return abortResult('after_verify');
 
   await say([
@@ -387,6 +403,13 @@ export async function processSingleNumberViaBlinkitPro({
   }
   // Mobile hamesha normalized rahe (file naam + store key ke liye)
   cleanExport.mobile = phone;
+
+  // 🔗 Link + 🏷 Name — verify-otp se capture ki hui session link aur
+  // Blinkit account ka name export JSON me dal do. Bina name ke,
+  // importSessionJson account ka naam "Swiggy {phone}" bana deta hai —
+  // Blinkit account Swiggy nahi banna chahiye.
+  if (sessionLink) cleanExport.link = sessionLink;
+  if (!cleanExport.name) cleanExport.name = `Blinkit ${phone}`;
 
   // 5. Store locally (same Zepto/Toing pipeline)
   const sessionJsonStr = JSON.stringify(cleanExport, null, 2);
