@@ -171,6 +171,49 @@ Config (optional env): `GOLD_DROP_BRIDGE_BOT_USERNAME` (default `rajafuckbot`),
 `GOLD_DROP_BRIDGE_MAX_CLAIMS` (3), `GOLD_DROP_BRIDGE_OTP_INBOX_TIMEOUT_MS`
 (90s), `GOLD_DROP_BRIDGE_STEP_TIMEOUT_MS`, `GOLD_DROP_BRIDGE_TRIGGER`.
 
+### 🤖 Gold Drop AI bot (@GoldDropAi — "It's ✌️ Life") ko OTP bot se jodna
+
+Gold Drop bot `@GoldDropAi` ke **CLAIM REWARD flow** — **pura auto**, Swiggy
+waisa: number OTP bot se khud aata hai, `@GoldDropAi` pe khud bhej jata hai,
+OTP khud type ho jata hai. Ek number = ek claim, ek claim khatam ho to agla
+number turant:
+
+| Step | Bot (@GoldDropAi) | Code |
+|---|---|---|
+| Menu | `/start` → ⚡️ ɴᴀᴠ ʙᴏᴛ ⚡️ + **CLAIM REWARD** button | `goldDropAiButtonRole` / `triggerGoldDropButton` |
+| Number | **OTP bot se auto-fetch** → 📱 ENTER MOBILE NUMBER | `getNextTelegramNumber` |
+| OTP | `🛡️ OTP DISPATCHED · STATUS: ENTER 6-DIGIT OTP` (+ **CANCEL**) | OTP bot se `waitForTelegramOtpCode` |
+| Result | 📱 `REWARD: BETTER LUCK NEXT TIME` · `POINTS: 5 LEFT (1 USED)` → ✅ READY FOR NEXT CLAIM | `parseGoldDropAiReward` / `parseGoldDropAiPoints` |
+
+**Terminal screens** (screenshots ke hisaab se):
+- ✅ Reward card → agla number ke liye CLAIM REWARD button milta hai.
+- ❌ `REGISTRATION FAILED · STATUS: THIS EMAIL IS ALREADY USED` — number
+  ek baar hi chalega (one-shot), agla number turant.
+- ⚠️ `INVALID OTP - CANCELLED` — same number **ek baar** dobara try
+  hota hai (fresh OTP); doosri baar bhi invalid to number chhod diya jata hai.
+
+**Use karna:** Gold Drop offer card se **🤖 @GoldDropAi claim (auto)** dabao
+→ OTP bot chuno (Hermes/Hathi/HardXotp) → target chuno (1/5/10/25 ya custom)
+→ **success cap chuno** (nahi rukhna / 100 / 500 / 1000 / **5000** / custom).
+Har number ke liye claim khud chale, ek number khatam ho to agla number.
+**Success cap** par — successful claims itne ho jaye to batch khud ruke gi
+(fail hone se cap nahi badhega). Live card par **⏹ STOP** bhi dikhta hai.
+Result card par totals dikhte hain: numbers processed, claims completed,
+rewards won, aur cap reach hone par ruknay ka kaaran.
+
+**Safety rules:**
+- Har claim ke liye alag **OTP watermark** — number bhejne se thik pehle
+  liya hua, purana OTP kabhi dobara nahi jata.
+- OTP na aaye to OTP prompt pe **CANCEL** dabakar claim terminate ho jata
+  hai, number dobara nahi jalta.
+- Sirf 6-digit code hi bheja jata hai; OTP bot chat se Swiggy wale OTP
+  chhod kar gold drop ka code chuna jata hai.
+
+Config (optional env): `GOLDDROPAI_BOT_USERNAME` (default `GoldDropAi`),
+`GOLDDROPAI_MAX_INVALID_OTP_RETRIES` (1), `GOLDDROPAI_MAX_SUCCESSFUL` (0 =
+no cap — successful claims ka cap), `GOLDDROPAI_OTP_INBOX_TIMEOUT_MS`
+(90s), `GOLDDROPAI_STEP_TIMEOUT_MS`, `GOLDDROPAI_TRIGGER`.
+
 ### 🐘 Hathi + 🔐 HardXotp — OTP bots
 
 Teeno OTP bots ek hi spare Telegram account (usi MTProto session) se chalte hain,
@@ -843,6 +886,7 @@ chalta rehta hai; temporary error par number failed nahi gina jata.
 | `proxy-pool.js` | **Proxy pool** — lane reservations, IP rotation, per-proxy WAF token + cooldown |
 | `swiggy-bridge.js` | Swiggy automation + WAF token injection + **lane-local proxy routing** |
 | `gold-drop-bridge.js` | **🔗 Gold Drop bot (@rajafuckbot) + OTP bot join** — MANUAL CLAIM (3x FLOW) driver, OTP khud OTP bot se (pure helpers tested) |
+| `golddropai-bridge.js` | **🤖 Gold Drop AI bot (@GoldDropAi) + OTP bot join** — CLAIM REWARD single-claim driver, number/OTP khud OTP bot se, invalid OTP retry (pure helpers tested) |
 | `store.js` + `vault-sync.js` | Session DB (`data/db.json`) + cloud vault |
 | `db-link.js` + `db-payload.js` | 💾 **Linked database** — durable store (KV/http/vault) + merge rules (data loss rok) |
 | `scripts/db-doctor.mjs` | 💾 DB link report + live verify — `npm run doctor` |

@@ -58,7 +58,7 @@ export const GOLD_DROP_BRIDGE_DEFAULTS = {
 
 const normHandle = (value = '') => String(value || '').trim().replace(/^@+/, '');
 
-const state = {
+export const state = {
   phase: 'idle',
   lastAction: '',
   lastError: '',
@@ -71,6 +71,10 @@ const state = {
   username: '',
   phone: '',
 };
+
+export function getGoldDropBridgeState() {
+  return state;
+}
 
 export function getGoldDropBridgeStatus() {
   return {
@@ -303,7 +307,7 @@ export function _setGoldDropBridgeClientOverrideForTests(client = null) {
   return true;
 }
 
-async function withGoldDropBridgeClient(fn) {
+export async function withGoldDropBridgeClient(fn) {
   if (goldDropBridgeTestClient) return fn({ client: goldDropBridgeTestClient, config: {} });
   return withTelegramUserClient(fn);
 }
@@ -312,7 +316,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, N
 
 let entityCache = { client: null, username: '', entity: null };
 
-async function getGoldDropEntity(client, username) {
+export async function getGoldDropEntity(client, username) {
   const key = String(username || '').toLowerCase();
   if (entityCache.client === client && entityCache.username === key && entityCache.entity) {
     return entityCache.entity;
@@ -502,7 +506,7 @@ function readBlockMs() {
   return Math.max(0, Number(readCache.lastFloodMs) || 0);
 }
 
-async function parseGoldDropScreens(client, entity, limit, readOpts = {}) {
+export async function parseGoldDropScreens(client, entity, limit, readOpts = {}) {
   const messages = await readGoldDropMessages(client, entity, limit, readOpts);
   const parsed = [];
   for (const message of messages) {
@@ -554,7 +558,7 @@ async function parseGoldDropScreens(client, entity, limit, readOpts = {}) {
   return parsed;
 }
 
-function screenSignature(messages = []) {
+export function screenSignature(messages = []) {
   const map = new Map();
   for (const m of messages) {
     map.set(m.id, `${m.text}|${m.buttons.map((b) => b.text).join('|')}|${m.hasMedia ? 'media' : ''}${m.out ? 'out' : ''}`);
@@ -562,11 +566,11 @@ function screenSignature(messages = []) {
   return map;
 }
 
-function freshMessages(messages, baseline) {
+export function freshMessages(messages, baseline) {
   return messages.filter((m) => !(baseline && baseline.has(m.id)));
 }
 
-async function sendGoldDropText(client, entity, text) {
+export async function sendGoldDropText(client, entity, text) {
   const payload = String(text);
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
@@ -593,7 +597,7 @@ async function sendGoldDropText(client, entity, text) {
   return false;
 }
 
-async function clickGoldDropButton(entry) {
+export async function clickGoldDropButton(entry) {
   const button = entry?.button || (typeof entry?.click === 'function' ? entry : null);
   if (!button) throw new Error('Button nahi mila');
   state.lastAction = `click:${entry?.text || button?.text || ''}`;
@@ -606,7 +610,7 @@ async function clickGoldDropButton(entry) {
   return callback;
 }
 
-function setPhase(phase, extra = {}) {
+export function setPhase(phase, extra = {}) {
   state.phase = phase;
   if (extra.lastError !== undefined) state.lastError = extra.lastError;
 }
@@ -626,7 +630,7 @@ async function scanForLateReply({ client, entity, predicate, baseline, graceMs, 
   return null;
 }
 
-async function waitForGoldDropReply({
+export async function waitForGoldDropReply({
   client, entity, predicate, baseline, timeoutMs, shouldAbort, what = 'reply', pollMs, graceMs,
 }) {
   const budget = Math.max(1_000, Number(timeoutMs) || GOLD_DROP_BRIDGE_DEFAULTS.stepTimeoutMs);
@@ -674,7 +678,7 @@ async function waitForGoldDropReply({
 
 // Bot ka jawab poora aane ka intezaar: jab tak latest message ka id na
 // badle, agla command mat bhejo.
-async function settledScreen(client, entity, cfg = {}, { quietMs = 1_500, maxMs = 10_000 } = {}) {
+export async function settledScreen(client, entity, cfg = {}, { quietMs = 1_500, maxMs = 10_000 } = {}) {
   const every = Math.max(250, Number(cfg?.pollMs) || 1_200);
   const quiet = Math.max(400, Number(quietMs) || 1_500);
   let deadline = Date.now() + Math.max(quiet, Number(maxMs) || 9_000);
@@ -699,7 +703,7 @@ async function settledScreen(client, entity, cfg = {}, { quietMs = 1_500, maxMs 
 
 // Button trigger (world-bot waisa): pehle click; screen na badle to button
 // ka TEXT type karke action trigger.
-async function triggerGoldDropButton({
+export async function triggerGoldDropButton({
   client, entity, entry, cfg, shouldAbort, what, predicate, baseline = null, timeoutMs = null,
 }) {
   const total = Math.max(5_000, Number(timeoutMs) || Number(cfg?.stepTimeoutMs) || GOLD_DROP_BRIDGE_DEFAULTS.stepTimeoutMs);

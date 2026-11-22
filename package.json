@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node fresh-bot.js",
-    "test": "node test_gold_drop.mjs && node test_fresh_unit.mjs && node test_gold-drop-bridge.mjs && node test_db_link.mjs && node test_used_numbers.mjs",
+    "test": "node test_gold_drop.mjs && node test_fresh_unit.mjs && node test_gold-drop-bridge.mjs && node test_golddropai-bridge.mjs && node test_db_link.mjs && node test_used_numbers.mjs",
     "doctor": "node scripts/db-doctor.mjs",
     "seed:used-numbers": "node scripts/seed-used-numbers.mjs",
     "inspect": "node scratch/firebase-inspect.mjs",
