@@ -41,8 +41,8 @@ const SPECS = {
   //   toing_pro = Toing Pro Web flow (storelex.store/toing_web API: check_mobile -> send_otp -> verify_otp -> export)
   //   zepto_pro = Zepto Pro Web flow (storelex.store/zzbot API: login/otp -> login/verify -> export)
   //   swiggy_pro = Swiggy Pro Web flow (storelex.store/swiggy_web API: check_mobile (registered = skip) -> send_otp -> verify_otp -> export)
-  accountEngine:     { dflt: 'direct', label: '🌍 Account engine (Chromium / Swiggy World / Toing Pro Web / Zepto Pro Web / Swiggy Pro Web)',
-                       enum: ['direct', 'worldbot', 'toing_pro', 'zepto_pro', 'swiggy_pro'] },
+  accountEngine:     { dflt: 'direct', label: '🌍 Account engine (Chromium / Swiggy World / Toing Pro Web / Zepto Pro Web / Swiggy Pro Web / Blinkit Pro Web)',
+                       enum: ['direct', 'worldbot', 'toing_pro', 'zepto_pro', 'swiggy_pro', 'blinkit_pro'] },
   telegramOtpMode:   { bool: true, dflt: false, label: '📨 Telegram Hermes mode (number + OTP Telegram bot se)' },
   telegramOtpTimeoutMs: { min: 5000, max: 180000, dflt: 20000, label: 'Hermes OTP Refresh budget (ms)' },
   telegramOtpRefreshMs: { min: 1000, max: 15000, dflt: 2500, label: 'Hermes Refresh interval (ms)' },
@@ -203,6 +203,7 @@ export function fmtSetting(key) {
     if (v === 'toing_pro') return 'Toing Pro Web';
     if (v === 'zepto_pro') return 'Zepto Pro Web';
     if (v === 'swiggy_pro') return 'Swiggy Pro Web';
+    if (v === 'blinkit_pro') return 'Blinkit Pro Web';
     return v === 'worldbot' ? 'OTP bot + Swiggy World' : 'OTP bot + Chromium';
   }
   if (key === 'zeptoAccessKey' || key === 'swiggyWebAccessKey' || key === 'blinkitAccessKey') {
