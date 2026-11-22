@@ -1009,6 +1009,10 @@ function compactSourceLine(snap = {}) {
     const botLabel = String(snap.otpBotLabel || getOtpBotProfile(snap.otpBotProfile || '').label || 'Hermes').toUpperCase();
     return `🌐 ${mono('TOING PRO')} · 📨 ${mono(botLabel)}`;
   }
+  if (snap.accountEngine === 'blinkit_pro' || snap.blinkitProMode) {
+    const botLabel = String(snap.otpBotLabel || getOtpBotProfile(snap.otpBotProfile || '').label || 'Hermes').toUpperCase();
+    return `⚡ ${mono('BLINKIT PRO')} · 📨 ${mono(botLabel)}`;
+  }
   if (snap.accountEngine === 'worldbot' || snap.worldBotMode) {
     if (snap.sourceMode === 'telegram') {
       const botLabel = String(snap.otpBotLabel || getOtpBotProfile(snap.otpBotProfile || '').label || 'Hermes').toUpperCase();
@@ -1065,7 +1069,8 @@ export function formatCompactAutopilotCard(snap = state, { stageText = '', final
   // proxy karta hi nahi — card par unka zikr kabhi na aaye.
   const ext = wb || s.accountEngine === 'toing_pro' || Boolean(s.toingProMode)
     || s.accountEngine === 'zepto_pro' || Boolean(s.zeptoProMode)
-    || s.accountEngine === 'swiggy_pro' || Boolean(s.swiggyProMode);
+    || s.accountEngine === 'swiggy_pro' || Boolean(s.swiggyProMode)
+    || s.accountEngine === 'blinkit_pro' || Boolean(s.blinkitProMode);
   const reason = {
     target: 'Target complete',
     time: 'Max time complete',
@@ -1276,12 +1281,13 @@ export async function startAutopilot(opts = {}) {
   const rawEngine = String(
     opts.accountEngine || s('accountEngine', 'direct') || 'direct'
   ).trim().toLowerCase();
-  const accountEngine = ['worldbot', 'toing_pro', 'zepto_pro', 'swiggy_pro'].includes(rawEngine) ? rawEngine : 'direct';
+  const accountEngine = ['worldbot', 'toing_pro', 'zepto_pro', 'swiggy_pro', 'blinkit_pro'].includes(rawEngine) ? rawEngine : 'direct';
   const worldBotMode = accountEngine === 'worldbot';
   const toingProMode = accountEngine === 'toing_pro';
   const zeptoProMode = accountEngine === 'zepto_pro';
   const swiggyProMode = accountEngine === 'swiggy_pro';
-  const bypassBridgeMode = worldBotMode || toingProMode || zeptoProMode || swiggyProMode;
+  const blinkitProMode = accountEngine === 'blinkit_pro';
+  const bypassBridgeMode = worldBotMode || toingProMode || zeptoProMode || swiggyProMode || blinkitProMode;
   const allowOffline = s('allowOffline', String(process.env.PREMIUM_ALLOW_OFFLINE_DEVICES || '') === '1') === true;
   const telegramSetting = s('telegramOtpMode', false) === true;
   const resolvedSourceMode = resolveAutopilotNumberSource({
@@ -1299,6 +1305,8 @@ export async function startAutopilot(opts = {}) {
     console.log(`[Autopilot] 🛒 Zepto Pro mode — number/OTP ${sourceMode === 'telegram' ? 'Telegram OTP bot' : 'Firebase pool'} (Swiggy bridge/WAF OFF).`);
   } else if (swiggyProMode) {
     console.log(`[Autopilot] 🍔 Swiggy Pro mode — number/OTP ${sourceMode === 'telegram' ? 'Telegram OTP bot' : 'Firebase pool'} (Swiggy bridge/WAF OFF; registered = fauran skip).`);
+  } else if (blinkitProMode) {
+    console.log(`[Autopilot] ⚡ Blinkit Pro mode — number/OTP ${sourceMode === 'telegram' ? 'Telegram OTP bot' : 'Firebase pool'} (Swiggy bridge/WAF OFF).`);
   } else if (worldBotMode) {
     console.log(`[Autopilot] 🌍 World Bot mode — number source ${sourceMode === 'telegram' ? 'Telegram OTP bot' : 'Firebase pool'} (proxy/WAF OFF).`);
   }
@@ -1407,6 +1415,7 @@ export async function startAutopilot(opts = {}) {
     toingProMode,
     zeptoProMode,
     swiggyProMode,
+    blinkitProMode,
     timeExtensions: 0,
     infraPauses: 0,
     infraPauseUntil: 0,
@@ -1580,7 +1589,7 @@ export async function startAutopilot(opts = {}) {
       // (World-bot pipeline ya Toing Pro engine ne khud bhej diya ho — res.sessionSent — to
       // dobara nahi bhejte, warna chat me do file chali jaati hain.)
       if (res.sessionSent !== true) {
-        if (!toingProMode && !zeptoProMode && !swiggyProMode && !res.viaToingPro && !res.viaZeptoPro && !res.viaSwiggyWeb) {
+        if (!toingProMode && !zeptoProMode && !swiggyProMode && !blinkitProMode && !res.viaToingPro && !res.viaZeptoPro && !res.viaSwiggyWeb && !res.viaBlinkitPro) {
           notifyFreshSession(ui, {
             phone: res.phone, accountKey: res.accountKey, kind: res.kind, account: res.account,
           });
@@ -1710,7 +1719,7 @@ export async function startAutopilot(opts = {}) {
         // 🌍 World Bot / Toing Pro / Zepto Pro mode: Swiggy ka kaam external server karta hai — proxy ki zaroorat
         // hi nahi, isliye fetch/solve bilkul band.
         if (bypassBridgeMode) {
-          console.log(`[Autopilot] 🌐 ${swiggyProMode ? 'Swiggy Pro' : (zeptoProMode ? 'Zepto Pro' : (toingProMode ? 'Toing Pro' : 'World Bot'))} mode — koi proxy/WAF solve nahi.`);
+          console.log(`[Autopilot] 🌐 ${swiggyProMode ? 'Swiggy Pro' : (blinkitProMode ? 'Blinkit Pro' : (zeptoProMode ? 'Zepto Pro' : (toingProMode ? 'Toing Pro' : 'World Bot')))} mode — koi proxy/WAF solve nahi.`);
           return { skipped: true, reason: `${accountEngine}-mode` };
         }
         // Direct mode: proxy fetch/solve bilkul nahi — yahi wo cheez thi jo
@@ -2946,7 +2955,7 @@ export async function startAutopilot(opts = {}) {
     // 🌍 World Bot ek hi Telegram chat par chalta hai — 2 lanes = do flows
     // ek hi screen par = gadbad. Isliye hamesha 1 lane, chahe setting kuch bhi.
     if (worldBotMode) laneCount = 1;
-    if (toingProMode || zeptoProMode || swiggyProMode) laneCount = 1;
+    if (toingProMode || zeptoProMode || swiggyProMode || blinkitProMode) laneCount = 1;
     state.concurrency = laneCount;
     state.requestedConcurrency = requestedConcurrency;
     lanes = Array.from({ length: laneCount }, (_, i) => ({

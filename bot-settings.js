@@ -62,6 +62,11 @@ const SPECS = {
   // 'reset' karne par wapas yehi aati hai. Env: SWIGGY_WEB_ACCESS_KEY.
   swiggyWebAccessKey: { string: true, dflt: 'SWG-WZEY-9089-69ZS', label: '🔑 Swiggy Pro Access Key' },
   swiggyWebBaseUrl:  { string: true, dflt: 'https://storelex.store/swiggy_web', label: '🍔 Swiggy Pro Base URL' },
+  // ⚡ Blinkit Pro (storelex.store/webapp) — owner ka rule: BLKP key HAMESHA
+  // yehi built-in default rahegi (Zepto ZPT / Swiggy SWG key ki tarah).
+  // Chat se override / 'reset' karne par wapas yehi aati hai. Env: BLINKIT_ACCESS_KEY.
+  blinkitAccessKey: { string: true, dflt: 'BLKP-SP08-IYFV-BISB-Y5KL', label: '🔑 Blinkit Pro Access Key' },
+  blinkitBaseUrl:   { string: true, dflt: 'https://storelex.store/webapp', label: '⚡ Blinkit Pro Base URL' },
   // 🛡️ NoCaptchaAI — Gold Drop security check (Cloudflare Turnstile) auto-solve.
   // '' (unset) = code ki built-in key; 'off' = auto-solve band; 'nocap_…' = apni key.
   nocapApiKey:       { string: true, dflt: '', label: '🛡️ NoCaptchaAI key (Gold Drop security check auto-solve)' },
@@ -86,6 +91,8 @@ const ENV_MAP = {
   zeptoBaseUrl: 'ZEPTO_PRO_BASE_URL',
   swiggyWebAccessKey: 'SWIGGY_WEB_ACCESS_KEY',
   swiggyWebBaseUrl: 'SWIGGY_WEB_BASE_URL',
+  blinkitAccessKey: 'BLINKIT_ACCESS_KEY',
+  blinkitBaseUrl: 'BLINKIT_PRO_BASE_URL',
   nocapApiKey: 'NOCAP_API_KEY',
 };
 
@@ -198,7 +205,7 @@ export function fmtSetting(key) {
     if (v === 'swiggy_pro') return 'Swiggy Pro Web';
     return v === 'worldbot' ? 'OTP bot + Swiggy World' : 'OTP bot + Chromium';
   }
-  if (key === 'zeptoAccessKey' || key === 'swiggyWebAccessKey') {
+  if (key === 'zeptoAccessKey' || key === 'swiggyWebAccessKey' || key === 'blinkitAccessKey') {
     const raw = String(v || '').trim();
     if (!raw) return '⚠️ set nahi hai';
     return `${raw.slice(0, 6)}…${raw.slice(-4)}`; // key kabhi poori mat dikhao

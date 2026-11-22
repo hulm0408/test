@@ -72,6 +72,7 @@ import {
 import { processSingleNumberViaToingPro } from './toing-pro-engine.js';
 import { processSingleNumberViaZeptoPro } from './zepto-pro-engine.js';
 import { processSingleNumberViaSwiggyWeb } from './swiggy-web-engine.js';
+import { processSingleNumberViaBlinkitPro } from './blinkit-pro-engine.js';
 
 // ---------------------------------------------------------------------------
 // Ledger (db.json → premiumFlow.used) + fresh-selection helpers
@@ -445,6 +446,10 @@ export async function processSingleNumber({
   // 🍔 Swiggy Pro Web mode — storelex.store/swiggy_web API
   if (String(otpCfg?.accountEngine || '').toLowerCase() === 'swiggy_pro') {
     return processSingleNumberViaSwiggyWeb({ userId, entry, report, otpCfg, shouldAbort, shouldSkip, markUsed, sendSession });
+  }
+  // ⚡ Blinkit Pro Web mode — storelex.store/webapp API
+  if (String(otpCfg?.accountEngine || '').toLowerCase() === 'blinkit_pro') {
+    return processSingleNumberViaBlinkitPro({ userId, entry, report, otpCfg, shouldAbort, shouldSkip, markUsed, sendSession });
   }
   const phone = entry?.phone;
   if (!phone) return { ok: false, kind: 'failed_bad_entry', phone: '', reason: 'Entry me phone nahi hai' };

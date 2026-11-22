@@ -5032,7 +5032,7 @@ Thanks`)),
   'START: Chromium option ka engine direct hai');
   ok(autoResumeSrc.includes('startSourcePresetSettings(preset)'),
     'START: preset dabate hi settings lock (engine + OTP bot)');
-  ok(autoResumeSrc.includes("accountEngine: ['worldbot', 'toing_pro', 'zepto_pro', 'swiggy_pro'].includes(bs.getSetting('accountEngine')) ? bs.getSetting('accountEngine') : 'direct'")
+  ok(autoResumeSrc.includes("accountEngine: ['worldbot', 'toing_pro', 'zepto_pro', 'swiggy_pro', 'blinkit_pro'].includes(bs.getSetting('accountEngine')) ? bs.getSetting('accountEngine') : 'direct'")
     || autoResumeSrc.includes("accountEngine: bs.getSetting('accountEngine') === 'worldbot' ? 'worldbot' : (bs.getSetting('accountEngine') === 'toing_pro' ? 'toing_pro' : 'direct')"),
     'START: engine choice batch ke saath lock hota hai (current engine variants included)');
 
@@ -5356,7 +5356,7 @@ Thanks`)),
   ok(wbBotSrc.includes("const diagWorld = bs.getSetting('accountEngine') === 'worldbot'")
     && wbBotSrc.includes('if (!diagWorld) {'),
   'diag: World Bot mode me Chrome/WAF token/proxy fields chhupe rehte hain');
-  ok(wbBotSrc.includes("...(['worldbot', 'toing_pro', 'zepto_pro', 'swiggy_pro'].includes(bs.getSetting('accountEngine')) ? [] : [{")
+  ok(wbBotSrc.includes("...(['worldbot', 'toing_pro', 'zepto_pro', 'swiggy_pro', 'blinkit_pro'].includes(bs.getSetting('accountEngine')) ? [] : [{")
     && wbBotSrc.includes('🌍 World Bot ON'),
   'settings: World Bot mode me Proxies button nahi, purana button neutral card deta hai');
   ok(!/koi proxy\/WAF nahi/.test(wbBotSrc) && !/koi proxy\/WAF nahi/.test(wbPipelineSrc),
@@ -5634,6 +5634,36 @@ console.log('🎓 CUSTOM BOT TRAINING (owner ka apna bot add + train):');
   ok(tgSrc.includes('customBotRefreshRunner') && tgSrc.includes('refresh-training-'), 'refresh: custom runner hook');
   const bsSrc = await fsp.readFile(new URL('./bot-settings.js', import.meta.url), 'utf8');
   ok(bsSrc.includes('allowKnownCustom'), 'settings: custom otp bot ids allowed');
+
+  // ⚡ Blinkit Pro — wiring (Zepto/Swiggy Pro ki tarah)
+  ok(bsSrc.includes("blinkitAccessKey: { string: true, dflt: 'BLKP-SP08-IYFV-BISB-Y5KL'"), 'settings: blinkitAccessKey built-in default');
+  ok(bsSrc.includes("blinkitBaseUrl:   { string: true, dflt: 'https://storelex.store/webapp'"), 'settings: blinkitBaseUrl default');
+  ok(bsSrc.includes("blinkitAccessKey: 'BLINKIT_ACCESS_KEY'") && bsSrc.includes("blinkitBaseUrl: 'BLINKIT_PRO_BASE_URL'"), 'settings: blinkit env map');
+  ok(bsSrc.includes("key === 'blinkitAccessKey'"), 'settings: blinkit key redact display');
+  const presetSrc = await fsp.readFile(new URL('./start-source-presets.js', import.meta.url), 'utf8');
+  ok(presetSrc.includes("id: 'blinkit_pro'") && presetSrc.includes("accountEngine: 'blinkit_pro'"), 'presets: blinkit_pro preset');
+  ok(presetSrc.includes("id: 'blinkit_hermes'") && presetSrc.includes("id: 'blinkit_hathi'"), 'presets: blinkit hermes/hathi variants');
+  ok(presetSrc.includes("'swiggy_pro', 'zepto_pro', 'blinkit_pro', 'toing_pro'"), 'presets: START_SOURCE_PRESET_IDS me blinkit_pro');
+  ok(presetSrc.includes("'blinkit_hermes', 'blinkit_hathi'"), 'presets: legacy ids me blinkit variants');
+  ok(presetSrc.includes("(preset.accountEngine === 'blinkit_pro' ? 'blinkit_pro' : 'direct')"), 'presets: startSourcePresetSettings engine map');
+  const pipeSrc = await fsp.readFile(new URL('./number-pipeline.js', import.meta.url), 'utf8');
+  ok(pipeSrc.includes("import { processSingleNumberViaBlinkitPro } from './blinkit-pro-engine.js'"), 'pipeline: blinkit engine import');
+  ok(pipeSrc.includes("=== 'blinkit_pro'") && pipeSrc.includes('processSingleNumberViaBlinkitPro'), 'pipeline: blinkit_pro dispatch');
+  ok(freshSrc.includes("const blinkitPro = await import('./blinkit-pro-engine.js')"), 'ui: blinkit engine import');
+  ok(freshSrc.includes('async function showBlinkitProScreen') && freshSrc.includes("bot.action('ap_start_blinkit_pro'"), 'ui: blinkit screen + entry action');
+  ok(freshSrc.includes("bot.action('ap_blinkit_key'") && freshSrc.includes("action: 'blinkit_access_key'"), 'ui: blinkit key capture');
+  ok(freshSrc.includes("callback_data: 'ap_start_go_blinkit_hathi'") && freshSrc.includes("callback_data: 'ap_start_go_blinkit_hermes'"), 'ui: blinkit Hathi/Hermes start buttons');
+  ok(freshSrc.includes("engine === 'blinkit_pro'") && freshSrc.includes("'blinkit_hathi' : 'blinkit_hermes'"), 'ui: activeStartPresetId blinkit mapping');
+  ok(freshSrc.includes("⚡ BLINKIT PRO SIGNUP"), 'ui: START picker me Blinkit button');
+  const apSrc = await fsp.readFile(new URL('./autopilot-engine.js', import.meta.url), 'utf8');
+  ok(apSrc.includes("'swiggy_pro', 'blinkit_pro'].includes(rawEngine)"), 'autopilot: blinkit_pro engine allow-list');
+  ok(apSrc.includes('blinkitProMode') && apSrc.includes("swiggyProMode || blinkitProMode"), 'autopilot: blinkitProMode flag + bypass bridge');
+  ok(apSrc.includes("mono('BLINKIT PRO')"), 'autopilot: compact source line');
+  const blinkitEngineSrc = await fsp.readFile(new URL('./blinkit-pro-engine.js', import.meta.url), 'utf8');
+  ok(blinkitEngineSrc.includes("'/api/auth/validate_key/'") || blinkitEngineSrc.includes('/api/auth/validate_key/'), 'engine: validate_key preflight');
+  ok(blinkitEngineSrc.includes('/api/login/send-otp') && blinkitEngineSrc.includes('/api/login/verify-otp'), 'engine: send-otp + verify-otp');
+  ok(blinkitEngineSrc.includes('/api/login/export') && blinkitEngineSrc.includes('blinkit-${phone}.json'), 'engine: export + session file name');
+  ok(blinkitEngineSrc.includes("markLedger(phone, 'success', { accountKey: imported.key, kind: 'blinkit_pro' })"), 'engine: ledger mark blinkit_pro');
 
   // 🧹 Cleanup — test-data me custom bots na chhodein
   for (const leftover of customBots.listCustomBots()) customBots.deleteCustomBot(leftover.id);
