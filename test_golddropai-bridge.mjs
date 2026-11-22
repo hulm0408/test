@@ -43,6 +43,12 @@ ok(goldDropAiButtonRole('CANCEL') === 'cancel', 'CANCEL → cancel');
 ok(goldDropAiButtonRole('MY ACCOUNT') === 'myAccount', 'MY ACCOUNT → myAccount');
 ok(goldDropAiButtonRole('USER GUIDE') === 'userGuide', 'USER GUIDE → userGuide');
 ok(goldDropAiButtonRole('REFER & EARN') === 'referEarn', 'REFER & EARN → referEarn');
+ok(goldDropAiButtonRole('REFRESH') === 'refresh', 'REFRESH → refresh');
+ok(goldDropAiButtonRole('🔄 REFRESH') === 'refresh', '🔄 REFRESH → refresh');
+ok(goldDropAiButtonRole('SHOW') === 'showHide', 'SHOW → showHide');
+ok(goldDropAiButtonRole('HIDE') === 'showHide', 'HIDE → showHide');
+ok(goldDropAiButtonRole('TOGGLE') === 'showHide', 'TOGGLE → showHide');
+ok(goldDropAiButtonRole('SHOW MENU') === 'showHide', 'SHOW MENU → showHide');
 ok(goldDropAiButtonRole('SOMETHING ELSE') === '', 'SOMETHING ELSE → no role');
 
 console.log('— Screen kinds (screenshots ke asli screens) —');
@@ -264,14 +270,125 @@ const ENGINE_CONFIG = {
   _setGoldDropBridgeClientOverrideForTests(null);
 }
 
+console.log('— 🔄 REFRESH button (claim ke baad dabana) + 👁 show/hide toggle —');
+
+// REFRESH button on result screen → claim ke baad refresh dabaya jaana chahiye.
+{
+  const msgs = [];
+  const sent = [];
+  const clicks = [];
+  let n = 1;
+  const bot = (text, buttons = []) => {
+    const msg = {
+      id: n++, out: false, date: Date.now(), message: text,
+      buttons: buttons.map((t) => ({
+        text: t,
+        click: async () => {
+          clicks.push(t);
+          if (t === 'CLAIM REWARD') bot('📱 ENTER MOBILE NUMBER\nSEND YOUR 10-DIGIT MOBILE NUMBER:\nEXAMPLE: 9876543210');
+          return { message: `clicked ${t}` };
+        },
+      })),
+    };
+    msgs.push(msg);
+    return msg;
+  };
+  const client = {
+    getEntity: async () => ({}),
+    sendMessage: async (entity, { message }) => {
+      const t = String(message);
+      sent.push(t);
+      if (t === '/start') {
+        bot('⚡️ ɴᴀᴠ ʙᴏᴛ ⚡️\n👑 WELCOME, It\'s ✌️!\n💰 YOUR POINTS: 5 PTS\n💎 TAP CLAIM REWARD TO START',
+          ['CLAIM REWARD', 'MY ACCOUNT', 'USER GUIDE', 'REFER & EARN']);
+      } else if (/^\d{10}$/.test(t)) {
+        bot('🛡️ OTP DISPATCHED\n📱 MOBILE: ' + t + '\n📍 STATUS: ENTER 6-DIGIT OTP\n💡 SEND 6-DIGIT OTP OR CANCEL', ['CANCEL']);
+      } else if (/^\d{6}$/.test(t)) {
+        bot('📱 MOBILE: ' + t + '\n💡 REWARD: BETTER LUCK NEXT TIME\n📈 POINTS: 5 LEFT (1 USED)');
+        bot('⚡️ ɴᴀᴠ ʙᴏᴛ\n✅ READY FOR NEXT CLAIM\n✨ TAP CLAIM REWARD BELOW TO PROCEED', ['CLAIM REWARD', 'REFRESH']);
+      }
+    },
+    getMessages: async (entity, { limit }) => msgs.slice(-Math.max(1, limit)).reverse(),
+  };
+  _setGoldDropBridgeClientOverrideForTests(client);
+  const result = await runGoldDropAiClaim({
+    phone: '6296591407',
+    otpProvider: async () => ({ code: '486888' }),
+    otpWatermark: async () => null,
+    report: () => {},
+    shouldAbort: () => false,
+    config: ENGINE_CONFIG,
+  });
+  ok(result?.ok === true, 'refresh: claim complete');
+  ok(clicks.includes('REFRESH'), 'refresh: claim ke baad REFRESH button dabaya');
+  _setGoldDropBridgeClientOverrideForTests(null);
+}
+
+// CLAIM REWARD na dikh raha → pehle show/hide toggle dabaya, phir CLAIM REWARD.
+{
+  const msgs = [];
+  const sent = [];
+  const clicks = [];
+  let n = 1;
+  const bot = (text, buttons = []) => {
+    const msg = {
+      id: n++, out: false, date: Date.now(), message: text,
+      buttons: buttons.map((t) => ({
+        text: t,
+        click: async () => {
+          clicks.push(t);
+          if (t === 'SHOW') {
+            bot('✅ READY FOR NEXT CLAIM\n✨ TAP CLAIM REWARD BELOW TO PROCEED', ['CLAIM REWARD']);
+          } else if (t === 'CLAIM REWARD') {
+            bot('📱 ENTER MOBILE NUMBER\nSEND YOUR 10-DIGIT MOBILE NUMBER:\nEXAMPLE: 9876543210');
+          }
+          return { message: `clicked ${t}` };
+        },
+      })),
+    };
+    msgs.push(msg);
+    return msg;
+  };
+  const client = {
+    getEntity: async () => ({}),
+    sendMessage: async (entity, { message }) => {
+      const t = String(message);
+      sent.push(t);
+      if (t === '/start') {
+        bot('⚡️ ɴᴀᴠ ʙᴏᴛ ⚡️\n👑 WELCOME, It\'s ✌️!\n💰 YOUR POINTS: 5 PTS\n💎 TAP CLAIM REWARD TO START',
+          ['SHOW', 'MY ACCOUNT', 'USER GUIDE', 'REFER & EARN']);
+      } else if (/^\d{10}$/.test(t)) {
+        bot('🛡️ OTP DISPATCHED\n📱 MOBILE: ' + t + '\n📍 STATUS: ENTER 6-DIGIT OTP\n💡 SEND 6-DIGIT OTP OR CANCEL', ['CANCEL']);
+      } else if (/^\d{6}$/.test(t)) {
+        bot('📱 MOBILE: ' + t + '\n💡 REWARD: BETTER LUCK NEXT TIME\n📈 POINTS: 5 LEFT (1 USED)');
+        bot('⚡️ ɴᴀᴠ ʙᴏᴛ\n✅ READY FOR NEXT CLAIM\n✨ TAP CLAIM REWARD BELOW TO PROCEED', ['CLAIM REWARD']);
+      }
+    },
+    getMessages: async (entity, { limit }) => msgs.slice(-Math.max(1, limit)).reverse(),
+  };
+  _setGoldDropBridgeClientOverrideForTests(client);
+  const result = await runGoldDropAiClaim({
+    phone: '6296591407',
+    otpProvider: async () => ({ code: '486888' }),
+    otpWatermark: async () => null,
+    report: () => {},
+    shouldAbort: () => false,
+    config: ENGINE_CONFIG,
+  });
+  ok(result?.ok === true, 'show/hide: claim complete (toggle click ke baad)');
+  ok(clicks.includes('SHOW'), 'show/hide: CLAIM REWARD se pehle SHOW toggle dabaya');
+  ok(clicks.includes('CLAIM REWARD'), 'show/hide: SHOW ke baad CLAIM REWARD dabaya');
+  _setGoldDropBridgeClientOverrideForTests(null);
+}
+
 console.log('— Auto batch (number auto-fetch + single-claim loop) —');
 
-// Happy path: 3 numbers, sab claims ok.
+// Happy path: 3 numbers, sab claims ok — STOP dabane pe rukna.
 {
   const numbers = ['9876543210', '9876543211', '9876543212'];
   let claimed = 0;
+  let n = 0;
   const res = await runGoldDropAiAutoClaims({
-    target: 3,
     getNextNumber: async ({ excludePhones }) => {
       assert.ok(!excludePhones.includes(numbers[claimed]), 'number dobara nahi aata');
       return { phone: numbers[claimed++] };
@@ -282,31 +399,31 @@ console.log('— Auto batch (number auto-fetch + single-claim loop) —');
       rewardWon: phone.endsWith('212') ? 1 : 0,
     }),
     report: () => {},
-    shouldAbort: () => false,
+    // 🛑 Owner rule: STOP pe hi rukna — target count nahi rokta.
+    shouldAbort: () => claimed >= 3,
   });
-  ok(res?.ok === true, 'auto: batch complete');
-  ok(res?.processed === 3 && res?.target === 3, 'auto: 3 numbers process hue');
+  ok(res?.ok === true, 'auto: batch complete (STOP pe)');
+  ok(res?.processed === 3, 'auto: 3 numbers process hue');
   ok(res?.claimsTotal === 3, 'auto: claims total 3 (ek claim per number)');
   ok(res?.rewardsTotal === 1, 'auto: rewards total 1 (sirf 212 pe)');
   ok(res?.phones.length === 3 && res?.phones[0] === '9876543210', 'auto: phones tracked');
-  ok(res?.stopped === false, 'auto: no STOP');
+  ok(res?.stopped === true, 'auto: STOP se ruk gaya (koi target nahi)');
 }
 
 // One-shot rule: ek number ka claim fail ho to batch nahi rukti — agla number.
 {
   let n = 0;
   const res = await runGoldDropAiAutoClaims({
-    target: 3,
     getNextNumber: async () => ({ phone: `987654321${n++}` }),
     runClaim: async (phone) => (phone === '9876543210'
       ? { ok: false, kind: 'registration_failed', reason: 'THIS EMAIL IS ALREADY USED' }
       : { ok: true, kind: 'claim_done', reward: 'BETTER LUCK NEXT TIME', rewardWon: 0 }),
     report: () => {},
-    shouldAbort: () => false,
+    shouldAbort: () => n >= 3,
   });
   ok(res?.processed === 3, 'auto: fail ke baad bhi 3 numbers process hue (one-shot)');
   ok(res?.claimsTotal === 2, 'auto: 2 successful numbers → 2 claims');
-  ok(res?.ok === true, 'auto: fail hone par bhi batch complete');
+  ok(res?.ok === true, 'auto: fail hone par bhi batch complete (STOP pe)');
 }
 
 // Invalid number from OTP bot → batch ruke, saaf error.
@@ -343,72 +460,70 @@ console.log('— Success cap (successful claims par rukna) —');
 ok(goldDropAiBridgeConfig({ GOLDDROPAI_MAX_SUCCESSFUL: '3' }).maxSuccessful === 3, 'config: env maxSuccessful override');
 ok(goldDropAiBridgeConfig().maxSuccessful === 0, 'config: default maxSuccessful 0 (no cap)');
 
-// Cap reach — 2 success ho jaye to batch khud ruke.
+// Cap reach — 2 success ho jaye to capReached true, par owner rule ke
+// mutabik ONLY STOP rokta hai batch. Cap sirf display ka hai.
 {
   let n = 0;
   const res = await runGoldDropAiAutoClaims({
-    target: 5,
     maxSuccesses: 2,
     getNextNumber: async () => ({ phone: `987654321${n++}` }),
     runClaim: async () => ({ ok: true, kind: 'claim_done', reward: 'BETTER LUCK NEXT TIME', rewardWon: 0 }),
     report: () => {},
-    shouldAbort: () => false,
+    shouldAbort: () => n >= 4,
   });
   ok(res?.capReached === true, 'cap: capReached true');
-  ok(res?.stopped === true, 'cap: batch ruka');
-  ok(res?.claimsTotal === 2, 'cap: 2 success hone par ruka');
-  ok(res?.processed === 2, 'cap: 2 numbers process hue (3rd nahi)');
+  ok(res?.claimsTotal === 4, 'cap: STOP tak 4 claims (cap sirf display, STOP rukata hai)');
+  ok(res?.processed === 4, 'cap: 4 numbers process hue');
   ok(res?.cap === 2, 'cap: cap value return me');
-  ok(res?.ok === true, 'cap: cap reach par bhi clean stop (ok)');
+  ok(res?.ok === true, 'cap: cap reach par bhi clean stop (STOP se)');
 }
 
-// Fail hone se cap nahi badhta — 2 fail + 2 success → cap 2 par ruke.
+// Fail hone se cap nahi badhta — 2 fail + 2 success → cap 2 reach, par
+// batch STOP tak chalta rahi.
 {
   let n = 0;
   const res = await runGoldDropAiAutoClaims({
-    target: 10,
     maxSuccesses: 2,
     getNextNumber: async () => ({ phone: `987654321${n++}` }),
     runClaim: async (phone) => (n <= 2
       ? { ok: false, kind: 'registration_failed', reason: 'already used' }
       : { ok: true, kind: 'claim_done', reward: 'BETTER LUCK NEXT TIME', rewardWon: 0 }),
     report: () => {},
-    shouldAbort: () => false,
+    shouldAbort: () => n >= 4,
   });
   ok(res?.claimsTotal === 2, 'cap: fail counts nahi karte — sirf 2 success');
   ok(res?.processed === 4, 'cap: 2 fail + 2 success → 4 numbers process');
-  ok(res?.capReached === true, 'cap: 2 success hone par ruka');
+  ok(res?.capReached === true, 'cap: 2 success hone par reach hua');
+  ok(res?.stopped === true, 'cap: STOP se ruk gaya');
 }
 
-// Cap 0 → koi cap nahi, target tak chale.
+// Cap 0 → koi cap nahi, loop STOP tak chale.
 {
   let n = 0;
   const res = await runGoldDropAiAutoClaims({
-    target: 3,
     maxSuccesses: 0,
     getNextNumber: async () => ({ phone: `987654321${n++}` }),
     runClaim: async () => ({ ok: true, kind: 'claim_done', reward: 'BETTER LUCK NEXT TIME', rewardWon: 0 }),
     report: () => {},
-    shouldAbort: () => false,
+    shouldAbort: () => n >= 3,
   });
-  ok(res?.processed === 3, 'cap: cap 0 → target tak chale');
+  ok(res?.processed === 3, 'cap: cap 0 → STOP tak chale');
   ok(res?.capReached === false, 'cap: cap 0 → capReached false');
-  ok(res?.stopped === false, 'cap: cap 0 → no stop');
+  ok(res?.stopped === true, 'cap: cap 0 → STOP se stop');
 }
 
-// STOP aur cap dono — cap pe ruke to stopped true.
+// Cap 1 set hai, par STOP pe hi ruko — cap khud nahi rokta.
 {
   let n = 0;
   const res = await runGoldDropAiAutoClaims({
-    target: 5,
     maxSuccesses: 1,
     getNextNumber: async () => ({ phone: `987654321${n++}` }),
     runClaim: async () => ({ ok: true, kind: 'claim_done', reward: 'BETTER LUCK NEXT TIME', rewardWon: 0 }),
     report: () => {},
-    shouldAbort: () => false,
+    shouldAbort: () => n >= 3,
   });
-  ok(res?.claimsTotal === 1 && res?.capReached === true, 'cap: 1 success par ruka');
-  ok(res?.processed === 1, 'cap: sirf ek number process');
+  ok(res?.claimsTotal === 3 && res?.capReached === true, 'cap: 1 success par reach, par STOP tak chale');
+  ok(res?.processed === 3, 'cap: cap 1 set hai par 3 numbers process (STOP rukata hai)');
 }
 
 console.log(`\n✅ ${passed} tests pass`);
