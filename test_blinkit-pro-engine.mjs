@@ -134,6 +134,57 @@ console.log('— Engine flow (mock client) —');
   ok(r.ok === false && r.kind === 'blinkit_send_otp_fail' && /blocked/.test(r.reason), 'send-otp fail → blinkit_send_otp_fail');
 }
 
+// 4b) Already registered (owner rule: fauran skip, OTP bhejna hi nahi)
+{
+  resetCalls();
+  mock.export.mobile = '9876543218';
+  _setBlinkitOtpPollForTests(async () => ({ code: '999999' }));
+  const prevSend = mock.sendOtp;
+  // "Account Found / registered" signal — text shape (jaise Blinkit dikhata hai)
+  mock.sendOtp = {
+    success: false,
+    message: 'Account Found. Found 9876543218 registered. Click on Continue to send OTP or enter a new number.',
+  };
+  const r = await processSingleNumberViaBlinkitPro({
+    entry: entry('9876543218', 'e4b'),
+    otpCfg: { otpBotProfile: 'hermes' },
+  });
+  mock.sendOtp = prevSend;
+  ok(r.ok === false && r.kind === 'skipped_already_registered', 'Account Found signal → skipped_already_registered');
+  ok(!mock.calls.some((c) => c.url.includes('/api/login/verify-otp')), 'registered number par verify-otp call nahi bheji');
+  ok(!mock.calls.some((c) => c.url.includes('/api/login/export')), 'registered number par export call nahi bheji');
+}
+
+// 4c) Already registered — boolean flag shape
+{
+  resetCalls();
+  mock.export.mobile = '9876543219';
+  _setBlinkitOtpPollForTests(async () => ({ code: '999999' }));
+  const prevSend = mock.sendOtp;
+  mock.sendOtp = { success: true, registered: true };
+  const r = await processSingleNumberViaBlinkitPro({
+    entry: entry('9876543219', 'e4c'),
+    otpCfg: { otpBotProfile: 'hermes' },
+  });
+  mock.sendOtp = prevSend;
+  ok(r.ok === false && r.kind === 'skipped_already_registered', 'registered=true flag → skipped_already_registered');
+}
+
+// 4d) Normal success response (registered flag nahi) — flow aage chale
+{
+  resetCalls();
+  mock.export.mobile = '9876543220';
+  _setBlinkitOtpPollForTests(async () => ({ code: '888888' }));
+  const prevSend = mock.sendOtp;
+  mock.sendOtp = { success: true, sid: 's1', tid: 't1', device_id: 'd1' };
+  const r = await processSingleNumberViaBlinkitPro({
+    entry: entry('9876543220', 'e4d'),
+    otpCfg: { otpBotProfile: 'hermes' },
+  });
+  mock.sendOtp = prevSend;
+  ok(r.ok === true && r.kind === 'fresh_new', 'normal send-otp response → flow aage chale (skip nahi)');
+}
+
 // 5) OTP timeout
 {
   resetCalls();

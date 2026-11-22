@@ -6,7 +6,9 @@
 //   1. GET  /api/auth/validate_key/{access_key}
 //      - key valid hai ya nahi — fail fast (preflight)
 //   2. POST /api/login/send-otp  { mobile }
-//      - OTP bhejta hai (sid/tid/device_id agar mile to verify me pass)
+//      - already registered number pe "Account Found / registered" signal
+//        aata hai → ⚡ OWNER KA RULE: number fauran SKIP (OTP bhejna hi nahi)
+//      - nahi to OTP bhejta hai (sid/tid/device_id agar mile to verify me pass)
 //   3. OTP Telegram OTP Bot (Hathi / Hermes) se poll
 //   4. POST /api/login/verify-otp { mobile, otp }
 //      - session banti hai (Zepto jaise — koi check_mobile nahi)
@@ -109,6 +111,30 @@ function failReason(data, status) {
     ? 'Blinkit access key reject ho gayi — Settings me sahi key set karo'
     : (status ? `Blinkit server error (HTTP ${status})` : 'Blinkit server se jawab nahi aaya');
   return redactSensitive(msg);
+}
+
+// ⚡ Already-registered signal detector — Blinkit send-otp ke response me
+// "Account Found / Found <phone> registered" signal kisi bhi shape me aa
+// sakta hai (boolean flag ya text). Owner ka rule: signal mile to number skip.
+function detectAlreadyRegisteredSignal(data) {
+  if (!data || typeof data !== 'object') return false;
+  // Boolean flags — sid/tid/success wala normal response me inme se koi nahi hota.
+  if (data.registered === true) return true;
+  if (data.account_found === true) return true;
+  if (data.already_registered === true) return true;
+  if (data.is_registered === true) return true;
+  // Text signals — "Account Found", "Found 6296591407 registered", etc.
+  const text = [
+    data.message, data.detail, data.error, data.status, data.raw,
+    data.title, data.heading,
+  ].filter(Boolean).join(' ');
+  if (!text) return false;
+  const low = text.toLowerCase();
+  if (/account found/.test(low)) return true;
+  if (/already registered/.test(low)) return true;
+  if (/found\s+\d{10}\s+registered/.test(low)) return true;
+  if (/registered\.?\s*click/.test(low)) return true;
+  return false;
 }
 
 // 🧪 Test override — tests OTP polling bina Telegram client ke simulate kar sakte hain.
@@ -226,6 +252,30 @@ export async function processSingleNumberViaBlinkitPro({
   } catch (err) {
     return { ok: false, kind: 'blinkit_send_otp_error', phone, reason: `Blinkit send OTP error: ${err.message}` };
   }
+
+  // ⚡ OWNER KA RULE: already registered number par OTP bhejna hi nahi —
+  // number chhod do. Blinkit "Account Found / registered" signal deta hai
+  // (jaise "Found 6296591407 registered. Click on Continue to send OTP...") —
+  // us signal ko pehchano, number fauran skip kar do.
+  const regSignal = detectAlreadyRegisteredSignal(otpRes.data);
+  if (regSignal) {
+    discardCurrentTelegramNumber(phone);
+    if (markUsed) {
+      try { await markPoolStatus(entry, 'skipped'); } catch {}
+    }
+    await say([
+      `⚡ <b>BLINKIT PRO SIGNUP</b>`,
+      `📱 Mobile: <code>${phone}</code>`,
+      `⏭ <b>Already Registered</b> — number fauran skip, agla number aa raha hai…`,
+    ].join('\n'));
+    return {
+      ok: false,
+      kind: 'skipped_already_registered',
+      phone,
+      reason: 'Number already registered hai — bina OTP bheje skip (owner rule)',
+    };
+  }
+
   if (!otpRes.ok || otpRes.data?.success === false) {
     return {
       ok: false,
