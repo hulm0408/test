@@ -12,6 +12,7 @@ node_modules/
 # production data/db.json KO KABHI chhune nahi (warna mock URLs persist
 # karke bot "fetch failed" karne lagta tha)
 test-data/
+test-data-blinkit/
 
 # Runtime data / scratch
 data/*.tmp

@@ -21,9 +21,9 @@
 import { OTP_BOT_PROFILE_IDS } from './otp-bot-profiles.js';
 
 // Pickers par ye buttons dikhte hain (order yahi rehta hai).
-export const START_SOURCE_PRESET_IDS = ['swiggy_pro', 'zepto_pro', 'toing_pro', 'otp_chromium', 'otp_world', 'hathi', 'world'];
+export const START_SOURCE_PRESET_IDS = ['swiggy_pro', 'zepto_pro', 'blinkit_pro', 'toing_pro', 'otp_chromium', 'otp_world', 'hathi', 'world'];
 // Purane id bhi valid rehte hain (chat me pada purana button dab jaye to).
-export const LEGACY_START_SOURCE_PRESET_IDS = ['hermes_world', 'toing_hermes', 'toing_hathi', 'zepto_hermes', 'zepto_hathi', 'swiggy_hermes', 'swiggy_hathi'];
+export const LEGACY_START_SOURCE_PRESET_IDS = ['hermes_world', 'toing_hermes', 'toing_hathi', 'zepto_hermes', 'zepto_hathi', 'swiggy_hermes', 'swiggy_hathi', 'blinkit_hermes', 'blinkit_hathi'];
 
 export const START_SOURCE_PRESETS = {
   // 0) 🍔 SWIGGY PRO SIGNUP — storelex.store/swiggy_web API flow
@@ -107,6 +107,48 @@ export const START_SOURCE_PRESETS = {
     accountEngine: 'zepto_pro',
     lines: [
       '🛒 Flow: <b>Zepto Pro</b> (storelex.store/zzbot API)',
+      '🐘 Number + OTP: <b>@Hathi_otp_bot</b>',
+    ],
+  },
+  // ⚡ BLINKIT PRO SIGNUP — storelex.store/webapp API flow (OTP login + export)
+  blinkit_pro: {
+    id: 'blinkit_pro',
+    label: '⚡ BLINKIT PRO SIGNUP',
+    shortLabel: 'Blinkit Pro Web',
+    sourceMode: 'telegram',
+    otpBotProfile: null,          // user can choose Hermes or Hathi
+    telegramOtpMode: true,
+    accountEngine: 'blinkit_pro',
+    lines: [
+      '⚡ Flow: <b>Blinkit Pro</b> (storelex.store/webapp API)',
+      '🔑 Access key preflight (validate_key) + OTP login',
+      '📨 Number + OTP: <b>Hathi 🐘 ya Hermes 📨 bot</b>',
+      '⚡ OTP verify & session export (.json) automatic',
+    ],
+  },
+  blinkit_hermes: {
+    id: 'blinkit_hermes',
+    label: '⚡ BLINKIT PRO + HERMES',
+    shortLabel: 'Blinkit + Hermes',
+    sourceMode: 'telegram',
+    otpBotProfile: 'hermes',
+    telegramOtpMode: true,
+    accountEngine: 'blinkit_pro',
+    lines: [
+      '⚡ Flow: <b>Blinkit Pro</b> (storelex.store/webapp API)',
+      '📨 Number + OTP: <b>@HermeshuOTPROBOT</b>',
+    ],
+  },
+  blinkit_hathi: {
+    id: 'blinkit_hathi',
+    label: '⚡ BLINKIT PRO + HATHI',
+    shortLabel: 'Blinkit + Hathi',
+    sourceMode: 'telegram',
+    otpBotProfile: 'hathi',
+    telegramOtpMode: true,
+    accountEngine: 'blinkit_pro',
+    lines: [
+      '⚡ Flow: <b>Blinkit Pro</b> (storelex.store/webapp API)',
       '🐘 Number + OTP: <b>@Hathi_otp_bot</b>',
     ],
   },
@@ -258,7 +300,9 @@ export function startSourcePresetSettings(preset = null) {
       ? 'toing_pro'
       : (preset.accountEngine === 'zepto_pro'
         ? 'zepto_pro'
-        : (preset.accountEngine === 'swiggy_pro' ? 'swiggy_pro' : 'direct')));
+        : (preset.accountEngine === 'swiggy_pro'
+          ? 'swiggy_pro'
+          : (preset.accountEngine === 'blinkit_pro' ? 'blinkit_pro' : 'direct'))));
   const patch = {
     telegramOtpMode: preset.telegramOtpMode === true,
     accountEngine: engine,
