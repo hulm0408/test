@@ -162,7 +162,8 @@ const lightNorm = (value = '') => {
 };
 
 // Button ka role — @GoldDropAi ke screens ke hisaab se.
-//   claimReward | cancel | myAccount | userGuide | referEarn | ''
+//   claimReward | cancel | myAccount | userGuide | referEarn | refresh |
+//   showHide | ''
 export function goldDropAiButtonRole(text = '') {
   const n = norm(text);
   if (!n) return '';
@@ -171,6 +172,11 @@ export function goldDropAiButtonRole(text = '') {
   if (/my\s*account/.test(n)) return 'myAccount';
   if (/user\s*guide/.test(n)) return 'userGuide';
   if (/refer.*earn|earn.*refer/.test(n)) return 'referEarn';
+  // REFRESH button — har claim ke baad (success ya fail) dabana hai.
+  if (/refresh/.test(n)) return 'refresh';
+  // Show/Hide toggle — CLAIM REWARD button na mile to pehle ye dabana hai
+  // taaki buttons dikhe. "SHOW", "HIDE", "TOGGLE", "MENU" wagaira.
+  if (/^(show|hide|toggle|expand|collapse|menu|show\s*menu|hide\s*menu)$/.test(n)) return 'showHide';
   return '';
 }
 
@@ -286,6 +292,42 @@ async function cancelGoldDropAiClaim(client, entity) {
     await sleep(800);
   }
   return false;
+}
+
+// 🔄 REFRESH button dab do — owner ka rule: claim success ho ya fail,
+// reward mile ya na mile, new number lene se PEHLE refresh zaroor karna hai.
+async function clickGoldDropAiRefresh(client, entity) {
+  try {
+    const screens = await parseGoldDropScreens(client, entity, 6, { fresh: true });
+    const hit = findGoldDropAiButtonOnScreens(screens, 'refresh');
+    if (hit) {
+      await clickGoldDropButton(hit).catch(() => {});
+      console.log(`[GoldDropAiBridge] 🔄 REFRESH dabaya (claim ke baad)`);
+      await sleep(1_000);
+      return true;
+    }
+  } catch {}
+  return false;
+}
+
+// CLAIM REWARD button khojna — na mile to show/hide toggle button dabakar
+// buttons dikhe, phir dobara dhoondho (owner ka rule).
+async function findClaimRewardButton(client, entity) {
+  let screens = await parseGoldDropScreens(client, entity, 8, { fresh: true });
+  let hit = findGoldDropAiButtonOnScreens(screens, 'claimReward');
+  if (hit) return hit;
+  // Button na mile to show/hide toggle dab do — bot ka menu chhipa hua ho
+  // to ye button dikhayega.
+  const toggle = findGoldDropAiButtonOnScreens(screens, 'showHide');
+  if (toggle) {
+    console.log(`[GoldDropAiBridge] 👁 CLAIM REWARD nahi dikh raha — show/hide toggle dabaya ("${toggle.text}")`);
+    await clickGoldDropButton(toggle).catch(() => {});
+    await sleep(1_500);
+    screens = await parseGoldDropScreens(client, entity, 8, { fresh: true });
+    hit = findGoldDropAiButtonOnScreens(screens, 'claimReward');
+    if (hit) return hit;
+  }
+  return null;
 }
 
 // Terminal result screens (result / registrationFailed / invalidOtp) —
@@ -444,12 +486,21 @@ export async function runGoldDropAiClaim({
       predicate: (fresh, all) => classifyTerminal(poolFrom(all, otpBefore)),
     }).catch(() => null);
 
-    if (outcome?.terminal) return { kind: outcome.terminal.kind, term: outcome.terminal };
+    if (outcome?.terminal) {
+      // 🔄 Owner rule: claim ke baad — success ho ya fail — new number
+      // lene se PEHLE REFRESH dab do (reward mile ya na mile).
+      await clickGoldDropAiRefresh(client, entity);
+      return { kind: outcome.terminal.kind, term: outcome.terminal };
+    }
 
     // Deadline khatam — jo screen hai usi se best-effort classify karo.
     const now = await parseGoldDropScreens(client, entity, 8, { fresh: true }).catch(() => []);
     const term = classifyTerminal(now);
-    if (term) return { kind: term.kind, term };
+    if (term) {
+      await clickGoldDropAiRefresh(client, entity);
+      return { kind: term.kind, term };
+    }
+    await clickGoldDropAiRefresh(client, entity);
     return { kind: 'timeout', reason: 'Claim result screen time-out me nahi aayi' };
   };
 
@@ -460,13 +511,15 @@ export async function runGoldDropAiClaim({
       await waitForGoldDropReply({
         client, entity, cfg, baseline: startBefore,
         what: '/start ka menu', timeoutMs: cfg.startTimeoutMs, shouldAbort,
-        predicate: (fresh, all) => findGoldDropAiButtonOnScreens([...fresh, ...all], 'claimReward'),
+        // Menu aa gayi agar CLAIM REWARD dikh raha ho, ya show/hide toggle
+        // dikh raha ho (CLAIM REWARD chhipa hua ho to toggle se ubharta hai).
+        predicate: (fresh, all) => findGoldDropAiButtonOnScreens([...fresh, ...all], 'claimReward')
+          || findGoldDropAiButtonOnScreens([...fresh, ...all], 'showHide'),
       });
       state.step = 1;
 
-      const claimHit = findGoldDropAiButtonOnScreens(
-        await parseGoldDropScreens(client, entity, 8, { fresh: true }), 'claimReward');
-      if (!claimHit) throw new Error('CLAIM REWARD button nahi mila');
+      const claimHit = await findClaimRewardButton(client, entity);
+      if (!claimHit) throw new Error('CLAIM REWARD button nahi mila (show/hide toggle click karne ke baad bhi)');
       await triggerGoldDropButton({
         client, entity, cfg, shouldAbort, entry: claimHit, what: 'CLAIM REWARD',
         predicate: (fresh, all) => goldDropAiHasPromptKind([...fresh, ...all], 'numberPrompt')
@@ -584,8 +637,8 @@ export async function runGoldDropAiClaim({
 //   runClaim(phone, { report, shouldAbort }) → runGoldDropAiClaim ka result
 //
 // Ek number ka claim fail ho (email already used / invalid OTP / OTP miss)
-// to wahi number dobara nahi aata (one-shot) — agla number turant. Target
-// poora hone ya STOP par rukna.
+// to wahi number dobara nahi aata (one-shot) — agla number turant. Batch
+// STOP dabane pe hi rukegi (koi Target count nahi).
 // ---------------------------------------------------------------------------
 export async function runGoldDropAiAutoClaims({
   target,
@@ -597,7 +650,10 @@ export async function runGoldDropAiAutoClaims({
   config = {},
 } = {}) {
   const cfg = { ...goldDropAiBridgeConfig(), ...(config || {}) };
-  const want = Math.max(1, Math.min(200, Math.trunc(Number(target) || 1)));
+  // 🛑 Owner rule: ONLY STOP stops the batch. Koi Target count nahi — bas
+  // number count chalega. `target` arg backward-compat rahega par loop STOP
+  // (shouldAbort) pe hi rukegi — koi target count nahi rokta.
+  const want = Math.max(1, Math.min(200, Math.trunc(Number(target) || 0)));
   // Successful claims ka cap — 0 = koi cap nahi. Argument ya config/env se.
   const cap = Math.max(0, Math.trunc(Number(maxSuccesses ?? cfg.maxSuccessful) || 0));
   const usedPhones = new Set();
@@ -612,14 +668,16 @@ export async function runGoldDropAiAutoClaims({
   const progressHtml = (phone, note) => [
     '🤖 <b>Gold Drop AI Bridge — Auto Batch</b>',
     `📨 OTP bot se number auto-fetch · @${cfg.username}`,
-    `📊 Processed: <b>${processed}/${want}</b> · Claims: <b>${claimsTotal}</b> · Rewards: <b>${rewardsTotal}</b>`,
+    `📊 Processed: <b>${processed}</b> · Claims: <b>${claimsTotal}</b> · Rewards: <b>${rewardsTotal}</b>`,
     cap > 0 ? `🛑 Success cap: <b>${cap}</b> (claims ${claimsTotal}/${cap})` : '',
     phone ? `📱 Current: <code>${phone}</code>` : '',
     note,
   ].filter(Boolean).join('\n');
 
   try {
-    while (processed < want) {
+    // Loop chalta raha — STOP dabane (ya cap, agar set hai) tak. Koi
+    // target count nahi rokta (owner rule: STOP pe hi ruko).
+    for (;;) {
       if (typeof shouldAbort === 'function' && shouldAbort()) {
         stopped = true;
         break;
@@ -644,7 +702,7 @@ export async function runGoldDropAiAutoClaims({
       usedPhones.add(phone);
       processed += 1;
       state.phone = phone;
-      console.log(`[GoldDropAiBridge] 🔢 auto number ${processed}/${want}: ${phone}`);
+      console.log(`[GoldDropAiBridge] 🔢 auto number #${processed}: ${phone}`);
 
       // 2) 🔗 single claim — @GoldDropAi pe khud bhej kar chalo.
       setPhase(`auto-claim-${processed}`);
@@ -673,12 +731,11 @@ export async function runGoldDropAiAutoClaims({
       await reportCard(report, progressHtml(phone, one.ok
         ? `✅ reward "${one.reward || '—'}" · agla number…`
         : `⚠️ claim terminate — agla number…`));
-      // 🛑 Success cap — itne success ho jaye to aage nahi chalo.
+      // 🛑 Success cap — owner rule: ONLY STOP rokta hai batch. Cap sirf
+      // display-purposes ka hai, loop STOP pe hi rukegi.
       if (cap > 0 && claimsTotal >= cap) {
         capReached = true;
-        stopped = true;
-        console.log(`[GoldDropAiBridge] 🛑 success cap ${cap} reach ho gaya — batch ruka`);
-        break;
+        console.log(`[GoldDropAiBridge] ✅ success cap ${cap} reach ho gaya — par STOP tak chalta raha`);
       }
       if (typeof shouldAbort === 'function' && shouldAbort()) {
         stopped = true;
@@ -696,11 +753,11 @@ export async function runGoldDropAiAutoClaims({
   }
 
   setPhase(stopped ? 'auto-stopped' : 'auto-done');
-  console.log(`[GoldDropAiBridge] 🤖 auto batch khatam — processed ${processed}/${want} · claims ${claimsTotal} · rewards ${rewardsTotal}${capReached ? ` · CAP ${cap}` : ''}${stopped ? ' · STOP' : ''}`);
+  console.log(`[GoldDropAiBridge] 🤖 auto batch khatam — processed ${processed} · claims ${claimsTotal} · rewards ${rewardsTotal}${capReached ? ` · CAP ${cap}` : ''}${stopped ? ' · STOP' : ''}`);
   return {
-    ok: !lastError || processed >= want,
+    ok: !lastError || stopped,
     processed,
-    target: want,
+    target: 0,
     claimsTotal,
     rewardsTotal,
     stopped,

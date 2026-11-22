@@ -1956,7 +1956,7 @@ async function startGoldDropBridgeAuto(ctx, source, target, cardMessageId) {
       ].join('\n')), true);
     } else {
       await render(section('⚠️ Gold Drop Bridge — Ruka', [
-        field('Processed', `${result?.processed || 0}/${target}`),
+        field('Processed', String(result?.processed || 0)),
         field('Reason', esc(String(result?.lastError || 'unknown error').slice(0, 160))),
         'OTP bot se valid number na milne ya error ke baad ruka — dobara shuru karein.',
       ].join('\n')), true);
@@ -1976,7 +1976,8 @@ async function startGoldDropBridgeAuto(ctx, source, target, cardMessageId) {
 // 🤖 Gold Drop AI bot (@GoldDropAi — "It's ✌️ Life") ko OTP bot se jodna —
 // PURA AUTO: number OTP bot se khud leh, @GoldDropAi pe khud bhej, OTP khud
 // type ho, ek number khatam to agla. Pehle source chuno (Hermes/Hathi/
-// HardXotp), phir kitne numbers process karni hain (target).
+// HardXotp), phir turant shuru — koi target nahi, bas number count, STOP
+// pe hi rukna (owner rule).
 bot.action('golddropai_bridge_open', async (ctx) => {
   if (!(await gate(ctx))) return;
   if (ctx.chat?.type !== 'private') {
@@ -2010,30 +2011,22 @@ bot.action(/^golddropai_bridge_source_(hermes|hathi|chauhan)$/, async (ctx) => {
   if (ctx.chat?.type !== 'private') return ctx.answerCbQuery('Private chat mein chunein.', { show_alert: true }).catch(() => {});
   if (goldDropRunning || isAutopilotRunning()) return ctx.answerCbQuery('Ek run pehle se chal raha hai.', { show_alert: true }).catch(() => {});
   if (!telegramOtp.isTelegramOtpConfigured()) return ctx.answerCbQuery('Pehle Telegram OTP account configure karein.', { show_alert: true }).catch(() => {});
-  pending.set(String(ctx.from.id), { action: 'golddropai_bridge_run', source: ctx.match[1] });
+  // 🛑 Owner rule: ek target/cap nahi poocha jata. Source chune ke baad
+  // turant auto run shuru — bas number count chalega, STOP pe hi rukna.
+  pending.delete(String(ctx.from.id));
   await ctx.answerCbQuery().catch(() => {});
-  await ctx.reply(section('🎯 Gold Drop AI Bridge — Auto target', [
-    'Kitne numbers process karni hain? Har number ke liye claim khud chalega.',
-    'Ek number ka claim fail ho (email already used / OTP miss) to wahi number chhod kar agla number turant chalega.',
-  ].join('\n')), kb([
-    [1, 5, 10, 25].map(n => ({ text: String(n), callback_data: `golddropai_bridge_go_${ctx.match[1]}_${n}` })),
-    [{ text: '✏️ Custom target', callback_data: `golddropai_bridge_custom_${ctx.match[1]}` }],
-    [{ text: '↩️ Back', callback_data: 'golddropai_bridge_open' }],
-  ])).catch(() => {});
+  const card = await ctx.reply('🧬 @GoldDropAi auto claim shuru ho raha hai…', kb([[{ text: '⏹ STOP', callback_data: 'gold_drop_stop' }]])).catch(() => null);
+  await startGoldDropAiBridgeAuto(ctx, ctx.match[1], card?.message_id).catch(error => {
+    console.error('[GoldDropAiBridge] auto run error:', error?.stack || error);
+  });
 });
 
-bot.action(/^golddropai_bridge_go_(hermes|hathi|chauhan)_(\d+)$/, async (ctx) => {
-  if (!(await gate(ctx))) return;
-  if (ctx.chat?.type !== 'private') return ctx.answerCbQuery('Private chat mein chunein.', { show_alert: true }).catch(() => {});
-  if (goldDropRunning || isAutopilotRunning()) return ctx.answerCbQuery('Ek run pehle se chal raha hai.', { show_alert: true }).catch(() => {});
-  if (!telegramOtp.isTelegramOtpConfigured()) return ctx.answerCbQuery('Pehle Telegram OTP account configure karein.', { show_alert: true }).catch(() => {});
-  pending.set(String(ctx.from.id), { action: 'golddropai_bridge_cap', source: ctx.match[1], target: Number(ctx.match[2]) });
-  await ctx.answerCbQuery().catch(() => {});
-  await showGoldDropAiCapPicker(ctx, ctx.match[1], Number(ctx.match[2]));
-});
+// NOTE: Target picker / success cap picker REMOVED — owner rule ke mutabik
+// koi target count nahi poocha jata, bas number count chalega aur STOP pe
+// hi run rukega. Source chune ke baad directly startGoldDropAiBridgeAuto
+// chalta hai (opar).
 
-// Target chune ke baad — successful claims ka cap chuno (0 = koi cap
-// nahi, target tak chale). 5000 wagaira quick options + custom.
+// RETIRED — owner rule: cap nahi poocha, cap sirf display-purposes ka hai.
 async function showGoldDropAiCapPicker(ctx, source, target) {
   await ctx.reply(section('🛑 Gold Drop AI Bridge — Success cap', [
     `Target: <b>${target} numbers</b>.`,
@@ -2043,60 +2036,29 @@ async function showGoldDropAiCapPicker(ctx, source, target) {
     [{ text: '✅ Nahi rukhna', callback_data: `golddropai_bridge_cap_${source}_none` }, { text: '100', callback_data: `golddropai_bridge_cap_${source}_100` }],
     [{ text: '500', callback_data: `golddropai_bridge_cap_${source}_500` }, { text: '1000', callback_data: `golddropai_bridge_cap_${source}_1000` }],
     [{ text: '5000', callback_data: `golddropai_bridge_cap_${source}_5000` }, { text: '✏️ Custom cap', callback_data: `golddropai_bridge_capcustom_${source}` }],
-    [{ text: '↩️ Back', callback_data: 'golddropai_bridge_open' }],
+    [{ text: '↡️ Back', callback_data: 'golddropai_bridge_open' }],
   ])).catch(() => {});
 }
 
+// RETIRED — target/cap buttons ab nahi dikhaye jaate (owner rule).
+bot.action(/^golddropai_bridge_go_(hermes|hathi|chauhan)_(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery('Target picker ab available nahi (owner rule).', { show_alert: true }).catch(() => {});
+});
 bot.action(/^golddropai_bridge_cap_(hermes|hathi|chauhan)_(none|100|500|1000|5000)$/, async (ctx) => {
-  if (!(await gate(ctx))) return;
-  if (ctx.chat?.type !== 'private') return ctx.answerCbQuery('Private chat mein chunein.', { show_alert: true }).catch(() => {});
-  if (goldDropRunning || isAutopilotRunning()) return ctx.answerCbQuery('Ek run pehle se chal raha hai.', { show_alert: true }).catch(() => {});
-  if (!telegramOtp.isTelegramOtpConfigured()) return ctx.answerCbQuery('Pehle Telegram OTP account configure karein.', { show_alert: true }).catch(() => {});
-  const st = pending.get(String(ctx.from.id));
-  if (st?.action !== 'golddropai_bridge_cap') {
-    await ctx.answerCbQuery('Pehle target chunein.', { show_alert: true }).catch(() => {});
-    return;
-  }
-  pending.delete(String(ctx.from.id));
-  await ctx.answerCbQuery().catch(() => {});
-  const cap = ctx.match[3] === 'none' ? 0 : Number(ctx.match[3]);
-  const card = await ctx.reply('🤖 @GoldDropAi auto claim shuru ho raha hai…', kb([[{ text: '⏹ STOP', callback_data: 'gold_drop_stop' }]])).catch(() => null);
-  await startGoldDropAiBridgeAuto(ctx, ctx.match[1], st.target, cap, card?.message_id).catch(error => {
-    console.error('[GoldDropAiBridge] auto run error:', error?.stack || error);
-  });
+  await ctx.answerCbQuery('Cap picker ab available nahi (owner rule).', { show_alert: true }).catch(() => {});
 });
-
 bot.action(/^golddropai_bridge_capcustom_(hermes|hathi|chauhan)$/, async (ctx) => {
-  if (!(await gate(ctx))) return;
-  if (ctx.chat?.type !== 'private') return ctx.answerCbQuery('Private chat mein chunein.', { show_alert: true }).catch(() => {});
-  const st = pending.get(String(ctx.from.id));
-  if (st?.action !== 'golddropai_bridge_cap') {
-    await ctx.answerCbQuery('Pehle target chunein.', { show_alert: true }).catch(() => {});
-    return;
-  }
-  pending.set(String(ctx.from.id), { action: 'golddropai_bridge_capinput', source: ctx.match[1], target: st.target });
-  await ctx.answerCbQuery().catch(() => {});
-  await ctx.reply('🎯 Success cap bhejo: 0 = koi cap nahi, ya koi bhi positive number.', kb([
-    [{ text: '↩️ Cancel', callback_data: 'golddropai_bridge_open' }],
-  ])).catch(() => {});
+  await ctx.answerCbQuery('Cap picker ab available nahi (owner rule).', { show_alert: true }).catch(() => {});
 });
-
 bot.action(/^golddropai_bridge_custom_(hermes|hathi|chauhan)$/, async (ctx) => {
-  if (!(await gate(ctx))) return;
-  if (ctx.chat?.type !== 'private') return ctx.answerCbQuery('Private chat mein chunein.', { show_alert: true }).catch(() => {});
-  pending.set(String(ctx.from.id), { action: 'golddropai_bridge_target', source: ctx.match[1] });
-  await ctx.answerCbQuery().catch(() => {});
-  await ctx.reply('🎯 Auto target bhejo: 1 se 100 tak ka number.', kb([
-    [{ text: '↩️ Cancel', callback_data: 'golddropai_bridge_open' }],
-  ])).catch(() => {});
+  await ctx.answerCbQuery('Target picker ab available nahi (owner rule).', { show_alert: true }).catch(() => {});
 });
 
-async function startGoldDropAiBridgeAuto(ctx, source, target, cap = 0, cardMessageId) {
+async function startGoldDropAiBridgeAuto(ctx, source, cardMessageId) {
   if (goldDropRunning || isAutopilotRunning()) throw new Error('Ek run pehle se chal raha hai.');
   if (!telegramOtp.isTelegramOtpConfigured()) throw new Error('Pehle Telegram OTP account configure karein.');
-  if (!Number.isInteger(target) || target < 1 || target > 100) throw new Error('Target 1 se 100 ke beech hona chahiye.');
-  if (!Number.isInteger(cap) || cap < 0) throw new Error('Cap 0 ya positive integer hona chahiye.');
-  const run = { owner: String(ctx.from.id), chatId: ctx.chat.id, source, target, count: 0, stop: false, stage: 'Shuru ho raha hai', phone: '', claims: 0, rewards: 0 };
+  // 🛑 Owner rule: koi target/cap nahi. Bas number count chalega, STOP pe hi rukna.
+  const run = { owner: String(ctx.from.id), chatId: ctx.chat.id, source, count: 0, stop: false, stage: 'Shuru ho raha hai', phone: '', claims: 0, rewards: 0 };
   goldDropRunning = true;
   goldDropRun = run;
   const previousProfile = telegramOtp.getActiveOtpBotProfile().id;
@@ -2135,13 +2097,9 @@ async function startGoldDropAiBridgeAuto(ctx, source, target, cap = 0, cardMessa
     telegramOtp.setActiveOtpBotProfile(source);
     await render(section('🤖 Gold Drop AI Bridge — Auto', [
       field('OTP bot', source.toUpperCase()),
-      field('Target', `${target} numbers`),
-      cap > 0 ? field('Success cap', `${cap} successful claims`) : '',
       field('Status', 'Shuru ho raha hai…'),
     ].filter(Boolean).join('\n')));
     const result = await goldDropAiBridge.runGoldDropAiAutoClaims({
-      target,
-      maxSuccesses: cap,
       // 1) number OTP bot se auto-fetch (Swiggy pipeline waisa hi).
       getNextNumber: ({ excludePhones, shouldAbort }) => telegramOtp.getNextTelegramNumber({
         forceNew: excludePhones.length > 0,
@@ -2166,17 +2124,16 @@ async function startGoldDropAiBridgeAuto(ctx, source, target, cap = 0, cardMessa
     if (result?.ok) {
       await ctx.telegram.sendMessage(run.chatId, section('✅ Gold Drop AI Bridge — Auto Khatam', [
         `📨 <b>${esc(source.toUpperCase())}</b> · @GoldDropAi`,
-        `📊 Numbers processed: <b>${result.processed}/${result.target}</b>`,
+        `📊 Numbers processed: <b>${result.processed}</b>`,
         `✅ Claims completed: <b>${result.claimsTotal}</b>`,
         `🎁 Rewards won: <b>${result.rewardsTotal}</b>`,
-        result.capReached ? `🛑 <b>${result.cap}</b> successful claims par khud ruka.` : '',
-        result.stopped && !result.capReached ? '⏹ STOP request ke baad ruka.' : '',
+        result.stopped ? '⏹ STOP request ke baad ruka.' : '',
       ].filter(Boolean).join('\n')), kb([[{ text: '🔗 Aur run', callback_data: 'golddropai_bridge_open' }, { text: '🏠 Home', callback_data: 'ap_home' }]])).catch(() => {});
       await render(section('✅ Gold Drop AI Bridge — Khatam', [
-        field('Processed', `${result.processed}/${result.target}`),
+        field('Processed', String(result.processed)),
         field('Claims', String(result.claimsTotal)),
         field('Rewards', String(result.rewardsTotal)),
-        result.capReached ? field('Stop reason', `${result.cap} successful claims — cap reach`) : '',
+        result.stopped ? field('Stop reason', 'STOP') : '',
       ].filter(Boolean).join('\n')), true);
     } else {
       await render(section('⚠️ Gold Drop AI Bridge — Ruka', [
@@ -5398,58 +5355,8 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  if (st.action === 'golddropai_bridge_target') {
-    pending.delete(uid);
-    const source = st.source;
-    // Target wala message chat se turant hatao.
-    try {
-      if (ctx.chat?.id && ctx.message?.message_id) {
-        await bot.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id);
-      }
-    } catch {}
-    const target = Number(String(txt).replace(/\D/g, ''));
-    if (!Number.isInteger(target) || target < 1 || target > 100) {
-      await ctx.reply(section('❌ Target Invalid', 'Target 1 se 100 ke beech ka integer hona chahiye.'), kb([
-        [{ text: '🔗 Dobara shuru', callback_data: 'golddropai_bridge_open' }],
-        [{ text: '🏠 Home', callback_data: 'ap_home' }],
-      ])).catch(() => {});
-      return;
-    }
-    // Target mil gaya — success cap picker dikhao.
-    pending.set(uid, { action: 'golddropai_bridge_cap', source, target });
-    await showGoldDropAiCapPicker(ctx, source, target);
-    return;
-  }
-
-  if (st.action === 'golddropai_bridge_capinput') {
-    pending.delete(uid);
-    const source = st.source;
-    const target = st.target;
-    // Cap wala message chat se turant hatao.
-    try {
-      if (ctx.chat?.id && ctx.message?.message_id) {
-        await bot.telegram.deleteMessage(ctx.chat.id, ctx.message.message_id);
-      }
-    } catch {}
-    const raw = String(txt).replace(/\D/g, '');
-    const cap = raw ? Number(raw) : 0;
-    if (!Number.isInteger(cap) || cap < 0) {
-      await ctx.reply(section('❌ Cap Invalid', 'Cap 0 (no cap) ya koi positive integer hona chahiye.'), kb([
-        [{ text: '🔗 Dobara shuru', callback_data: 'golddropai_bridge_open' }],
-        [{ text: '🏠 Home', callback_data: 'ap_home' }],
-      ])).catch(() => {});
-      return;
-    }
-    try {
-      const card = await ctx.reply('🤖 @GoldDropAi auto claim shuru ho raha hai…', kb([[{ text: '⏹ STOP', callback_data: 'gold_drop_stop' }]])).catch(() => null);
-      await startGoldDropAiBridgeAuto(ctx, source, target, cap, card?.message_id).catch(error => {
-        console.error('[GoldDropAiBridge] auto run error:', error?.stack || error);
-      });
-    } catch (error) {
-      await ctx.reply(section('⚠️ Gold Drop AI Bridge', `Shuru nahi ho saka: ${esc(String(error?.message || 'Unknown error').slice(0, 160))}`), kb([[{ text: '🏠 Home', callback_data: 'ap_home' }]])).catch(() => {});
-    }
-    return;
-  }
+  // golddropai_bridge_target / capinput handlers REMOVED — owner rule
+  // ke mutabik target/cap picker nahi hai, source chune se directly run shuru.
 
   if (typeof st.action === 'string' && st.action.startsWith('custom_')) {
     await handleCustomBotPending(ctx, st, txt);
