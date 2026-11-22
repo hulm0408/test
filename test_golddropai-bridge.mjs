@@ -338,4 +338,77 @@ console.log('— Auto batch (number auto-fetch + single-claim loop) —');
   ok(res?.claimsTotal === 2, 'auto: STOP tak 2 claims');
 }
 
+console.log('— Success cap (successful claims par rukna) —');
+
+ok(goldDropAiBridgeConfig({ GOLDDROPAI_MAX_SUCCESSFUL: '3' }).maxSuccessful === 3, 'config: env maxSuccessful override');
+ok(goldDropAiBridgeConfig().maxSuccessful === 0, 'config: default maxSuccessful 0 (no cap)');
+
+// Cap reach — 2 success ho jaye to batch khud ruke.
+{
+  let n = 0;
+  const res = await runGoldDropAiAutoClaims({
+    target: 5,
+    maxSuccesses: 2,
+    getNextNumber: async () => ({ phone: `987654321${n++}` }),
+    runClaim: async () => ({ ok: true, kind: 'claim_done', reward: 'BETTER LUCK NEXT TIME', rewardWon: 0 }),
+    report: () => {},
+    shouldAbort: () => false,
+  });
+  ok(res?.capReached === true, 'cap: capReached true');
+  ok(res?.stopped === true, 'cap: batch ruka');
+  ok(res?.claimsTotal === 2, 'cap: 2 success hone par ruka');
+  ok(res?.processed === 2, 'cap: 2 numbers process hue (3rd nahi)');
+  ok(res?.cap === 2, 'cap: cap value return me');
+  ok(res?.ok === true, 'cap: cap reach par bhi clean stop (ok)');
+}
+
+// Fail hone se cap nahi badhta — 2 fail + 2 success → cap 2 par ruke.
+{
+  let n = 0;
+  const res = await runGoldDropAiAutoClaims({
+    target: 10,
+    maxSuccesses: 2,
+    getNextNumber: async () => ({ phone: `987654321${n++}` }),
+    runClaim: async (phone) => (n <= 2
+      ? { ok: false, kind: 'registration_failed', reason: 'already used' }
+      : { ok: true, kind: 'claim_done', reward: 'BETTER LUCK NEXT TIME', rewardWon: 0 }),
+    report: () => {},
+    shouldAbort: () => false,
+  });
+  ok(res?.claimsTotal === 2, 'cap: fail counts nahi karte — sirf 2 success');
+  ok(res?.processed === 4, 'cap: 2 fail + 2 success → 4 numbers process');
+  ok(res?.capReached === true, 'cap: 2 success hone par ruka');
+}
+
+// Cap 0 → koi cap nahi, target tak chale.
+{
+  let n = 0;
+  const res = await runGoldDropAiAutoClaims({
+    target: 3,
+    maxSuccesses: 0,
+    getNextNumber: async () => ({ phone: `987654321${n++}` }),
+    runClaim: async () => ({ ok: true, kind: 'claim_done', reward: 'BETTER LUCK NEXT TIME', rewardWon: 0 }),
+    report: () => {},
+    shouldAbort: () => false,
+  });
+  ok(res?.processed === 3, 'cap: cap 0 → target tak chale');
+  ok(res?.capReached === false, 'cap: cap 0 → capReached false');
+  ok(res?.stopped === false, 'cap: cap 0 → no stop');
+}
+
+// STOP aur cap dono — cap pe ruke to stopped true.
+{
+  let n = 0;
+  const res = await runGoldDropAiAutoClaims({
+    target: 5,
+    maxSuccesses: 1,
+    getNextNumber: async () => ({ phone: `987654321${n++}` }),
+    runClaim: async () => ({ ok: true, kind: 'claim_done', reward: 'BETTER LUCK NEXT TIME', rewardWon: 0 }),
+    report: () => {},
+    shouldAbort: () => false,
+  });
+  ok(res?.claimsTotal === 1 && res?.capReached === true, 'cap: 1 success par ruka');
+  ok(res?.processed === 1, 'cap: sirf ek number process');
+}
+
 console.log(`\n✅ ${passed} tests pass`);

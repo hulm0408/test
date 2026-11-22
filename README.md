@@ -193,10 +193,13 @@ number turant:
   hota hai (fresh OTP); doosri baar bhi invalid to number chhod diya jata hai.
 
 **Use karna:** Gold Drop offer card se **🤖 @GoldDropAi claim (auto)** dabao
-→ OTP bot chuno (Hermes/Hathi/HardXotp) → target chuno (1/5/10/25 ya custom).
+→ OTP bot chuno (Hermes/Hathi/HardXotp) → target chuno (1/5/10/25 ya custom)
+→ **success cap chuno** (nahi rukhna / 100 / 500 / 1000 / **5000** / custom).
 Har number ke liye claim khud chale, ek number khatam ho to agla number.
-Live card par **⏹ STOP** dikhta hai. Result card par totals dikhte hain:
-numbers processed, claims completed, rewards won.
+**Success cap** par — successful claims itne ho jaye to batch khud ruke gi
+(fail hone se cap nahi badhega). Live card par **⏹ STOP** bhi dikhta hai.
+Result card par totals dikhte hain: numbers processed, claims completed,
+rewards won, aur cap reach hone par ruknay ka kaaran.
 
 **Safety rules:**
 - Har claim ke liye alag **OTP watermark** — number bhejne se thik pehle
@@ -207,7 +210,8 @@ numbers processed, claims completed, rewards won.
   chhod kar gold drop ka code chuna jata hai.
 
 Config (optional env): `GOLDDROPAI_BOT_USERNAME` (default `GoldDropAi`),
-`GOLDDROPAI_MAX_INVALID_OTP_RETRIES` (1), `GOLDDROPAI_OTP_INBOX_TIMEOUT_MS`
+`GOLDDROPAI_MAX_INVALID_OTP_RETRIES` (1), `GOLDDROPAI_MAX_SUCCESSFUL` (0 =
+no cap — successful claims ka cap), `GOLDDROPAI_OTP_INBOX_TIMEOUT_MS`
 (90s), `GOLDDROPAI_STEP_TIMEOUT_MS`, `GOLDDROPAI_TRIGGER`.
 
 ### 🐘 Hathi + 🔐 HardXotp — OTP bots

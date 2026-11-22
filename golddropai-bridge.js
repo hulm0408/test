@@ -67,6 +67,10 @@ export const GOLDDROPAI_BRIDGE_DEFAULTS = {
   otpInboxTimeoutMs: 90_000,
   // INVALID OTP par same number ek baar dobara try karna.
   maxInvalidOtpRetries: 1,
+  // Successful claims ka cap — itna success ho jaye to batch ruke
+  // (0 = koi cap nahi, target tak chale). UI se ya
+  // GOLDDROPAI_MAX_SUCCESSFUL env se set ho sakta hai.
+  maxSuccessful: 0,
   // Button trigger: 'auto' = pehle click; screen na badle to button ka TEXT
   // type karke action trigger (world-bot jaisa). 'type' = click bilkul nahi.
   trigger: 'auto',
@@ -102,6 +106,7 @@ export function goldDropAiBridgeConfig(env = process.env) {
     otpInboxTimeoutMs: Math.max(30_000, Math.min(180_000,
       num('GOLDDROPAI_OTP_INBOX_TIMEOUT_MS', GOLDDROPAI_BRIDGE_DEFAULTS.otpInboxTimeoutMs, 30_000))),
     maxInvalidOtpRetries: Math.max(0, Math.min(3, Math.trunc(num('GOLDDROPAI_MAX_INVALID_OTP_RETRIES', GOLDDROPAI_BRIDGE_DEFAULTS.maxInvalidOtpRetries, 0)))),
+    maxSuccessful: Math.max(0, Math.trunc(num('GOLDDROPAI_MAX_SUCCESSFUL', GOLDDROPAI_BRIDGE_DEFAULTS.maxSuccessful, 0))),
     trigger: ['click', 'type', 'auto'].includes(String(env?.GOLDDROPAI_TRIGGER || '').trim().toLowerCase())
       ? String(env.GOLDDROPAI_TRIGGER).trim().toLowerCase()
       : GOLDDROPAI_BRIDGE_DEFAULTS.trigger,
@@ -584,6 +589,7 @@ export async function runGoldDropAiClaim({
 // ---------------------------------------------------------------------------
 export async function runGoldDropAiAutoClaims({
   target,
+  maxSuccesses,
   getNextNumber,
   runClaim,
   report,
@@ -592,18 +598,22 @@ export async function runGoldDropAiAutoClaims({
 } = {}) {
   const cfg = { ...goldDropAiBridgeConfig(), ...(config || {}) };
   const want = Math.max(1, Math.min(200, Math.trunc(Number(target) || 1)));
+  // Successful claims ka cap — 0 = koi cap nahi. Argument ya config/env se.
+  const cap = Math.max(0, Math.trunc(Number(maxSuccesses ?? cfg.maxSuccessful) || 0));
   const usedPhones = new Set();
   const results = [];
   let processed = 0;
   let claimsTotal = 0;
   let rewardsTotal = 0;
   let stopped = false;
+  let capReached = false;
   let lastError = '';
 
   const progressHtml = (phone, note) => [
     '🤖 <b>Gold Drop AI Bridge — Auto Batch</b>',
     `📨 OTP bot se number auto-fetch · @${cfg.username}`,
     `📊 Processed: <b>${processed}/${want}</b> · Claims: <b>${claimsTotal}</b> · Rewards: <b>${rewardsTotal}</b>`,
+    cap > 0 ? `🛑 Success cap: <b>${cap}</b> (claims ${claimsTotal}/${cap})` : '',
     phone ? `📱 Current: <code>${phone}</code>` : '',
     note,
   ].filter(Boolean).join('\n');
@@ -656,13 +666,20 @@ export async function runGoldDropAiAutoClaims({
         rewardsTotal += one.rewardWon;
       } else {
         // ⚠️ Ek number ka claim fail = wahi number khatam (one-shot) — agla
-        // number turant, batch nahi rukti.
+        // number turant, batch nahi rukti. Fail hone se cap nahi badhta.
         lastError = one.reason || 'claim fail';
         console.warn(`[GoldDropAiBridge] ⚠️ ${phone} claim fail — ${lastError.slice(0, 90)} · agla number`);
       }
       await reportCard(report, progressHtml(phone, one.ok
         ? `✅ reward "${one.reward || '—'}" · agla number…`
         : `⚠️ claim terminate — agla number…`));
+      // 🛑 Success cap — itne success ho jaye to aage nahi chalo.
+      if (cap > 0 && claimsTotal >= cap) {
+        capReached = true;
+        stopped = true;
+        console.log(`[GoldDropAiBridge] 🛑 success cap ${cap} reach ho gaya — batch ruka`);
+        break;
+      }
       if (typeof shouldAbort === 'function' && shouldAbort()) {
         stopped = true;
         break;
@@ -679,7 +696,7 @@ export async function runGoldDropAiAutoClaims({
   }
 
   setPhase(stopped ? 'auto-stopped' : 'auto-done');
-  console.log(`[GoldDropAiBridge] 🤖 auto batch khatam — processed ${processed}/${want} · claims ${claimsTotal} · rewards ${rewardsTotal}${stopped ? ' · STOP' : ''}`);
+  console.log(`[GoldDropAiBridge] 🤖 auto batch khatam — processed ${processed}/${want} · claims ${claimsTotal} · rewards ${rewardsTotal}${capReached ? ` · CAP ${cap}` : ''}${stopped ? ' · STOP' : ''}`);
   return {
     ok: !lastError || processed >= want,
     processed,
@@ -687,6 +704,8 @@ export async function runGoldDropAiAutoClaims({
     claimsTotal,
     rewardsTotal,
     stopped,
+    capReached,
+    cap: cap > 0 ? cap : 0,
     lastError,
     phones: [...usedPhones],
     results,
