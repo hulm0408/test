@@ -67,6 +67,7 @@ const {
 } = await import('./autopilot-engine.js');
 const { isFirebaseConfigured, firebaseSetupHintLines, listPoolNumbers, _countDeviceOnlineStates } = await import('./firebase-numbers.js');
 const telegramOtp = await import('./telegram-otp-source.js');
+const { classifyTelegramError } = await import('./telegram-account-health.js');
 const zeptoPro = await import('./zepto-pro-engine.js');
 const swiggyWeb = await import('./swiggy-web-engine.js');
 const blinkitPro = await import('./blinkit-pro-engine.js');
@@ -2706,9 +2707,20 @@ function maskTelegramLoginPhone(phone = '') {
 }
 
 function shortTelegramLoginError(error) {
-  return String(error?.message || error || 'Unknown error')
+  const raw = String(error?.message || error || 'Unknown error')
     .replace(/\s+/g, ' ')
+    .trim()
     .slice(0, 220);
+  try {
+    const classified = classifyTelegramError(error);
+    if (classified && classified.code && classified.code !== 'UNKNOWN') {
+      const detail = [classified.label, classified.hint].filter(Boolean).join(' — ');
+      if (detail) return `${raw} · ${detail}`.slice(0, 300);
+    }
+  } catch {
+    // classifyTelegramError khud fail ho to raw message hi dikhao
+  }
+  return raw;
 }
 
 function clearTelegramLoginWait(flow) {
@@ -2788,7 +2800,15 @@ async function waitForTelegramLoginInput(flow, stage, prompt, rows = telegramLog
 
 async function askTelegramLoginValue(flow, stage, prompt, validate) {
   for (;;) {
-    const raw = await waitForTelegramLoginInput(flow, stage, prompt);
+    let raw;
+    try {
+      raw = await waitForTelegramLoginInput(flow, stage, prompt);
+    } catch (err) {
+      // waitForTelegramLoginInput throw karta hai (abort/timeout/prompt-fail) —
+      // loop nahi, seedha upar propagate karo taki runTelegramLoginFlow catch
+      // block error dikha sake aur flow clean-up ho sake.
+      throw err;
+    }
     const checked = validate(raw);
     if (checked?.ok) return checked.value;
     await sendTelegramLoginMessage(flow, section('⚠️ Input Sahi Nahi', [
@@ -2993,7 +3013,14 @@ async function runTelegramLoginFlow(flow) {
       onError: async (error) => {
         if (flow.cancelled) return true;
         const message = shortTelegramLoginError(error);
-        const unrecoverable = /API_ID_INVALID|API_HASH_INVALID|PHONE_NUMBER_BANNED|FLOOD_WAIT|AUTH_KEY_(UNREGISTERED|DUPLICATED)|USER_DEACTIVATED|PHONE_NUMBER_INVALID/i.test(message);
+        let unrecoverable = false;
+        try {
+          const classified = classifyTelegramError(error);
+          unrecoverable = Boolean(classified?.fatal);
+        } catch {
+          // classify fail to purana regex fallback
+          unrecoverable = /API_ID_INVALID|API_HASH_INVALID|PHONE_NUMBER_BANNED|FLOOD_WAIT|AUTH_KEY_(UNREGISTERED|DUPLICATED)|USER_DEACTIVATED|PHONE_NUMBER_INVALID/i.test(message);
+        }
         await sendTelegramLoginMessage(flow, section(
           unrecoverable ? '❌ Telegram Login Ruk Gaya' : '⚠️ Telegram Ne Retry Manga',
           [
@@ -3039,12 +3066,24 @@ async function runTelegramLoginFlow(flow) {
   } catch (error) {
     const aborted = flow.cancelled || error?.code === 'TELEGRAM_LOGIN_ABORTED' || /AUTH_USER_CANCEL|cancel\/timeout/i.test(String(error?.message || ''));
     if (!flow.done) {
+      let detail = shortTelegramLoginError(error);
+      // Fatal errors me user ko clear hint milni chahiye — classify se le lo.
+      if (!aborted) {
+        try {
+          const classified = classifyTelegramError(error);
+          if (classified?.hint) {
+            detail = `${detail}\n\n💡 ${classified.hint}`.slice(0, 400);
+          }
+        } catch {
+          // classify fail to existing detail hi rakh do
+        }
+      }
       await sendTelegramLoginMessage(flow, section(
         aborted ? '✖️ Telegram Login Cancel' : '❌ Telegram Login Fail',
         [
           esc(aborted
             ? 'Login flow band kar diya gaya hai. Partial session save nahi hui.'
-            : shortTelegramLoginError(error)),
+            : detail),
           ``,
           sub('Settings → Add Telegram Account se dobara try kar sakte ho.'),
         ].join('\n')

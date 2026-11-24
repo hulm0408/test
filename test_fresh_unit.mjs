@@ -3206,6 +3206,18 @@ console.log('Telegram accounts: health classify + multi-account roster:');
   // ---- live-ish check: ek hi session do slots me = same tag (conflict pakda jaye) ----
   const dupRoster = rosterMod.buildRoster({ TELEGRAM_SESSION: 'same', TELEGRAM_SESSION_2: 'same' });
   ok(dupRoster[0].tag === dupRoster[1].tag, 'roster: duplicate session same tag deti hai (detect ho jata hai)');
+
+  // ---- fresh-bot login error handling: classify import + shortTelegramLoginError + onError ----
+  ok(fbSrc2.includes("import('./telegram-account-health.js')") && fbSrc2.includes('classifyTelegramError'),
+    'login: fresh-bot classifyTelegramError import karta hai');
+  ok(fbSrc2.includes('classifyTelegramError(error)') && fbSrc2.includes('classified?.fatal'),
+    'login: onError callback classify se fatal detect karta hai');
+  ok(fbSrc2.includes('classified?.hint') && fbSrc2.includes('💡'),
+    'login: catch block me classified hint user ko dikhta hai');
+  ok(fbSrc2.includes('try {') && fbSrc2.includes('raw = await waitForTelegramLoginInput') && fbSrc2.includes('throw err'),
+    'login: askTelegramLoginValue waitForTelegramLoginInput throw ko propagate karta hai (loop nahi)');
+  ok(fbSrc2.includes('shortTelegramLoginError') && fbSrc2.includes('classified.label') && fbSrc2.includes('classified.hint'),
+    'login: shortTelegramLoginError classify se label+hint append karta hai');
 }
 
 // ---------------------------------------------------------------------------
