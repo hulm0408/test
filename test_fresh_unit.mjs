@@ -226,6 +226,12 @@ ok(_extractSixDigitCode('OTP 123456\n-JP-987654-A') === '123456', 'pehla 6-digit
 ok(_extractSixDigitCode('no code here') === '', 'code absent → empty');
 ok(_extractSixDigitCode('') === '', 'empty text → empty');
 ok(_extractSixDigitCode('code 1234567 (7 digit)') === '', '7-digit ko 6-digit nahi samjha');
+ok(_extractSixDigitCode('[CP-blnkit-S] · OTP: 1986') === '1986', 'Blinkit 4-digit OTP extract hoga');
+ok(_extractSixDigitCode('[VA-blnkit-S] · OTP: 6164') === '6164', 'VA Blinkit 4-digit OTP extract hoga');
+ok(_extractSixDigitCode('OTP is 4321 for blinkit signup') === '4321', 'OTP-context 4-digit extract hoga');
+ok(_extractSixDigitCode('Zepto code 5785') === '5785', 'Zepto 4-digit code extract hoga');
+ok(_extractSixDigitCode('random text 1234 no otp') === '1234', '4-digit fallback kisi bhi line me nikalta hai');
+ok(_extractSixDigitCode('OTP: 123456\n[CP-blnkit-S] · OTP: 1986') === '123456', '6-digit OTP 4-digit se prefer hoga');
 
 // ---------------------------------------------------------------------------
 console.log('listPoolNumbers (clients primary, numbers legacy fallback):');

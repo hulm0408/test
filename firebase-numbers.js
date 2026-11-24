@@ -445,12 +445,23 @@ function messageTsOf(v) {
 
 // Swiggy wale line ko prefer karte hue standalone 6-digit code nikalna.
 // (Sirf MESSAGE text se — sender line me digits ho sakte hain, e.g. "JX-620014-P")
+// Blinkit/Zepto 4-digit OTP bhi support karta hai — pehle 6-digit, phir
+// OTP-context line me 4-digit, phir kisi bhi line me 4-digit.
 export function _extractSixDigitCode(text) {
   const src = String(text ?? '');
   if (!src) return '';
-  const pick = (s) => (s.match(/(?<!\d)\d{6}(?!\d)/) || [])[0] || '';
+  const pick6 = (s) => (s.match(/(?<!\d)\d{6}(?!\d)/) || [])[0] || '';
+  const pick4 = (s) => (s.match(/(?<!\d)\d{4}(?!\d)/) || [])[0] || '';
+
+  // 1) 6-digit — Swiggy line ko prefer karo
   const swiggyLine = src.split(/\r?\n/).find((l) => /swiggy|swgtns/i.test(l)) || '';
-  return pick(swiggyLine) || pick(src);
+  const six = pick6(swiggyLine) || pick6(src);
+  if (six) return six;
+
+  // 2) 4-digit fallback — OTP/code context wale line ko prefer karo
+  //    (Blinkit [CP-blnkit-S] · OTP: 1986, Zepto, aadi)
+  const otpLine = src.split(/\r?\n/).find((l) => /otp|code|verify|login|blinkit|zepto|swiggy|blnkit|va-|cp-/i.test(l)) || '';
+  return pick4(otpLine) || pick4(src);
 }
 
 function candidateFrom(idKey, v, via, meta = '') {
