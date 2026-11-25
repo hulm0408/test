@@ -38,7 +38,10 @@ export const DEFAULT_TELEGRAM_OTP_BOT_USERNAME = OTP_BOT_PROFILES[DEFAULT_OTP_BO
 // Telegram API ID/hash aur login phone jaan-boojhkar source me default nahi
 // rakhe jaate. Owner apni API app values private setup flow me deta hai.
 // Empty phone default se login hamesha user-entered number maangta hai.
-export const DEFAULT_TELEGRAM_LOGIN_PHONE = '';
+// TELEGRAM_LOGIN_PHONE env set ho to us number ko pre-select karke login
+// turant shuru ho jayega — spare account add ka flow fast hoga.
+export const DEFAULT_TELEGRAM_LOGIN_PHONE =
+  String(process.env.TELEGRAM_LOGIN_PHONE || '').trim();
 
 // ---------------------------------------------------------------------------
 // Kaunsa OTP bot — Hermes (@HermeshuOTPROBOT) ya HardXotp (@HardXotp_Bot).
@@ -2376,7 +2379,18 @@ export async function disconnectTelegramUserClient() {
   entityCacheKey = '';
   providerState.connected = false;
   providerState.authorized = false;
+  // loginInProgress lock reset karo — purana failed/interrupted login
+  // is lock ko stuck kar sakta tha, jisse spare account add hamesha block
+  // ho jata tha. Disconnect ke saath lock bhi khol do.
+  providerState.loginInProgress = false;
   try { await client?.disconnect?.(); } catch {}
+}
+
+// Force-clear stuck loginInProgress lock — Settings → Add Telegram Account
+// par "login chal raha hai" dikhaye aur koi bhi naya login start na ho to
+// is function ko call karo. Existing client disconnect karke lock reset karta hai.
+export async function forceClearTelegramLoginLock() {
+  await disconnectTelegramUserClient();
 }
 
 // ---------------------------------------------------------------------------
