@@ -3108,9 +3108,10 @@ async function startTelegramLoginFlow(ctx) {
   }
   const status = telegramProviderStatus();
   if (status.loginInProgress) {
-    await ctx.answerCbQuery('⏳ Telegram login provider me pehle se chal raha hai.', { show_alert: true }).catch(() => {});
-    await editOrSend(ctx, telegramAccountCard(), telegramLoginRows());
-    return;
+    // Stuck lock — purana failed/interrupted login lock reset karke naya
+    // login start karo, na ki block karo. Spare account add hamesha chale.
+    try { await telegramOtp.forceClearTelegramLoginLock?.(); } catch {}
+    await ctx.answerCbQuery('🔄 Purani login lock reset karke naya login shuru kar raha hoon…', { show_alert: true }).catch(() => {});
   }
 
   const flow = {

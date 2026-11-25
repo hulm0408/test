@@ -65,7 +65,7 @@ const SPECS = {
   // ⚡ Blinkit Pro (storelex.store/webapp) — owner ka rule: BLKP key HAMESHA
   // yehi built-in default rahegi (Zepto ZPT / Swiggy SWG key ki tarah).
   // Chat se override / 'reset' karne par wapas yehi aati hai. Env: BLINKIT_ACCESS_KEY.
-  blinkitAccessKey: { string: true, dflt: 'BLKP-SP08-IYFV-BISB-Y5KL', label: '🔑 Blinkit Pro Access Key' },
+    blinkitAccessKey: { string: true, dflt: 'TNG-6BMI-SHBL-OOLY', label: '🔑 Blinkit Pro Access Key' },
   blinkitBaseUrl:   { string: true, dflt: 'https://storelex.store/webapp', label: '⚡ Blinkit Pro Base URL' },
   // 🛡️ NoCaptchaAI — Gold Drop security check (Cloudflare Turnstile) auto-solve.
   // '' (unset) = code ki built-in key; 'off' = auto-solve band; 'nocap_…' = apni key.

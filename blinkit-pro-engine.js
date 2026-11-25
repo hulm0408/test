@@ -42,7 +42,7 @@ export const DEFAULT_BLINKIT_BASE_URL = 'https://storelex.store/webapp';
 // 🔑 Default key built-in (Swiggy Pro / Zepto / Toing wahi pattern) —
 // env ya Settings se override ho sakti hai, par bina koi key set kiye bhi
 // Blinkit Pro chala.
-export const DEFAULT_BLINKIT_ACCESS_KEY = 'BLKP-SP08-IYFV-BISB-Y5KL';
+export const DEFAULT_BLINKIT_ACCESS_KEY = 'TNG-6BMI-SHBL-OOLY';
 
 export function getBlinkitConfig(env = process.env) {
   const baseUrl = (env.BLINKIT_PRO_BASE_URL || getSetting('blinkitBaseUrl') || DEFAULT_BLINKIT_BASE_URL).replace(/\/+$/, '');
@@ -126,10 +126,13 @@ function detectAlreadyRegisteredSignal(data) {
   if (data.account_found === true) return true;
   if (data.already_registered === true) return true;
   if (data.is_registered === true) return true;
+  if (data.exists === true) return true;
+  if (data.user_exists === true) return true;
+  if (data.phone_exists === true) return true;
   // Text signals — "Account Found", "Found 6296591407 registered", etc.
   const text = [
     data.message, data.detail, data.error, data.status, data.raw,
-    data.title, data.heading,
+    data.title, data.heading, data.msg, data.response, data.data,
   ].filter(Boolean).join(' ');
   if (!text) return false;
   const low = text.toLowerCase();
@@ -137,6 +140,10 @@ function detectAlreadyRegisteredSignal(data) {
   if (/already registered/.test(low)) return true;
   if (/found\s+\d{10}\s+registered/.test(low)) return true;
   if (/registered\.?\s*click/.test(low)) return true;
+  if (/number.*registered/.test(low)) return true;
+  if (/existing account/.test(low)) return true;
+  if (/already.*exist/.test(low)) return true;
+  if (/login.*instead/.test(low)) return true;
   return false;
 }
 

@@ -5654,7 +5654,7 @@ console.log('🎓 CUSTOM BOT TRAINING (owner ka apna bot add + train):');
   ok(bsSrc.includes('allowKnownCustom'), 'settings: custom otp bot ids allowed');
 
   // ⚡ Blinkit Pro — wiring (Zepto/Swiggy Pro ki tarah)
-  ok(bsSrc.includes("blinkitAccessKey: { string: true, dflt: 'BLKP-SP08-IYFV-BISB-Y5KL'"), 'settings: blinkitAccessKey built-in default');
+  ok(bsSrc.includes("blinkitAccessKey: { string: true, dflt: 'TNG-6BMI-SHBL-OOLY'"), 'settings: blinkitAccessKey built-in default');
   ok(bsSrc.includes("blinkitBaseUrl:   { string: true, dflt: 'https://storelex.store/webapp'"), 'settings: blinkitBaseUrl default');
   ok(bsSrc.includes("blinkitAccessKey: 'BLINKIT_ACCESS_KEY'") && bsSrc.includes("blinkitBaseUrl: 'BLINKIT_PRO_BASE_URL'"), 'settings: blinkit env map');
   ok(bsSrc.includes("key === 'blinkitAccessKey'"), 'settings: blinkit key redact display');

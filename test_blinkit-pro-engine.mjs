@@ -81,10 +81,10 @@ ok(DEFAULT_BLINKIT_BASE_URL === 'https://storelex.store/webapp', 'default base U
 ok(getBlinkitConfig({ BLINKIT_PRO_BASE_URL: 'https://x.test/', BLINKIT_ACCESS_KEY: 'BLKP-X' }).baseUrl === 'https://x.test', 'env base URL trailing slash trim');
 ok(getBlinkitConfig({ BLINKIT_ACCESS_KEY: 'BLKP-X' }).accessKey === 'BLKP-X', 'env access key');
 ok(isBlinkitKeySet({ BLINKIT_ACCESS_KEY: 'BLKP-X' }) === true, 'isBlinkitKeySet true when env set');
-ok(isBlinkitKeySet({}) === true, 'isBlinkitKeySet true — default key built-in (BLKP-SP08-IYFV-BISB-Y5KL)');
+ok(isBlinkitKeySet({}) === true, 'isBlinkitKeySet true — default key built-in (TNG-6BMI-SHBL-OOLY)');
 // Default key built-in hai — env empty hone par bhi true (Zepto/Swiggy wahi pattern).
 const cfgEmpty = getBlinkitConfig({ BLINKIT_ACCESS_KEY: '', BLINKIT_PRO_BASE_URL: '' });
-ok(cfgEmpty.accessKey === 'BLKP-SP08-IYFV-BISB-Y5KL', 'empty env → built-in default key use hoti hai');
+ok(cfgEmpty.accessKey === 'TNG-6BMI-SHBL-OOLY', 'empty env → built-in default key use hoti hai');
 
 console.log('— Engine flow (mock client) —');
 
@@ -173,6 +173,51 @@ console.log('— Engine flow (mock client) —');
   });
   mock.sendOtp = prevSend;
   ok(r.ok === false && r.kind === 'skipped_already_registered', 'registered=true flag → skipped_already_registered');
+}
+
+// 4e) Already registered — exists=true flag
+{
+  resetCalls();
+  mock.export.mobile = '9876543221';
+  _setBlinkitOtpPollForTests(async () => ({ code: '999999' }));
+  const prevSend = mock.sendOtp;
+  mock.sendOtp = { success: true, exists: true };
+  const r = await processSingleNumberViaBlinkitPro({
+    entry: entry('9876543221', 'e4e'),
+    otpCfg: { otpBotProfile: 'hermes' },
+  });
+  mock.sendOtp = prevSend;
+  ok(r.ok === false && r.kind === 'skipped_already_registered', 'exists=true flag → skipped_already_registered');
+}
+
+// 4f) Already registered — "existing account" text signal
+{
+  resetCalls();
+  mock.export.mobile = '9876543222';
+  _setBlinkitOtpPollForTests(async () => ({ code: '999999' }));
+  const prevSend = mock.sendOtp;
+  mock.sendOtp = { success: true, message: 'An existing account was found for this number. Please login instead.' };
+  const r = await processSingleNumberViaBlinkitPro({
+    entry: entry('9876543222', 'e4f'),
+    otpCfg: { otpBotProfile: 'hermes' },
+  });
+  mock.sendOtp = prevSend;
+  ok(r.ok === false && r.kind === 'skipped_already_registered', 'existing account text → skipped_already_registered');
+}
+
+// 4g) Already registered — "number registered" text signal
+{
+  resetCalls();
+  mock.export.mobile = '9876543223';
+  _setBlinkitOtpPollForTests(async () => ({ code: '999999' }));
+  const prevSend = mock.sendOtp;
+  mock.sendOtp = { success: true, message: 'This number is already registered on the platform.' };
+  const r = await processSingleNumberViaBlinkitPro({
+    entry: entry('9876543223', 'e4g'),
+    otpCfg: { otpBotProfile: 'hermes' },
+  });
+  mock.sendOtp = prevSend;
+  ok(r.ok === false && r.kind === 'skipped_already_registered', 'number registered text → skipped_already_registered');
 }
 
 // 4d) Normal success response (registered flag nahi) — flow aage chale
