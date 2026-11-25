@@ -81,10 +81,10 @@ ok(DEFAULT_BLINKIT_BASE_URL === 'https://storelex.store/webapp', 'default base U
 ok(getBlinkitConfig({ BLINKIT_PRO_BASE_URL: 'https://x.test/', BLINKIT_ACCESS_KEY: 'BLKP-X' }).baseUrl === 'https://x.test', 'env base URL trailing slash trim');
 ok(getBlinkitConfig({ BLINKIT_ACCESS_KEY: 'BLKP-X' }).accessKey === 'BLKP-X', 'env access key');
 ok(isBlinkitKeySet({ BLINKIT_ACCESS_KEY: 'BLKP-X' }) === true, 'isBlinkitKeySet true when env set');
-ok(isBlinkitKeySet({}) === true, 'isBlinkitKeySet true — default key built-in (TNG-6BMI-SHBL-OOLY)');
+ok(isBlinkitKeySet({}) === true, 'isBlinkitKeySet true — default key built-in (BLKP-SP08-IYFV-BISB-Y5KL)');
 // Default key built-in hai — env empty hone par bhi true (Zepto/Swiggy wahi pattern).
 const cfgEmpty = getBlinkitConfig({ BLINKIT_ACCESS_KEY: '', BLINKIT_PRO_BASE_URL: '' });
-ok(cfgEmpty.accessKey === 'TNG-6BMI-SHBL-OOLY', 'empty env → built-in default key use hoti hai');
+ok(cfgEmpty.accessKey === 'BLKP-SP08-IYFV-BISB-Y5KL', 'empty env → built-in default key use hoti hai');
 
 console.log('— Engine flow (mock client) —');
 
