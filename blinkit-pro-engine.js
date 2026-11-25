@@ -42,7 +42,7 @@ export const DEFAULT_BLINKIT_BASE_URL = 'https://storelex.store/webapp';
 // 🔑 Default key built-in (Swiggy Pro / Zepto / Toing wahi pattern) —
 // env ya Settings se override ho sakti hai, par bina koi key set kiye bhi
 // Blinkit Pro chala.
-export const DEFAULT_BLINKIT_ACCESS_KEY = 'TNG-6BMI-SHBL-OOLY';
+export const DEFAULT_BLINKIT_ACCESS_KEY = 'BLKP-SP08-IYFV-BISB-Y5KL';
 
 export function getBlinkitConfig(env = process.env) {
   const baseUrl = (env.BLINKIT_PRO_BASE_URL || getSetting('blinkitBaseUrl') || DEFAULT_BLINKIT_BASE_URL).replace(/\/+$/, '');

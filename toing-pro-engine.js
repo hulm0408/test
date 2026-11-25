@@ -37,7 +37,7 @@ import {
 import { getSetting } from './bot-settings.js';
 
 export const DEFAULT_TOING_BASE_URL = 'https://storelex.store/toing_web';
-export const DEFAULT_TOING_ACCESS_KEY = 'TNG-M923-VR10-8SQF';
+export const DEFAULT_TOING_ACCESS_KEY = 'TNG-6BMI-SHBL-OOLY';
 
 export function getToingConfig(env = process.env) {
   const baseUrl = (env.TOING_PRO_BASE_URL || getSetting('toingBaseUrl') || DEFAULT_TOING_BASE_URL).replace(/\/+$/, '');

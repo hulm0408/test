@@ -50,7 +50,7 @@ const SPECS = {
   // 'chauhan' (@HardXotp_Bot) ya 'custom_<hex>' (owner ka Train Custom Bot).
   otpBotProfile:     { dflt: 'hermes', label: '📨 OTP bot (hermes = @HermeshuOTPROBOT, hathi = @Hathi_otp_bot, chauhan = @HardXotp_Bot, custom_* = aapka trained bot)',
                        enum: ['hermes', 'hathi', 'chauhan'], allowKnownCustom: true },
-  toingAccessKey:    { string: true, dflt: 'TNG-M923-VR10-8SQF', label: '🔑 Toing Pro Access Key' },
+  toingAccessKey:    { string: true, dflt: 'TNG-6BMI-SHBL-OOLY', label: '🔑 Toing Pro Access Key' },
   toingBaseUrl:      { string: true, dflt: 'https://storelex.store/toing_web', label: '🌐 Toing Pro Base URL' },
   // 🛒 Zepto Pro (storelex.store/zzbot) — owner ka rule: key HAMESHA yehi
   // default rahegi (Toing TNG key ki tarah built-in). Chat se set ki hui key
@@ -65,7 +65,7 @@ const SPECS = {
   // ⚡ Blinkit Pro (storelex.store/webapp) — owner ka rule: BLKP key HAMESHA
   // yehi built-in default rahegi (Zepto ZPT / Swiggy SWG key ki tarah).
   // Chat se override / 'reset' karne par wapas yehi aati hai. Env: BLINKIT_ACCESS_KEY.
-    blinkitAccessKey: { string: true, dflt: 'TNG-6BMI-SHBL-OOLY', label: '🔑 Blinkit Pro Access Key' },
+    blinkitAccessKey: { string: true, dflt: 'BLKP-SP08-IYFV-BISB-Y5KL', label: '🔑 Blinkit Pro Access Key' },
   blinkitBaseUrl:   { string: true, dflt: 'https://storelex.store/webapp', label: '⚡ Blinkit Pro Base URL' },
   // 🛡️ NoCaptchaAI — Gold Drop security check (Cloudflare Turnstile) auto-solve.
   // '' (unset) = code ki built-in key; 'off' = auto-solve band; 'nocap_…' = apni key.
