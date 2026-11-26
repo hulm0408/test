@@ -2127,6 +2127,9 @@ export async function loginTelegramUserInteractive(callbacks = {}, opts = {}) {
 
       let loginPhone = '';
       await loginClient.start({
+        // forceSMS: Telegram server SMS nahi, app/calls me code bhej sakta hai.
+        // Spare account par SMS receive hona zaroori hai — force SMS karo.
+        forceSMS: true,
         phoneNumber: async () => {
           throwIfAborted();
           const value = await callbacks.phoneNumber();
