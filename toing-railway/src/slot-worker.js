@@ -24,6 +24,7 @@ export class SlotWorker {
     toingClient,
     getRuntimeConfig,
     clientFactory = null,
+    botPacer = null,
     onSignupSuccess = null,
     onSlotAlert = null,
   } = {}) {
@@ -32,6 +33,7 @@ export class SlotWorker {
     this.toingClient = toingClient;
     this.getRuntimeConfig = getRuntimeConfig;
     this.clientFactory = clientFactory;
+    this.botPacer = botPacer || null;
     this.onSignupSuccess = onSignupSuccess;
     this.onSlotAlert = onSlotAlert;
 
@@ -143,6 +145,7 @@ export class SlotWorker {
       apiId,
       apiHash,
       otpBotProfile: this.otpBotProfile,
+      botPacer: this.botPacer,
     };
     if (typeof this.clientFactory === 'function') {
       return this.clientFactory(opts);

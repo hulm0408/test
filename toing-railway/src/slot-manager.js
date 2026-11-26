@@ -5,6 +5,7 @@
 //   - Live account add/remove/bot-switch without disrupting other running slots
 
 import { SlotWorker } from './slot-worker.js';
+import { BotClickPacer } from './bot-pacer.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, Number(ms) || 0)));
 
@@ -14,6 +15,7 @@ export class SlotManager {
     toingClient,
     getRuntimeConfig,
     clientFactory = null,
+    botPacer = null,
     onSignupSuccess = null,
     onSlotAlert = null,
   } = {}) {
@@ -21,6 +23,7 @@ export class SlotManager {
     this.toingClient = toingClient;
     this.getRuntimeConfig = getRuntimeConfig;
     this.clientFactory = clientFactory;
+    this.botPacer = botPacer || new BotClickPacer();
     this.onSignupSuccess = onSignupSuccess;
     this.onSlotAlert = onSlotAlert;
 
@@ -104,6 +107,7 @@ export class SlotManager {
           toingClient: this.toingClient,
           getRuntimeConfig: this.getRuntimeConfig,
           clientFactory: this.clientFactory,
+          botPacer: this.botPacer,
           onSignupSuccess: this.onSignupSuccess,
           onSlotAlert: this.onSlotAlert,
         });
@@ -162,6 +166,7 @@ export class SlotManager {
       toingClient: this.toingClient,
       getRuntimeConfig: this.getRuntimeConfig,
       clientFactory: this.clientFactory,
+      botPacer: this.botPacer,
       onSignupSuccess: this.onSignupSuccess,
       onSlotAlert: this.onSlotAlert,
     });

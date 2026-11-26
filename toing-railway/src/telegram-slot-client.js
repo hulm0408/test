@@ -92,6 +92,7 @@ export class TelegramSlotClient {
     apiId,
     apiHash,
     otpBotProfile = 'hathi',
+    botPacer = null,
   } = {}) {
     this.slotId = Number(slotId);
     this.slotNo = Number(slotNo);
@@ -100,6 +101,7 @@ export class TelegramSlotClient {
     this.apiId = Number(apiId) || 0;
     this.apiHash = String(apiHash || '').trim();
     this.profile = getOtpBotProfile(otpBotProfile);
+    this.botPacer = botPacer || null;
 
     this.client = null;
     this.entity = null;
@@ -510,17 +512,45 @@ export class TelegramSlotClient {
     return this._screenFromMessages(fresh);
   }
 
-  async _safeClickButton(entry) {
+  async _safeClickButton(entry, { timeoutMs = 4_500 } = {}) {
+    const startedAt = Date.now();
+    const clickTimeoutMs = Math.max(1_500, Number(timeoutMs) || 4_500);
+    let timer = null;
     try {
-      const answer = await entry.button.click({});
+      const clickPromise = Promise.resolve().then(() => entry.button.click({}));
+      // Prevent unhandled rejection if soft timeout wins and Telegram rejects late
+      clickPromise.catch(() => {});
+
+      const raceResult = await Promise.race([
+        clickPromise.then((answer) => ({ done: true, answer })),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve({ done: false, softTimeout: true }), clickTimeoutMs);
+        }),
+      ]);
+      if (timer) clearTimeout(timer);
+
+      if (!raceResult.done) {
+        // Callback already sent to Telegram; don't freeze slot for 10s waiting on bot toast!
+        this.botPacer?.noteBotSlow(this.profile.id);
+        return { clicked: true, softTimeout: true, callbackMessage: 'click_soft_timeout' };
+      }
+
+      const elapsedMs = Date.now() - startedAt;
+      if (elapsedMs > 2_800) {
+        this.botPacer?.noteBotSlow(this.profile.id);
+      } else if (elapsedMs < 2_000) {
+        this.botPacer?.noteBotFast(this.profile.id);
+      }
       return {
         clicked: true,
-        callbackMessage: String(answer?.message || '').trim().slice(0, 160),
+        callbackMessage: String(raceResult.answer?.message || '').trim().slice(0, 160),
       };
     } catch (err) {
+      if (timer) clearTimeout(timer);
       const pool = `${err?.errorMessage || ''} ${err?.message || err || ''}`;
       if (/(BOT_RESPONSE_TIMEOUT|QUERY_ID_INVALID|MESSAGE_NOT_MODIFIED)/i.test(pool)) {
         // Callback reached Telegram; OTP bot simply took >5s to answer toast or card unchanged
+        if (/BOT_RESPONSE_TIMEOUT/i.test(pool)) this.botPacer?.noteBotSlow(this.profile.id);
         return { clicked: true, softTimeout: true, callbackMessage: pool.trim().slice(0, 80) };
       }
       if (/(MESSAGE_ID_INVALID|BUTTON_INVALID|BUTTON_NOT_FOUND|DATA_INVALID)/i.test(pool)) {
@@ -587,7 +617,8 @@ export class TelegramSlotClient {
     shouldAbort = null,
   } = {}) {
     return this._withSlotLock(async () => {
-      const deadline = Date.now() + Math.max(4_000, Number(timeoutMs) || 16_000);
+      const budgetMs = Math.max(4_000, Number(timeoutMs) || 16_000);
+      let deadline = Date.now() + budgetMs;
       const remaining = () => Math.max(0, deadline - Date.now());
       const excludedPhonesSeen = [];
 
@@ -619,6 +650,16 @@ export class TelegramSlotClient {
 
       for (let cycle = 0; cycle < 3 && remaining() > 600; cycle++) {
         if (shouldAbort?.()) return { ok: false, aborted: true, excludedPhonesSeen };
+
+        // Yield politely to shared per-bot pacer so NEW NUMBER scans never starve active OTP REFRESH clicks
+        if (this.botPacer) {
+          const granted = await this.botPacer.acquire(this.profile.id, { priority: 'claim', shouldAbort });
+          if (!granted) return { ok: false, aborted: true, excludedPhonesSeen };
+          // Pacer wait shouldn't eat the first click's response deadline
+          if (cycle === 0) {
+            deadline = Math.max(deadline, Date.now() + budgetMs);
+          }
+        }
 
         // Capture push epoch BEFORE clicking NEW NUMBER so even a 30ms bot reply during click() is caught!
         let lastEpoch = this._pushEpoch;
@@ -720,8 +761,12 @@ export class TelegramSlotClient {
           continue;
         }
         lastFailureReason = 'claim_timeout';
+        this.botPacer?.noteBotSlow(this.profile.id);
       }
 
+      if (lastFailureReason === 'claim_timeout') {
+        this.botPacer?.noteBotSlow(this.profile.id);
+      }
       return { ok: false, reason: lastFailureReason, excludedPhonesSeen };
     });
   }
@@ -783,9 +828,15 @@ export class TelegramSlotClient {
   }
 
   // Targeted refresh: prefers clicking REFRESH right on the cached active card (0 GetHistory RPCs!)
-  async _refreshOtpChatUnlocked(phone, attempt = 1) {
+  async _refreshOtpChatUnlocked(phone, attempt = 1, shouldAbort = null) {
     const wanted = normalizePhone10(phone);
     const allowed = this.profile.refreshRoles || ['refresh'];
+
+    // VIP fast-lane on shared per-bot pacer: REFRESH jumps ahead of all NEW NUMBER scans!
+    if (this.botPacer) {
+      const granted = await this.botPacer.acquire(this.profile.id, { priority: 'refresh', shouldAbort });
+      if (!granted) return { ok: false, aborted: true };
+    }
 
     const tryClickInMessages = async (messages) => {
       let fallbackEntry = null;
@@ -808,11 +859,11 @@ export class TelegramSlotClient {
           if (!fallbackEntry) fallbackEntry = matchEntry;
           continue;
         }
-        const clickRes = await this._safeClickButton(matchEntry);
+        const clickRes = await this._safeClickButton(matchEntry, { timeoutMs: 3_500 });
         if (clickRes.clicked) return { ok: true, via: 'click' };
       }
       if (fallbackEntry && attempt >= 2) {
-        const clickRes = await this._safeClickButton(fallbackEntry);
+        const clickRes = await this._safeClickButton(fallbackEntry, { timeoutMs: 3_500 });
         if (clickRes.clicked) return { ok: true, via: 'click-fallback' };
       }
       return null;
@@ -849,108 +900,135 @@ export class TelegramSlotClient {
     shouldAbort = null,
   } = {}) {
     return this._withSlotLock(async () => {
-      const cleanPhone = normalizePhone10(phone);
-      const totalMs = Math.max(4_000, Number(timeoutMs) || 30_000);
-      const baseRefreshMs = Math.max(900, Number(refreshMs) || 2_200);
-      const acceptAnyAfterMs = Math.min(10_000, Math.floor(totalMs * 0.55));
-      const startedAt = Date.now();
-      const deadline = startedAt + totalMs;
+      this.botPacer?.markOtpWaitStart(this.profile.id);
+      try {
+        const cleanPhone = normalizePhone10(phone);
+        const totalMs = Math.max(4_000, Number(timeoutMs) || 30_000);
+        const baseRefreshMs = Math.max(900, Number(refreshMs) || 2_200);
+        const acceptAnyAfterMs = Math.min(10_000, Math.floor(totalMs * 0.55));
+        const startedAt = Date.now();
+        const deadline = startedAt + totalMs;
 
-      const normBaseline = {
-        ids: new Set(baseline?.ids || []),
-        codes: new Set(baseline?.codes || []),
-        ts: Number(baseline?.ts) || startedAt,
-        afterMs: Number(baseline?.afterMs || baseline?.ts) || startedAt,
-        messageId: Number(baseline?.messageId) || 0,
-      };
+        const normBaseline = {
+          ids: new Set(baseline?.ids || []),
+          codes: new Set(baseline?.codes || []),
+          ts: Number(baseline?.ts) || startedAt,
+          afterMs: Number(baseline?.afterMs || baseline?.ts) || startedAt,
+          messageId: Number(baseline?.messageId) || 0,
+        };
 
-      let currentRefreshMs = baseRefreshMs;
-      // Wait ~1.5s before first REFRESH so Swiggy SMS has a moment to arrive (push catches instant OTPs immediately!)
-      let lastRefreshAt = startedAt - Math.floor(baseRefreshMs * 0.3);
-      let lastFallbackFetchAt = startedAt;
-      let lastEpoch = this._pushEpoch;
-      let attempts = 0;
-      let lastError = null;
-      const fallbackFetchGapMs = this._pushActive ? 6_000 : 700;
+        let currentRefreshMs = baseRefreshMs;
+        // Wait ~1.5s before first REFRESH so Swiggy SMS has a moment to arrive (push catches instant OTPs immediately!)
+        let lastRefreshAt = startedAt - Math.floor(baseRefreshMs * 0.3);
+        let lastFallbackFetchAt = startedAt;
+        let lastEpoch = this._pushEpoch;
+        let attempts = 0;
+        let lastError = null;
+        const fallbackFetchGapMs = this._pushActive ? 6_000 : 700;
 
-      while (Date.now() < deadline) {
-        if (shouldAbort?.()) return { ok: false, aborted: true, code: '' };
-        const iterStart = Date.now();
+        while (Date.now() < deadline) {
+          if (shouldAbort?.()) return { ok: false, aborted: true, code: '' };
+          const iterStart = Date.now();
 
-        const needFallbackFetch = !this._pushActive || (iterStart - lastFallbackFetchAt >= fallbackFetchGapMs);
-        if (needFallbackFetch) lastFallbackFetchAt = iterStart;
+          const needFallbackFetch = !this._pushActive || (iterStart - lastFallbackFetchAt >= fallbackFetchGapMs);
+          if (needFallbackFetch) lastFallbackFetchAt = iterStart;
 
-        try {
-          const candidates = await this._readOtpCandidatesUnlocked(cleanPhone, { forceFetch: needFallbackFetch });
-          const fresh = candidates.filter((c) => candidateIsNew(c, normBaseline));
-          const swiggy = fresh.find((c) =>
-            /swiggy|swgtns|toing/i.test(c.parsed.sender || '') ||
-            /swiggy|swgtns|toing/i.test(messageText(c.message) || '')
-          );
-          const chosen = swiggy || ((Date.now() - startedAt) >= acceptAnyAfterMs ? fresh[0] : null);
-          if (chosen) {
-            return {
-              ok: true,
-              code: chosen.parsed.code,
-              sender: chosen.parsed.sender || '',
-              elapsedMs: Date.now() - startedAt,
-            };
-          }
-        } catch (err) {
-          lastError = err;
-          // Re-throw fatal / flood errors immediately so SlotWorker handles health properly
-          if (/FLOOD_WAIT|PEER_FLOOD|AUTH_KEY|SESSION_REVOKED|USER_DEACTIVATED|CHAT_WRITE_FORBIDDEN/i.test(String(err?.message || err))) {
-            throw err;
-          }
-        }
-
-        if (shouldAbort?.() || Date.now() >= deadline) break;
-
-        const now = Date.now();
-        if (now - lastRefreshAt >= currentRefreshMs) {
-          lastRefreshAt = now;
-          attempts += 1;
           try {
-            await this._refreshOtpChatUnlocked(cleanPhone, attempts);
+            const candidates = await this._readOtpCandidatesUnlocked(cleanPhone, { forceFetch: needFallbackFetch });
+            const fresh = candidates.filter((c) => candidateIsNew(c, normBaseline));
+            const swiggy = fresh.find((c) =>
+              /swiggy|swgtns|toing/i.test(c.parsed.sender || '') ||
+              /swiggy|swgtns|toing/i.test(messageText(c.message) || '')
+            );
+            const chosen = swiggy || ((Date.now() - startedAt) >= acceptAnyAfterMs ? fresh[0] : null);
+            if (chosen) {
+              return {
+                ok: true,
+                code: chosen.parsed.code,
+                sender: chosen.parsed.sender || '',
+                elapsedMs: Date.now() - startedAt,
+              };
+            }
           } catch (err) {
             lastError = err;
+            // Re-throw fatal / flood errors immediately so SlotWorker handles health properly
             if (/FLOOD_WAIT|PEER_FLOOD|AUTH_KEY|SESSION_REVOKED|USER_DEACTIVATED|CHAT_WRITE_FORBIDDEN/i.test(String(err?.message || err))) {
               throw err;
             }
           }
-        }
 
-        const iterMs = Date.now() - iterStart;
-        if (iterMs > 2_000) {
-          currentRefreshMs = Math.min(5_000, Math.max(currentRefreshMs, iterMs));
-        } else if (iterMs < 800 && currentRefreshMs > baseRefreshMs) {
-          currentRefreshMs = Math.max(baseRefreshMs, currentRefreshMs - 400);
-        }
+          if (shouldAbort?.() || Date.now() >= deadline) break;
 
-        // Sleep until either the next REFRESH tick OR an instant MTProto push (NewMessage / EditedMessage)!
-        const untilRefresh = Math.max(150, (lastRefreshAt + currentRefreshMs) - Date.now());
-        const untilFallback = Math.max(150, (lastFallbackFetchAt + fallbackFetchGapMs) - Date.now());
-        const waitMs = Math.min(untilRefresh, untilFallback, Math.max(0, deadline - Date.now()));
-        if (this._pushActive) {
-          const gotPush = await this._waitForPush(waitMs, shouldAbort, lastEpoch);
-          if (gotPush) {
-            lastEpoch = this._pushEpoch;
-            // Push arrived — postpone safety fallback fetch since push channel is actively delivering!
-            lastFallbackFetchAt = Date.now();
+          const now = Date.now();
+          if (now - lastRefreshAt >= currentRefreshMs) {
+            lastRefreshAt = now;
+            attempts += 1;
+            try {
+              await this._refreshOtpChatUnlocked(cleanPhone, attempts, shouldAbort);
+            } catch (err) {
+              lastError = err;
+              if (/FLOOD_WAIT|PEER_FLOOD|AUTH_KEY|SESSION_REVOKED|USER_DEACTIVATED|CHAT_WRITE_FORBIDDEN/i.test(String(err?.message || err))) {
+                throw err;
+              }
+            }
           }
-        } else {
-          await sleepInterruptibly(Math.min(500, waitMs), shouldAbort);
-        }
-      }
 
-      return {
-        ok: false,
-        code: '',
-        timeout: true,
-        attempts,
-        elapsedMs: Date.now() - startedAt,
-        error: lastError ? String(lastError?.message || lastError).slice(0, 160) : `OTP timeout (${Math.round(totalMs / 1000)}s)`,
-      };
+          const iterMs = Date.now() - iterStart;
+          if (iterMs > 2_000) {
+            // Cap refresh cadence at 3.0s so a 30s OTP wait ALWAYS fires 8-12 crisp refreshes (not 3!)
+            currentRefreshMs = Math.min(3_000, Math.max(currentRefreshMs, Math.min(iterMs, 3_000)));
+          } else if (iterMs < 800 && currentRefreshMs > baseRefreshMs) {
+            currentRefreshMs = Math.max(baseRefreshMs, currentRefreshMs - 400);
+          }
+
+          // Sleep until either the next REFRESH tick OR an instant MTProto push (NewMessage / EditedMessage)!
+          const untilRefresh = Math.max(150, (lastRefreshAt + currentRefreshMs) - Date.now());
+          const untilFallback = Math.max(150, (lastFallbackFetchAt + fallbackFetchGapMs) - Date.now());
+          const waitMs = Math.min(untilRefresh, untilFallback, Math.max(0, deadline - Date.now()));
+          if (this._pushActive) {
+            const gotPush = await this._waitForPush(waitMs, shouldAbort, lastEpoch);
+            if (gotPush) {
+              lastEpoch = this._pushEpoch;
+              // Push arrived — postpone safety fallback fetch since push channel is actively delivering!
+              lastFallbackFetchAt = Date.now();
+            }
+          } else {
+            await sleepInterruptibly(Math.min(500, waitMs), shouldAbort);
+          }
+        }
+
+        // One final forced read right at the deadline so an OTP that arrived at the last second isn't missed!
+        if (!shouldAbort?.()) {
+          try {
+            const finalCandidates = await this._readOtpCandidatesUnlocked(cleanPhone, { forceFetch: true });
+            const fresh = finalCandidates.filter((c) => candidateIsNew(c, normBaseline));
+            const swiggy = fresh.find((c) =>
+              /swiggy|swgtns|toing/i.test(c.parsed.sender || '') ||
+              /swiggy|swgtns|toing/i.test(messageText(c.message) || '')
+            );
+            const chosen = swiggy || fresh[0] || null;
+            if (chosen) {
+              return {
+                ok: true,
+                code: chosen.parsed.code,
+                sender: chosen.parsed.sender || '',
+                elapsedMs: Date.now() - startedAt,
+              };
+            }
+          } catch {}
+        }
+
+        return {
+          ok: false,
+          code: '',
+          timeout: true,
+          attempts,
+          elapsedMs: Date.now() - startedAt,
+          error: lastError ? String(lastError?.message || lastError).slice(0, 160) : `OTP timeout (${Math.round(totalMs / 1000)}s)`,
+        };
+      } finally {
+        this.botPacer?.markOtpWaitEnd(this.profile.id);
+      }
     });
   }
 }
