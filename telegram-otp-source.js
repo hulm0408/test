@@ -648,10 +648,40 @@ async function loadTeleproto() {
     teleprotoPromise = Promise.all([
       import('teleproto'),
       import('teleproto/sessions'),
-    ]).then(([main, sessions]) => ({
-      TelegramClient: main.TelegramClient,
-      StringSession: sessions.StringSession,
-    }));
+      import('teleproto/tl/generated/api.js'),
+    ]).then(([main, sessions, apiMod]) => {
+      // ⚡ CodeSettings patch — Telegram login code SMS par aana zaroori hai.
+      // teleproto ke requestCode() me `new Api.CodeSettings({})` hardcoded hai,
+      // jisse server khud delivery type (app/call/SMS) decide karta hai.
+      // forceSMS sirf tab kaam karta hai jab server pehle se SMS offer karta hai.
+      // Is liye CodeSettings ko patch karke app/call/flashcall/firebase disable
+      // karte hain — sirf SMS remain karta hai.
+      try {
+        const CodeSettings = apiMod.Api?.CodeSettings;
+        if (CodeSettings && !CodeSettings.__smsPatched) {
+          const origCtor = CodeSettings;
+          CodeSettings.__smsPatched = true;
+          const patched = function CodeSettingsSmsOnly(...args) {
+            const inst = new origCtor(...args);
+            inst.allowAppHash = false;     // app delivery block
+            inst.allowMissedCall = false;  // missed call block
+            inst.allowFlashcall = false;   // flash call block
+            inst.allowFirebase = false;    // firebase delivery block
+            inst.appSandbox = false;
+            return inst;
+          };
+          patched.prototype = origCtor.prototype;
+          Object.assign(patched, origCtor);
+          apiMod.Api.CodeSettings = patched;
+        }
+      } catch {
+        // Patch fail to normal flow chale — forceSMS still try karega
+      }
+      return {
+        TelegramClient: main.TelegramClient,
+        StringSession: sessions.StringSession,
+      };
+    });
   }
   return teleprotoPromise;
 }
