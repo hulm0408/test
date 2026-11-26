@@ -81,7 +81,7 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
       stageLine ? `🔄 <b>Stages:</b> <code>${esc(stageLine)}</code>` : '',
       `📤 <b>Delivery Queue:</b> <code>${d.pending}</code> pending · <code>${d.sent}</code> sent · <code>${d.failed}</code> failed`,
       `🔑 <b>Toing Keys:</b> <code>${snap.toing.keysCount}</code> · <b>HTTP Gate:</b> <code>${snap.toing.semaphore.active}/${snap.toing.semaphore.limit}</code> (429: ${snap.toing.rateLimited429})`,
-      `🤖 <b>OTP Bot:</b> <code>${esc(cfg.defaultOtpBot)}</code> · <b>OTP Timeout:</b> <code>${Math.round(cfg.otpTimeoutMs / 1000)}s</code> · <b>Skip Registered:</b> <code>${cfg.skipRegistered !== false ? 'ON ✅' : 'OFF'}</code>`,
+      `🤖 <b>OTP Bot:</b> <code>${esc(cfg.defaultOtpBot)}</code> · <b>OTP Timeout:</b> <code>${Math.round(cfg.otpTimeoutMs / 1000)}s</code> · <b>Filter:</b> <code>${cfg.skipRegistered === true ? 'Fresh Only' : 'All Numbers ✅'}</code>`,
     ].filter(Boolean);
 
     const rows = [
@@ -360,7 +360,7 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     const lines = [
       `⚙️ <b>TOING CLUSTER SETTINGS</b>`,
       ``,
-      `🆕 Skip Already Registered: <b>${cfg.skipRegistered !== false ? 'ON ✅ (Only Fresh Numbers)' : 'OFF (Existing Allowed)'}</b>`,
+      `🆕 Skip Already Registered: <b>${cfg.skipRegistered === true ? 'ON (Fresh Only)' : 'OFF ✅ (New + Registered Sab Par OTP)'}</b>`,
       `🤖 Default OTP Bot: <code>${esc(cfg.defaultOtpBot)}</code> (🐘 ${botDist.hathi} | 📨 ${botDist.hermes} | 🔐 ${botDist.chauhan})`,
       `🔁 Auto-Failover & Pool Rotate: <b>${cfg.autoFailoverBots ? `ON (every ${cfg.poolRotateThreshold || 12} skips)` : 'OFF'}</b>`,
       `⏱ OTP Fast-Fail Timeout: <code>${Math.round(cfg.otpTimeoutMs / 1000)}s</code>`,
@@ -382,7 +382,7 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     const rows = [
       [
         Markup.button.callback(
-          `🆕 Skip Registered: ${cfg.skipRegistered !== false ? 'ON ✅' : 'OFF'}`,
+          `🆕 Skip Registered: ${cfg.skipRegistered === true ? 'ON' : 'OFF ✅'}`,
           'cfg_toggle_skip_reg'
         ),
         Markup.button.callback('🔀 Spread 3 Bots', 'cfg_spread_bots'),
@@ -1069,7 +1069,7 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
   });
 
   bot.action('cfg_toggle_skip_reg', async (ctx) => {
-    const next = !(getRuntimeConfig().skipRegistered !== false);
+    const next = !(getRuntimeConfig().skipRegistered === true);
     db.setSetting('skipRegistered', next);
     if (!next) slotManager.clearAllLocalExcludes();
     await ctx.answerCbQuery(`🆕 Skip Registered: ${next ? 'ON' : 'OFF'}`).catch(() => {});

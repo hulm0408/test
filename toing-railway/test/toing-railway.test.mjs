@@ -1545,4 +1545,109 @@ test('20. selectLatestFreshNumberCard finds brand-new card id > cursorId even if
   assert.equal(sel.result.card.phone, '9876543219');
 });
 
+test('21. Default config (filter OFF) sends OTP & exports BOTH new and already-registered numbers', async () => {
+  const dir = makeTmpDir();
+  try {
+    const db = new ToingDb({
+      dbPath: path.join(dir, 'toing.db'),
+      dataDir: dir,
+      encryptionKey: 'all-num-filter-off-key',
+      sessionsDir: path.join(dir, 'sessions'),
+    });
+    const added = db.addAccount({
+      label: 'AllNumSlot',
+      session: '1BVtsMOCK_ALL_NUMBERS_FILTER_OFF_SESSION_00001',
+      otpBotProfile: 'hathi',
+    });
+    const acc = db.getAccountById(added.id, { includeSession: true });
+
+    // Pre-populate one old already_registered row AND one extracted row
+    db.markNumberUsed('9111111111', { status: 'already_registered', slotId: 99, cooldownDays: 30, source: 'old_filter' });
+    db.markNumberUsed('9000000000', { status: 'extracted', slotId: 99, cooldownDays: 30, source: 'signup' });
+
+    const sentPhones = [];
+    const verifyPayloads = [];
+    const phoneQueue = [
+      '9000000000', // already extracted -> still skipped so we don't duplicate an already-exported session
+      '9111111111', // previously marked already_registered + check_mobile registered=true -> MUST STILL GET OTP (is_new=false)!
+      '9222222222', // brand new (registered=false) -> MUST GET OTP (is_new=true)!
+      '9333333333', // check_mobile returns 502 error -> MUST STILL GET OTP (defaults is_new=false)!
+    ];
+
+    const toingClient = {
+      async checkMobile(mobile) {
+        if (mobile === '9111111111') return { ok: true, registered: true, isNew: false, key: 'K1' };
+        if (mobile === '9222222222') return { ok: true, registered: false, isNew: true, key: 'K1' };
+        return { ok: false, registered: null, isNew: false, error: 'HTTP 502 Bad Gateway' };
+      },
+      async sendOtp(mobile) {
+        sentPhones.push(mobile);
+        return { ok: true, sid: `sid-${mobile}`, tid: `tid-${mobile}`, deviceId: `dev-${mobile}`, key: 'K1', mobile };
+      },
+      async verifyOtp(payload) {
+        verifyPayloads.push(payload);
+        return { ok: true, key: 'K1', data: { success: true } };
+      },
+      async exportAccount(mobile, { otpState }) {
+        return {
+          ok: true,
+          fallback: false,
+          exportObj: { mobile, name: 'Test', token: `tok-${mobile}`, sid: otpState.sid, tid: otpState.tid, deviceId: otpState.deviceId, customerId: '1' },
+        };
+      },
+    };
+
+    const worker = new SlotWorker({
+      account: acc,
+      db,
+      toingClient,
+      // skipRegistered omitted (default OFF!)
+      getRuntimeConfig: () => ({
+        telegramApiId: 12345,
+        telegramApiHash: 'hash',
+        claimTimeoutMs: 2_000,
+        claimLockTtlMs: 60_000,
+        otpTimeoutMs: 500,
+        otpRefreshMs: 100,
+        usedCooldownDays: 30,
+        deliveryChatId: '6484999726',
+        slotJitterMinMs: 0,
+        slotJitterMaxMs: 0,
+      }),
+      clientFactory: () => ({
+        connected: false,
+        async connect() { this.connected = true; return { ok: true, me: 'AllNum' }; },
+        async disconnect() { this.connected = false; },
+        setBotProfile() {},
+        async claimFreshNumber() {
+          const next = phoneQueue.shift();
+          return next ? { ok: true, phone: next, card: { phone: next } } : { ok: false, reason: 'queue_empty' };
+        },
+        async captureOtpWatermark() { return { ids: [], codes: [], ts: Date.now(), afterMs: Date.now(), messageId: 1 }; },
+        async waitForOtp() { return { ok: true, code: '654321', sender: 'SWIGGY', elapsedMs: 100 }; },
+      }),
+    });
+
+    await worker._runSingleCycle(); // skips 9000000000 (extracted), processes 9111111111 (registered=true)
+    await worker._runSingleCycle(); // processes 9222222222 (registered=false)
+    await worker._runSingleCycle(); // processes 9333333333 (check_mobile failed)
+
+    assert.deepEqual(sentPhones, ['9111111111', '9222222222', '9333333333']);
+    assert.deepEqual(
+      verifyPayloads.map((p) => ({ mobile: p.mobile, isNew: p.isNew })),
+      [
+        { mobile: '9111111111', isNew: false },
+        { mobile: '9222222222', isNew: true },
+        { mobile: '9333333333', isNew: false },
+      ]
+    );
+    assert.equal(db.getThroughputStats().totalSessions, 3);
+
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+
 

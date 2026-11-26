@@ -307,7 +307,7 @@ export class SlotWorker {
   async _claimLockedPhone(cfg) {
     const excludeSet = new Set(this.localExcludes);
     const maxFastSkips = 14;
-    const ignoreAlreadyRegistered = cfg.skipRegistered === false;
+    const ignoreAlreadyRegistered = cfg.skipRegistered !== true;
 
     for (let skip = 0; skip < maxFastSkips; skip++) {
       if (this._isAborted()) return { ok: false, aborted: true };
@@ -476,18 +476,20 @@ export class SlotWorker {
       lockedPhone = claimed.phone;
       this.attemptsInRun += 1;
 
-      // 2. CHECK REGISTRATION STATUS *FIRST* (before watermark RPC & BEFORE send_otp!)
-      // Already-registered numbers are skipped in ~200ms with ZERO OTPs sent & ZERO wasted TG RPCs!
-      this._setStage('checking', lockedPhone);
-      this.db.updateClaimStage(lockedPhone, this.account.id, 'checking');
+      const skipRegistered = cfg.skipRegistered === true;
+      let checkRes = null;
+      let watermark = null;
 
-      const checkRes = await this.toingClient.checkMobile(lockedPhone, {
-        shouldAbort: () => this._isAborted(),
-      });
-      if (checkRes?.aborted || this._isAborted()) return;
-
-      const skipRegistered = cfg.skipRegistered !== false;
       if (skipRegistered) {
+        // Optional filter ON: check registration status BEFORE watermark RPC & BEFORE send_otp
+        this._setStage('checking', lockedPhone);
+        this.db.updateClaimStage(lockedPhone, this.account.id, 'checking');
+
+        checkRes = await this.toingClient.checkMobile(lockedPhone, {
+          shouldAbort: () => this._isAborted(),
+        });
+        if (checkRes?.aborted || this._isAborted()) return;
+
         if (!checkRes?.ok) {
           this.db.recordMetric(this.account.id, 'check_mobile_fail', Date.now() - cycleStart);
           this.lastError = `check_mobile: ${checkRes?.error || 'failed'}`.slice(0, 180);
@@ -525,18 +527,31 @@ export class SlotWorker {
           this._lastCycleWasFastSkip = true;
           return;
         }
+
+        this._setStage('sending_otp', lockedPhone);
+        this.db.updateClaimStage(lockedPhone, this.account.id, 'sending_otp');
+        watermark = await this.client.captureOtpWatermark(lockedPhone);
+        if (this._isAborted()) return;
+      } else {
+        // Default (NO registered filter): BOTH NEW and ALREADY REGISTERED numbers get OTP!
+        // Run check_mobile (only for is_new flag, non-fatal) + OTP watermark in parallel for max speed.
+        this._setStage('sending_otp', lockedPhone);
+        this.db.updateClaimStage(lockedPhone, this.account.id, 'sending_otp');
+
+        const [chk, wm] = await Promise.all([
+          this.toingClient.checkMobile(lockedPhone, {
+            shouldAbort: () => this._isAborted(),
+          }).catch(() => ({ ok: false, registered: null, isNew: false, key: '' })),
+          this.client.captureOtpWatermark(lockedPhone),
+        ]);
+        if (chk?.aborted || this._isAborted()) return;
+        checkRes = chk;
+        watermark = wm;
       }
 
       const isNew = Boolean(checkRes?.isNew);
 
-      // 3. Number is verified FRESH (or skipRegistered=false) -> capture OTP watermark BEFORE send_otp!
-      this._setStage('sending_otp', lockedPhone);
-      this.db.updateClaimStage(lockedPhone, this.account.id, 'sending_otp');
-
-      const watermark = await this.client.captureOtpWatermark(lockedPhone);
-      if (this._isAborted()) return;
-
-      console.log(`[Slot #${this.account.slotNo}] 📨 SEND_OTP ${lockedPhone} | ${isNew ? 'FRESH ✅' : 'EXISTING'} | bot=${this.otpBotProfile}${claimed.reusedOnScreen ? ' (on-screen)' : ''}`);
+      console.log(`[Slot #${this.account.slotNo}] 📨 SEND_OTP ${lockedPhone} | ${isNew ? 'FRESH ✅' : 'EXISTING ✅'} | bot=${this.otpBotProfile}${claimed.reusedOnScreen ? ' (on-screen)' : ''}`);
 
       const sendRes = await this.toingClient.sendOtp(lockedPhone, {
         shouldAbort: () => this._isAborted(),
@@ -545,7 +560,7 @@ export class SlotWorker {
       if (sendRes.aborted || this._isAborted()) return;
 
       if (!sendRes.ok) {
-        if (sendRes.alreadyRegistered) {
+        if (skipRegistered && sendRes.alreadyRegistered) {
           const skippedPhone = lockedPhone;
           this.consecutivePoolSkips += 1;
           this.db.markNumberUsed(skippedPhone, {
