@@ -34,19 +34,12 @@ export async function loadTeleproto() {
       import('teleproto'),
       import('teleproto/sessions'),
       import('teleproto/tl/generated/api.js'),
-    ]).then(([main, sessions, apiMod]) => {
-      // Quiet down noisy MTProto info logs when 50 clients run in parallel
-      try {
-        const Logger = main.Logger || main.default?.Logger;
-        if (Logger?.setLevel) Logger.setLevel('error');
-      } catch {}
-
-      return {
-        TelegramClient: main.TelegramClient,
-        StringSession: sessions.StringSession,
-        apiMod,
-      };
-    });
+    ]).then(([main, sessions, apiMod]) => ({
+      TelegramClient: main.TelegramClient,
+      Logger: main.Logger || main.default?.Logger || null,
+      StringSession: sessions.StringSession,
+      apiMod,
+    }));
   }
   return teleprotoPromise;
 }
@@ -139,22 +132,51 @@ export class TelegramSlotClient {
       throw new Error('SESSION_INVALID: empty session');
     }
 
-    if (this.client && this.connected) {
-      const looksUp = this.client.connected !== false && !this.client.disconnected;
-      if (looksUp) return this.client;
+    if (this.client) {
+      // If teleproto autoReconnect is mid-flight, wait briefly instead of tearing down!
+      if (this.client._sender?.isReconnecting || this.client._sender?.isConnecting) {
+        const waitEnd = Date.now() + 4_000;
+        while (Date.now() < waitEnd) {
+          if (this.client.connected && !this.client.disconnected) {
+            this.connected = true;
+            return this.client;
+          }
+          await sleep(150);
+        }
+      }
+
+      if (this.connected && this.client.connected !== false && !this.client.disconnected) {
+        return this.client;
+      }
+
+      // Reuse existing non-destroyed client via connect() before creating a brand-new instance
+      if (!this.client._destroyed) {
+        try {
+          await Promise.race([
+            this.client.connect(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('TIMEOUT: MTProto reconnect timed out (15s)')), 15_000)),
+          ]);
+          if (this.client.connected && !this.client.disconnected) {
+            this.connected = true;
+            return this.client;
+          }
+        } catch {}
+      }
     }
 
     await this._disconnectUnlocked();
 
-    const { TelegramClient, StringSession } = await loadTeleproto();
+    const { TelegramClient, StringSession, Logger } = await loadTeleproto();
+    const baseLogger = typeof Logger === 'function' ? new Logger('error') : undefined;
     const client = new TelegramClient(new StringSession(this._session), this.apiId, this.apiHash, {
       connectionRetries: 2,
       requestRetries: 1,
       autoReconnect: true,
-      reconnectRetries: 2,
+      reconnectRetries: 3,
       floodSleepThreshold: 15,
       // Crucial for 50 parallel accounts: skip background update loop overhead
       receiveUpdates: false,
+      ...(baseLogger ? { baseLogger } : {}),
       deviceModel: `ToingWorker-${this.slotNo}`,
       systemVersion: process.version,
       appVersion: '2.0.0',
@@ -185,6 +207,7 @@ export class TelegramSlotClient {
     this.connected = true;
     this.entity = null;
     this.entityUsername = '';
+    console.log(`[Slot #${this.slotNo}] 🔌 Connected (${this.meLabel || this.label}) | bot=@${this.profile.username}`);
     return client;
   }
 
@@ -302,6 +325,27 @@ export class TelegramSlotClient {
     return null;
   }
 
+  async _safeClickButton(entry) {
+    try {
+      const answer = await entry.button.click({});
+      return {
+        clicked: true,
+        callbackMessage: String(answer?.message || '').trim().slice(0, 160),
+      };
+    } catch (err) {
+      const pool = `${err?.errorMessage || ''} ${err?.message || err || ''}`;
+      if (/(BOT_RESPONSE_TIMEOUT|QUERY_ID_INVALID|MESSAGE_NOT_MODIFIED)/i.test(pool)) {
+        // Callback reached Telegram; OTP bot simply took >5s to answer toast or card unchanged
+        return { clicked: true, softTimeout: true, callbackMessage: pool.trim().slice(0, 80) };
+      }
+      if (/(MESSAGE_ID_INVALID|BUTTON_INVALID|BUTTON_NOT_FOUND|DATA_INVALID)/i.test(pool)) {
+        return { clicked: false, reason: pool.trim().slice(0, 80) };
+      }
+      this._invalidateIfConnectionError(err);
+      throw err;
+    }
+  }
+
   async _clickLatestButtonUnlocked({ mode = 'claim', phone = '' } = {}) {
     const screen = await this._latestScreenUnlocked(6);
     if (!screen) return { ok: false, reason: 'no-latest-screen' };
@@ -322,7 +366,15 @@ export class TelegramSlotClient {
     }
 
     const entry = screen.entries[action.buttonIndex];
-    const answer = await entry.button.click({});
+    const clickRes = await this._safeClickButton(entry);
+    if (!clickRes.clicked) {
+      return {
+        ok: false,
+        reason: clickRes.reason || 'button-click-invalid',
+        messageId: messageId(screen.message),
+        cardPhone: screen.card?.phone || '',
+      };
+    }
     return {
       ok: true,
       role: action.role,
@@ -330,7 +382,8 @@ export class TelegramSlotClient {
       screenSignature: messageSignature(screen.message),
       buttonText: entry.text,
       cardPhone: screen.card?.phone || '',
-      callbackMessage: String(answer?.message || '').trim().slice(0, 160),
+      callbackMessage: clickRes.callbackMessage || '',
+      softTimeout: Boolean(clickRes.softTimeout),
     };
   }
 
@@ -342,40 +395,51 @@ export class TelegramSlotClient {
 
   // Claim a fresh phone number card from this slot's OTP bot.
   async claimFreshNumber({
-    forceNew = true,
+    forceNew = false,
     excludePhones = new Set(),
-    timeoutMs = 15_000,
+    timeoutMs = 16_000,
     shouldAbort = null,
   } = {}) {
     return this._withSlotLock(async () => {
-      const deadline = Date.now() + Math.max(4_000, Number(timeoutMs) || 15_000);
+      const deadline = Date.now() + Math.max(4_000, Number(timeoutMs) || 16_000);
       const remaining = () => Math.max(0, deadline - Date.now());
+      const excludedPhonesSeen = [];
 
+      // If forceNew=false, reuse an untouched fresh card ALREADY sitting on screen (0 wasted numbers!)
       if (!forceNew) {
-        const msgs = await this._fetchIncomingUnlocked(8);
+        const msgs = await this._fetchIncomingUnlocked(6);
         const sel = selectLatestFreshNumberCard(msgs, { excludePhones });
         if (sel.status === 'fresh') {
           this.currentCardMessageId = messageId(sel.result.message);
           this.currentPhone = sel.result.card.phone;
           this._trackMessageId(this.currentCardMessageId);
-          return { ok: true, phone: sel.result.card.phone, card: sel.result.card, messageId: this.currentCardMessageId };
+          return {
+            ok: true,
+            phone: sel.result.card.phone,
+            card: sel.result.card,
+            messageId: this.currentCardMessageId,
+            reusedOnScreen: true,
+            excludedPhonesSeen,
+          };
         }
       }
 
-      const currentSigs = async () => new Set((await this._fetchIncomingUnlocked(12)).map(messageSignature));
+      const currentSigs = async () => new Set((await this._fetchIncomingUnlocked(10)).map(messageSignature));
       let baselineSignatures = await currentSigs();
       let cursor = { afterMessageId: 0, afterSignature: '', afterPhone: '' };
       let sentStart = false;
+      let lastFailureReason = 'claim_timeout';
 
-      for (let cycle = 0; cycle < 3 && remaining() > 500; cycle++) {
-        if (shouldAbort?.()) return { ok: false, aborted: true };
+      for (let cycle = 0; cycle < 3 && remaining() > 600; cycle++) {
+        if (shouldAbort?.()) return { ok: false, aborted: true, excludedPhonesSeen };
 
         const clicked = await this._clickLatestButtonUnlocked({ mode: 'claim' });
         if (!clicked.ok) {
-          if (sentStart || remaining() <= 1_500) break;
+          lastFailureReason = clicked.reason || 'no-claim-button';
+          if (sentStart || remaining() <= 1_800) break;
           sentStart = true;
           await this._sendStartUnlocked();
-          await sleepInterruptibly(Math.min(800, remaining()), shouldAbort);
+          await sleepInterruptibly(Math.min(1_000, remaining()), shouldAbort);
           baselineSignatures = await currentSigs();
           continue;
         }
@@ -386,11 +450,15 @@ export class TelegramSlotClient {
           afterPhone: clicked.cardPhone || '',
         };
 
-        const waitBudget = cycle === 2 ? remaining() : Math.min(6_500, remaining());
+        // Generous first-click wait (up to 11s) so slow OTP bots finish replying instead of
+        // double-clicking NEW NUMBER and throwing away the first number!
+        const waitBudget = cycle === 0 ? Math.min(11_000, remaining()) : Math.min(6_500, remaining());
         const waitEnd = Date.now() + waitBudget;
+        let sawExcludedReply = false;
+
         while (Date.now() < waitEnd) {
-          if (shouldAbort?.()) return { ok: false, aborted: true };
-          const msgs = await this._fetchIncomingUnlocked(12);
+          if (shouldAbort?.()) return { ok: false, aborted: true, excludedPhonesSeen };
+          const msgs = await this._fetchIncomingUnlocked(10);
           const sel = selectLatestFreshNumberCard(msgs, {
             baselineSignatures,
             excludePhones,
@@ -405,29 +473,40 @@ export class TelegramSlotClient {
               phone: sel.result.card.phone,
               card: sel.result.card,
               messageId: this.currentCardMessageId,
+              reusedOnScreen: false,
+              excludedPhonesSeen,
             };
           }
-          await sleepInterruptibly(Math.min(600, Math.max(0, waitEnd - Date.now())), shouldAbort);
+          // Bot already replied with a brand-new card, but its phone is in excludePhones ->
+          // stop waiting immediately and request the next number!
+          if (sel.status === 'excluded-latest' && sel.result?.card?.phone) {
+            const dupPhone = sel.result.card.phone;
+            if (!excludedPhonesSeen.includes(dupPhone)) excludedPhonesSeen.push(dupPhone);
+            lastFailureReason = 'bot_returned_excluded';
+            sawExcludedReply = true;
+            break;
+          }
+          await sleepInterruptibly(Math.min(550, Math.max(0, waitEnd - Date.now())), shouldAbort);
         }
 
-        if (shouldAbort?.() || remaining() <= 500) return { ok: false, aborted: Boolean(shouldAbort?.()), reason: 'claim_timeout' };
+        if (shouldAbort?.() || remaining() <= 600) {
+          return {
+            ok: false,
+            aborted: Boolean(shouldAbort?.()),
+            reason: lastFailureReason,
+            excludedPhonesSeen,
+          };
+        }
 
         baselineSignatures = await currentSigs();
-        const latestMsgs = await this._fetchIncomingUnlocked(8);
-        const latestAny = selectLatestFreshNumberCard(latestMsgs, { excludePhones: new Set() });
-        if (latestAny.status === 'fresh' && excludePhones.has(latestAny.result.card.phone)) {
-          // Bot gave an excluded phone — loop immediately to click NEW NUMBER again
+        if (sawExcludedReply) {
+          await sleepInterruptibly(Math.min(350, remaining()), shouldAbort);
           continue;
         }
-        if (!sentStart && cycle === 0 && remaining() > 2_000) {
-          sentStart = true;
-          await this._sendStartUnlocked();
-          await sleepInterruptibly(Math.min(800, remaining()), shouldAbort);
-          baselineSignatures = await currentSigs();
-        }
+        lastFailureReason = 'claim_timeout';
       }
 
-      return { ok: false, reason: 'claim_timeout' };
+      return { ok: false, reason: lastFailureReason, excludedPhonesSeen };
     });
   }
 
@@ -514,12 +593,12 @@ export class TelegramSlotClient {
           if (!fallbackEntry) fallbackEntry = matchEntry;
           continue;
         }
-        await matchEntry.button.click({});
-        return { ok: true, via: 'click' };
+        const clickRes = await this._safeClickButton(matchEntry);
+        if (clickRes.clicked) return { ok: true, via: 'click' };
       }
       if (fallbackEntry && attempt >= 2) {
-        await fallbackEntry.button.click({});
-        return { ok: true, via: 'click-fallback' };
+        const clickRes = await this._safeClickButton(fallbackEntry);
+        if (clickRes.clicked) return { ok: true, via: 'click-fallback' };
       }
     } catch (err) {
       this._invalidateIfConnectionError(err);
@@ -619,6 +698,7 @@ export class TelegramSlotClient {
         code: '',
         timeout: true,
         attempts,
+        elapsedMs: Date.now() - startedAt,
         error: lastError ? String(lastError?.message || lastError).slice(0, 160) : `OTP timeout (${Math.round(totalMs / 1000)}s)`,
       };
     });
@@ -693,12 +773,14 @@ export async function loginInteractiveSession({
   if (!apiId || !apiHash) {
     throw new Error('TELEGRAM_API_ID / TELEGRAM_API_HASH env me set karo (my.telegram.org).');
   }
-  const { TelegramClient, StringSession } = await loadTeleproto();
+  const { TelegramClient, StringSession, Logger } = await loadTeleproto();
+  const baseLogger = typeof Logger === 'function' ? new Logger('error') : undefined;
   const client = new TelegramClient(new StringSession(''), Number(apiId), String(apiHash), {
     connectionRetries: 3,
     requestRetries: 2,
     autoReconnect: true,
     receiveUpdates: false,
+    ...(baseLogger ? { baseLogger } : {}),
     deviceModel: 'Desktop',
     systemVersion: 'Linux',
     appVersion: '5.10.0',
@@ -778,13 +860,15 @@ export async function loginQrSession({ apiId, apiHash, callbacks, abortSignal = 
   if (!apiId || !apiHash) {
     throw new Error('TELEGRAM_API_ID / TELEGRAM_API_HASH env me set karo (my.telegram.org).');
   }
-  const { TelegramClient, StringSession } = await loadTeleproto();
+  const { TelegramClient, StringSession, Logger } = await loadTeleproto();
+  const baseLogger = typeof Logger === 'function' ? new Logger('error') : undefined;
   // receiveUpdates MUST be true for QR login so UpdateLoginToken arrives immediately on scan!
   const client = new TelegramClient(new StringSession(''), Number(apiId), String(apiHash), {
     connectionRetries: 3,
     requestRetries: 2,
     autoReconnect: true,
     receiveUpdates: true,
+    ...(baseLogger ? { baseLogger } : {}),
     deviceModel: 'Desktop',
     systemVersion: 'Linux',
     appVersion: '5.10.0',

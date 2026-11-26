@@ -57,7 +57,7 @@ export class SlotManager {
       try { this.db.pruneOldMetrics(); } catch {}
     }
 
-    const activeStages = new Set(['connecting', 'claiming', 'sending_otp', 'waiting_otp', 'verifying', 'exporting']);
+    const activeStages = new Set(['connecting', 'claiming', 'checking', 'sending_otp', 'waiting_otp', 'verifying', 'exporting']);
     for (const worker of this.workers.values()) {
       if (!worker.running) continue;
       if (!activeStages.has(worker.stage)) continue;

@@ -3,7 +3,7 @@
 //   claim number -> atomic SQLite lock -> parallel (check_mobile + watermark)
 //   -> send_otp -> poll OTP -> verify_otp -> export -> atomic DB commit + delivery queue
 
-import { classifyTelegramError } from './telegram-health.js';
+import { classifyTelegramError, isConnectionError } from './telegram-health.js';
 import { nextFailoverProfileId } from './otp-profiles.js';
 import { TelegramSlotClient } from './telegram-slot-client.js';
 
@@ -45,6 +45,33 @@ export class SlotWorker {
     this.localExcludes = [];
     this.createdInRun = 0;
     this.attemptsInRun = 0;
+    this._lastCycleWasFastSkip = false;
+  }
+
+  _logNumberEvent({ phone = '', outcome = 'skip', reason = 'unknown', detail = '', durationMs = 0, logConsole = true } = {}) {
+    try {
+      this.db.recordNumberEvent?.({
+        slotId: this.account.id,
+        slotNo: this.account.slotNo,
+        phone,
+        otpBot: this.otpBotProfile,
+        outcome,
+        reason,
+        detail,
+        durationMs,
+      });
+    } catch {}
+
+    if (!logConsole) return;
+    const tag = `[Slot #${this.account.slotNo}]`;
+    const p = phone || '-';
+    if (outcome === 'skip') {
+      console.log(`${tag} ⏭ SKIP ${p} | reason=${reason} | ${detail}`);
+    } else if (outcome === 'drop') {
+      console.warn(`${tag} ❌ DROP ${p} | reason=${reason} | ${detail}`);
+    } else if (outcome === 'claim_fail') {
+      console.warn(`${tag} ⚠️ CLAIM_FAIL | bot=${this.otpBotProfile} | reason=${reason} | ${detail}`);
+    }
   }
 
   _setStage(stage, phone = undefined) {
@@ -162,6 +189,7 @@ export class SlotWorker {
     const classified = classifyTelegramError(err);
     const now = Date.now();
     this.lastError = `${classified.label}: ${classified.raw}`.slice(0, 200);
+    console.warn(`[Slot #${this.account.slotNo}] ⚠️ TG_ERROR | code=${classified.code} | kind=${classified.kind} | ${classified.raw}`);
 
     if (classified.fatal || classified.healthStatus === 'dead') {
       this.healthStatus = 'dead';
@@ -232,18 +260,32 @@ export class SlotWorker {
 
   async _claimLockedPhone(cfg) {
     const excludeSet = new Set(this.localExcludes);
-    const maxFastSkips = 6;
+    const maxFastSkips = 8;
 
     for (let skip = 0; skip < maxFastSkips; skip++) {
       if (this._isAborted()) return { ok: false, aborted: true };
       this._setStage('claiming', '');
 
+      // On first attempt (skip === 0), pass forceNew=false so an untouched fresh card
+      // ALREADY sitting on screen is used immediately (0 wasted numbers!).
+      // Once we skip a card, forceNew=true requests a new number from the OTP bot.
       const claimRes = await this.client.claimFreshNumber({
-        forceNew: true,
+        forceNew: skip > 0,
         excludePhones: excludeSet,
         timeoutMs: cfg.claimTimeoutMs,
         shouldAbort: () => this._isAborted(),
       });
+
+      if (Array.isArray(claimRes?.excludedPhonesSeen)) {
+        for (const dupPhone of claimRes.excludedPhonesSeen) {
+          this._logNumberEvent({
+            phone: dupPhone,
+            outcome: 'skip',
+            reason: 'bot_duplicate',
+            detail: 'OTP bot ne wahi number dobara diya jo ye slot pehle dekh chuka hai',
+          });
+        }
+      }
 
       if (claimRes.aborted || this._isAborted()) return { ok: false, aborted: true };
       if (!claimRes.ok || !claimRes.phone) {
@@ -254,13 +296,37 @@ export class SlotWorker {
       const lockRes = this.db.tryClaimPhone(phone, this.account.id, { ttlMs: cfg.claimLockTtlMs });
       if (lockRes.ok) {
         this._rememberExclude(phone);
-        return { ok: true, phone, card: claimRes.card };
+        return { ok: true, phone, card: claimRes.card, reusedOnScreen: Boolean(claimRes.reusedOnScreen) };
       }
 
-      // Duplicate / cooldown / already in-flight on another slot -> instant fast-skip!
+      // Duplicate / cooldown / already in-flight on another slot -> explicit reason log + fast-skip!
       excludeSet.add(phone);
       this._rememberExclude(phone);
       this.db.recordMetric(this.account.id, 'duplicate_skip', 0);
+
+      if (lockRes.reason === 'cooldown') {
+        const sub = lockRes.status || 'used';
+        this._logNumberEvent({
+          phone,
+          outcome: 'skip',
+          reason: 'used_cooldown',
+          detail: `pehle ${sub} list me hai (cooldown active) — OTP nahi bheja`,
+        });
+      } else if (lockRes.reason === 'in_flight') {
+        this._logNumberEvent({
+          phone,
+          outcome: 'skip',
+          reason: 'in_flight',
+          detail: `doosra slot (id=${lockRes.bySlot}) abhi process kar raha hai — OTP nahi bheja`,
+        });
+      } else {
+        this._logNumberEvent({
+          phone,
+          outcome: 'skip',
+          reason: lockRes.reason || 'claim_rejected',
+          detail: 'SQLite claim guard ne reject kiya — OTP nahi bheja',
+        });
+      }
     }
 
     return { ok: false, reason: 'all_claimed_duplicates' };
@@ -270,6 +336,7 @@ export class SlotWorker {
     const cfg = this.getRuntimeConfig();
     const cycleStart = Date.now();
     let lockedPhone = '';
+    this._lastCycleWasFastSkip = false;
 
     try {
       await this._ensureClientConnected();
@@ -282,6 +349,13 @@ export class SlotWorker {
       if (!claimed.ok) {
         this.consecutiveClaimFails += 1;
         this.db.recordMetric(this.account.id, 'claim_fail', Date.now() - cycleStart);
+        this._logNumberEvent({
+          phone: '',
+          outcome: 'claim_fail',
+          reason: claimed.reason || 'claim_empty',
+          detail: `consecutive_fails=${this.consecutiveClaimFails}`,
+          durationMs: Date.now() - cycleStart,
+        });
 
         // Optional OTP bot auto-failover if current bot is empty/stuck
         if (cfg.autoFailoverBots && this.consecutiveClaimFails >= 5) {
@@ -300,21 +374,67 @@ export class SlotWorker {
       this.consecutiveClaimFails = 0;
       lockedPhone = claimed.phone;
       this.attemptsInRun += 1;
-      this._setStage('sending_otp', lockedPhone);
-      this.db.updateClaimStage(lockedPhone, this.account.id, 'sending_otp');
 
-      // 2. CRITICAL SPEED & CONSISTENCY FIX:
-      // Run check_mobile + captureOtpWatermark IN PARALLEL *BEFORE* send_otp!
-      // Saves 1-2s every signup AND guarantees fast 1s OTPs are NEVER ignored!
-      const [checkRes, watermark] = await Promise.all([
-        this.toingClient.checkMobile(lockedPhone, { shouldAbort: () => this._isAborted() }),
-        this.client.captureOtpWatermark(lockedPhone),
-      ]);
-      if (this._isAborted()) return;
+      // 2. CHECK REGISTRATION STATUS *FIRST* (before watermark RPC & BEFORE send_otp!)
+      // Already-registered numbers are skipped in ~200ms with ZERO OTPs sent & ZERO wasted TG RPCs!
+      this._setStage('checking', lockedPhone);
+      this.db.updateClaimStage(lockedPhone, this.account.id, 'checking');
+
+      const checkRes = await this.toingClient.checkMobile(lockedPhone, {
+        shouldAbort: () => this._isAborted(),
+      });
+      if (checkRes?.aborted || this._isAborted()) return;
+
+      const skipRegistered = cfg.skipRegistered !== false;
+      if (skipRegistered) {
+        if (!checkRes?.ok) {
+          this.db.recordMetric(this.account.id, 'check_mobile_fail', Date.now() - cycleStart);
+          this.lastError = `check_mobile: ${checkRes?.error || 'failed'}`.slice(0, 180);
+          this._logNumberEvent({
+            phone: lockedPhone,
+            outcome: 'skip',
+            reason: 'check_mobile_failed',
+            detail: `${checkRes?.error || 'unknown status'} — safe skip (OTP nahi bheja)`,
+            durationMs: Date.now() - cycleStart,
+          });
+          this._setStage('backoff', '');
+          await this._sleepInterruptible(500);
+          return;
+        }
+
+        if (checkRes.registered === true) {
+          const skippedPhone = lockedPhone;
+          this.db.markNumberUsed(skippedPhone, {
+            status: 'already_registered',
+            slotId: this.account.id,
+            cooldownDays: cfg.usedCooldownDays,
+            source: 'toing_check',
+          });
+          lockedPhone = ''; // claim already released inside markNumberUsed TX
+          this.db.recordMetric(this.account.id, 'already_registered_skip', Date.now() - cycleStart);
+          this._logNumberEvent({
+            phone: skippedPhone,
+            outcome: 'skip',
+            reason: 'already_registered',
+            detail: checkRes.message || 'Already Registered on Toing — turant skip (OTP nahi bheja)',
+            durationMs: Date.now() - cycleStart,
+          });
+          this._lastCycleWasFastSkip = true;
+          return;
+        }
+      }
 
       const isNew = Boolean(checkRes?.isNew);
 
-      // 3. Send OTP via Toing Pro
+      // 3. Number is verified FRESH (or skipRegistered=false) -> capture OTP watermark BEFORE send_otp!
+      this._setStage('sending_otp', lockedPhone);
+      this.db.updateClaimStage(lockedPhone, this.account.id, 'sending_otp');
+
+      const watermark = await this.client.captureOtpWatermark(lockedPhone);
+      if (this._isAborted()) return;
+
+      console.log(`[Slot #${this.account.slotNo}] 📨 SEND_OTP ${lockedPhone} | ${isNew ? 'FRESH ✅' : 'EXISTING'} | bot=${this.otpBotProfile}${claimed.reusedOnScreen ? ' (on-screen)' : ''}`);
+
       const sendRes = await this.toingClient.sendOtp(lockedPhone, {
         shouldAbort: () => this._isAborted(),
         preferredKey: checkRes?.key || '',
@@ -322,10 +442,38 @@ export class SlotWorker {
       if (sendRes.aborted || this._isAborted()) return;
 
       if (!sendRes.ok) {
+        if (sendRes.alreadyRegistered) {
+          const skippedPhone = lockedPhone;
+          this.db.markNumberUsed(skippedPhone, {
+            status: 'already_registered',
+            slotId: this.account.id,
+            cooldownDays: cfg.usedCooldownDays,
+            source: 'toing_send_otp',
+          });
+          lockedPhone = '';
+          this.db.recordMetric(this.account.id, 'already_registered_skip', Date.now() - cycleStart);
+          this._logNumberEvent({
+            phone: skippedPhone,
+            outcome: 'skip',
+            reason: 'already_registered',
+            detail: sendRes.reason || 'Already Registered (send_otp response)',
+            durationMs: Date.now() - cycleStart,
+          });
+          this._lastCycleWasFastSkip = true;
+          return;
+        }
+
         this.consecutiveSendFails += 1;
         this.db.incrementAccountAttempt(this.account.id, { failed: true });
         this.db.recordMetric(this.account.id, 'send_otp_fail', Date.now() - cycleStart);
         this.lastError = `send_otp: ${sendRes.reason || 'failed'}`.slice(0, 180);
+        this._logNumberEvent({
+          phone: lockedPhone,
+          outcome: 'drop',
+          reason: 'send_otp_failed',
+          detail: `${sendRes.reason || 'Toing send_otp failed'}${sendRes.status ? ` (HTTP ${sendRes.status})` : ''}`,
+          durationMs: Date.now() - cycleStart,
+        });
         this._setStage('backoff', '');
         await this._sleepInterruptible(Math.min(4_000, 600 * this.consecutiveSendFails));
         return;
@@ -345,9 +493,28 @@ export class SlotWorker {
       if (otpRes.aborted || this._isAborted()) return;
 
       if (!otpRes.ok || !/^\d{6}$/.test(String(otpRes.code || ''))) {
+        const timedOutPhone = lockedPhone;
         this.db.incrementAccountAttempt(this.account.id, { failed: true });
         this.db.recordMetric(this.account.id, 'otp_timeout', Date.now() - cycleStart);
-        this.lastError = `OTP timeout on ${lockedPhone}`;
+        this.lastError = `OTP timeout on ${timedOutPhone}`;
+        const elapsedSec = ((otpRes.elapsedMs || cfg.otpTimeoutMs) / 1000).toFixed(1);
+        const coolMin = Number(cfg.otpTimeoutCooldownMin ?? 10);
+        if (coolMin > 0) {
+          this.db.markNumberUsed(timedOutPhone, {
+            status: 'otp_timeout_cool',
+            slotId: this.account.id,
+            cooldownMs: coolMin * 60_000,
+            source: 'otp_timeout',
+          });
+          lockedPhone = '';
+        }
+        this._logNumberEvent({
+          phone: timedOutPhone,
+          outcome: 'drop',
+          reason: 'otp_timeout',
+          detail: `${elapsedSec}s me koi OTP nahi aaya (${otpRes.attempts || 0} refreshes, bot=${this.otpBotProfile}${coolMin > 0 ? `, ${coolMin}m cool` : ''})`,
+          durationMs: Date.now() - cycleStart,
+        });
         return;
       }
 
@@ -372,6 +539,13 @@ export class SlotWorker {
         this.db.incrementAccountAttempt(this.account.id, { failed: true });
         this.db.recordMetric(this.account.id, 'verify_fail', Date.now() - cycleStart);
         this.lastError = `verify_otp: ${verifyRes.reason || 'failed'}`.slice(0, 180);
+        this._logNumberEvent({
+          phone: lockedPhone,
+          outcome: 'drop',
+          reason: 'verify_failed',
+          detail: `OTP ${otpRes.code} rejected: ${verifyRes.reason || 'verify_otp failed'}`,
+          durationMs: Date.now() - cycleStart,
+        });
         return;
       }
 
@@ -402,6 +576,14 @@ export class SlotWorker {
       lockedPhone = ''; // already released inside commitCompletedSignup TX
       this.createdInRun += 1;
       this.lastError = '';
+      this._logNumberEvent({
+        phone: committed.exportObj.mobile,
+        outcome: 'ok',
+        reason: isNew ? 'created_new' : 'created_existing',
+        detail: `${isNew ? 'NEW' : 'EXISTING'} created & queued in ${(durationMs / 1000).toFixed(1)}s`,
+        durationMs,
+        logConsole: false,
+      });
       this.onSignupSuccess?.({
         slotNo: this.account.slotNo,
         phone: committed.exportObj.mobile,
@@ -412,7 +594,9 @@ export class SlotWorker {
     } catch (err) {
       if (this._isAborted()) return;
       const action = this._handleTelegramError(err);
-      if (this.client && (action === 'dead' || action === 'cooldown')) {
+      // Only destroy & recreate TelegramClient on dead sessions or real connection errors —
+      // NEVER tear down a healthy MTProto socket on FLOOD_WAIT or non-fatal bot UI errors!
+      if (this.client && (action === 'dead' || isConnectionError(err))) {
         try { await this.client.disconnect(); } catch {}
         this.client = null;
       }
@@ -427,7 +611,7 @@ export class SlotWorker {
           this.db.updateAccountHealth(this.account.id, { healthStatus: 'ready', cooldownUntil: 0, lastError: '' });
         }
       } else {
-        await this._sleepInterruptible(2_000);
+        await this._sleepInterruptible(1_500);
       }
     } finally {
       if (lockedPhone) {
@@ -458,7 +642,9 @@ export class SlotWorker {
       const cfg = this.getRuntimeConfig();
       const minJ = Math.max(0, Number(cfg.slotJitterMinMs) || 200);
       const maxJ = Math.max(minJ, Number(cfg.slotJitterMaxMs) || 800);
-      const jitter = minJ + Math.floor(Math.random() * (maxJ - minJ + 1));
+      const jitter = this._lastCycleWasFastSkip
+        ? Math.min(350, minJ)
+        : (minJ + Math.floor(Math.random() * (maxJ - minJ + 1)));
       if (jitter > 0) await this._sleepInterruptible(jitter);
     }
   }
