@@ -18,6 +18,8 @@ import { ToingClient } from '../src/toing-client.js';
 import { SlotManager } from '../src/slot-manager.js';
 import { DeliveryWorker } from '../src/delivery-worker.js';
 import { startHealthServer } from '../src/health-server.js';
+import { formatCodeDeliverySummary, qrLoginUrlFromToken } from '../src/telegram-slot-client.js';
+import QRCode from 'qrcode';
 
 function makeTmpDir(prefix = 'toing-rail-test-') {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -599,4 +601,32 @@ test('Health server serves /health and /metrics JSON', async () => {
   } finally {
     await new Promise((r) => server.close(r));
   }
+});
+
+// ---------------------------------------------------------------------------
+// 8. Phone Login Delivery Formatter & QR Code Generation
+// ---------------------------------------------------------------------------
+test('Login delivery formatter distinguishes App vs SMS & QR token encodes cleanly to PNG', async () => {
+  const appInfo = formatCodeDeliverySummary({ type: 'app', nextType: 'sms', length: 5 });
+  assert.equal(appInfo.type, 'app');
+  assert.equal(appInfo.nextType, 'sms');
+  assert.match(appInfo.channelLine, /Telegram App/i);
+
+  const smsInfo = formatCodeDeliverySummary({ type: 'sms', nextType: 'call', length: 5 });
+  assert.equal(smsInfo.type, 'sms');
+  assert.match(smsInfo.channelLine, /SMS/i);
+  assert.match(smsInfo.tipLine, /\/addqr/i);
+
+  const token = Buffer.from([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 250, 251, 252]);
+  const qrUrl = qrLoginUrlFromToken(token);
+  assert.ok(qrUrl.startsWith('tg://login?token='));
+  const encodedToken = qrUrl.slice('tg://login?token='.length);
+  assert.equal(encodedToken.includes('+'), false);
+  assert.equal(encodedToken.includes('/'), false);
+  assert.equal(encodedToken.includes('='), false);
+
+  const png = await QRCode.toBuffer(qrUrl, { width: 256, margin: 2 });
+  assert.ok(Buffer.isBuffer(png) && png.length > 200);
+  assert.equal(png[0], 0x89); // PNG magic byte
+  assert.equal(png[1], 0x50); // 'P'
 });

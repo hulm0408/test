@@ -1,8 +1,13 @@
 // ===== Telegram Control Bot UI (Telegraf) — Pure Toing 50-Slot Cluster =====
 import { Markup } from 'telegraf';
+import QRCode from 'qrcode';
 import { OTP_BOT_PROFILES, OTP_BOT_PROFILE_IDS, normalizeOtpBotProfileId } from './otp-profiles.js';
 import { parseBulkSessionsInput } from './db.js';
-import { loginInteractiveSession } from './telegram-slot-client.js';
+import {
+  formatCodeDeliverySummary,
+  loginInteractiveSession,
+  loginQrSession,
+} from './telegram-slot-client.js';
 import { parseCsvList } from './config.js';
 
 function esc(s = '') {
@@ -91,10 +96,13 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
       ],
       [
         Markup.button.callback('📱 Add via Phone', 'act_add_phone'),
-        Markup.button.callback('⚙️ Settings', 'act_settings'),
+        Markup.button.callback('📷 Add via QR', 'act_add_qr'),
       ],
       [
+        Markup.button.callback('⚙️ Settings', 'act_settings'),
         Markup.button.callback('📦 Export Last 50', 'act_export_50'),
+      ],
+      [
         Markup.button.callback('♻️ Reset Health', 'act_reset_health'),
       ],
     ];
@@ -402,14 +410,23 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     await startInteractivePhoneLogin(ctx);
   });
 
-  bot.command('cancel', async (ctx) => {
-    const key = String(ctx.chat.id);
+  bot.command(['addqr', 'qr'], async (ctx) => {
+    await startQrLogin(ctx);
+  });
+
+  function abortChatFlow(chatId) {
+    const key = String(chatId);
     const mode = chatModes.get(key);
     if (mode?.type === 'login') {
       mode.cancelled = true;
+      try { mode.abortController?.abort(); } catch {}
       mode.rejectInput?.(new Error('Cancelled by user'));
     }
     chatModes.delete(key);
+  }
+
+  bot.command('cancel', async (ctx) => {
+    abortChatFlow(ctx.chat.id);
     await ctx.reply('✅ Cancelled.');
   });
 
@@ -433,6 +450,34 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     });
   }
 
+  // ── Shared Helper: Save & Auto-Start Newly Logged-In Account ───────────────
+  async function saveLoggedInAccount(ctx, res) {
+    const cfg = getRuntimeConfig();
+    const added = db.addAccount({
+      session: res.session,
+      label: res.me ? res.me.split('·')[0].trim().slice(0, 24) : (res.phone || 'Spare'),
+      tgUserLabel: res.me || res.phone || '',
+      otpBotProfile: cfg.defaultOtpBot,
+      maxSlots: cfg.maxSlots,
+    });
+
+    if (added.ok) {
+      await ctx.reply([
+        `✅ <b>Spare Account Added!</b>`,
+        `🎛 Slot: <b>#${added.slotNo}</b> (${esc(added.label)})`,
+        `👤 Account: <code>${esc(res.me || res.phone)}</code>`,
+        `🤖 OTP Bot: <code>${esc(added.otpBotProfile)}</code>`,
+      ].join('\n'), { parse_mode: 'HTML' });
+
+      if (slotManager.desiredRunning) {
+        await slotManager.startSlot(added.id);
+        await ctx.reply(`🚀 Slot #${added.slotNo} auto-started in parallel cluster!`);
+      }
+    } else {
+      await ctx.reply(`⚠️ Login OK, par save fail: <code>${esc(added.reason)}</code>`, { parse_mode: 'HTML' });
+    }
+  }
+
   // ── Helper: Interactive Phone Login Flow ───────────────────────────────────
   async function startInteractivePhoneLogin(ctx) {
     const cfg = getRuntimeConfig();
@@ -442,7 +487,7 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     }
     const chatId = String(ctx.chat.id);
     if (chatModes.get(chatId)?.type === 'login') {
-      await ctx.reply('⏳ Ek phone login pehle se chal raha hai — pehle complete ya /cancel karo.');
+      await ctx.reply('⏳ Ek account login pehle se chal raha hai — pehle complete ya /cancel karo.');
       return;
     }
 
@@ -451,12 +496,17 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
       cancelled: false,
       resolveInput: null,
       rejectInput: null,
+      resendFn: null,
+      nextType: '',
     };
     chatModes.set(chatId, flow);
 
-    const ask = async (promptHtml) => {
+    const ask = async (promptHtml, buttons = [[Markup.button.callback('❌ Cancel', 'act_login_cancel')]]) => {
       if (flow.cancelled) throw new Error('Cancelled');
-      await ctx.reply(promptHtml, { parse_mode: 'HTML' });
+      await ctx.reply(promptHtml, {
+        parse_mode: 'HTML',
+        ...Markup.inlineKeyboard(buttons),
+      });
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
           flow.resolveInput = null;
@@ -474,46 +524,149 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
         const res = await loginInteractiveSession({
           apiId: cfg.telegramApiId,
           apiHash: cfg.telegramApiHash,
+          forceSMS: false,
           shouldAbort: () => flow.cancelled,
           callbacks: {
-            phoneNumber: () => ask('📱 Spare Telegram account ka <b>phone number</b> bhejo (e.g. <code>+919876543210</code>)\n<i>(/cancel to abort)</i>'),
-            phoneCode: () => ask('📩 Telegram se aaya <b>login OTP code</b> bhejo (space daal ke bhi bhej sakte ho, e.g. <code>1 2 3 4 5</code>):'),
+            phoneNumber: () => ask([
+              `📱 Spare Telegram account ka <b>phone number</b> bhejo (e.g. <code>+919876543210</code>)`,
+              `<i>Tip: Agar account phone par Telegram app me login hai to code 1 sec me Telegram app me aayega (ya <b>/addqr</b> se seedha QR scan kar lo).</i>`,
+            ].join('\n')),
+            phoneCode: (_isCodeViaApp, info) => {
+              const summary = formatCodeDeliverySummary(info);
+              flow.resendFn = typeof info?.resend === 'function' ? info.resend : null;
+              flow.nextType = summary.nextType;
+              const btns = [];
+              if (flow.resendFn && summary.nextType) {
+                btns.push([Markup.button.callback(`🔄 Resend via ${summary.nextType.toUpperCase()}`, 'act_login_resend')]);
+              }
+              btns.push([
+                Markup.button.callback('📷 Switch to QR Login', 'act_login_switch_qr'),
+                Markup.button.callback('❌ Cancel', 'act_login_cancel'),
+              ]);
+              return ask([
+                summary.channelLine,
+                ``,
+                `🔑 <b>Login code yahan reply karo</b> (space daal ke bhi chalega, e.g. <code>1 2 3 4 5</code>):`,
+                summary.tipLine,
+              ].join('\n'), btns);
+            },
+            emailVerification: (emailInfo) => ask(
+              `📧 Telegram ne email verification code bheja hai${emailInfo?.emailPattern ? ` (<code>${esc(emailInfo.emailPattern)}</code>)` : ''}. Email code bhejo:`
+            ),
             password: (hint) => ask(`🔐 Is account par 2FA ON hai${hint ? ` (hint: <code>${esc(hint)}</code>)` : ''}. <b>2FA password</b> bhejo:`),
             onError: async (err) => {
-              await ctx.reply(`⚠️ Telegram login error: <code>${esc(String(err?.message || err).slice(0, 160))}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+              await ctx.reply(`⚠️ Telegram login error: <code>${esc(String(err?.message || err).slice(0, 180))}</code>`, { parse_mode: 'HTML' }).catch(() => {});
               return false;
             },
           },
         });
 
-        const added = db.addAccount({
-          session: res.session,
-          label: res.me ? res.me.split('·')[0].trim().slice(0, 24) : res.phone,
-          tgUserLabel: res.me || res.phone,
-          otpBotProfile: cfg.defaultOtpBot,
-          maxSlots: cfg.maxSlots,
-        });
-
-        if (added.ok) {
-          await ctx.reply([
-            `✅ <b>Spare Account Added!</b>`,
-            `🎛 Slot: <b>#${added.slotNo}</b> (${esc(added.label)})`,
-            `👤 Account: <code>${esc(res.me || res.phone)}</code>`,
-            `🤖 OTP Bot: <code>${esc(added.otpBotProfile)}</code>`,
-          ].join('\n'), { parse_mode: 'HTML' });
-
-          if (slotManager.desiredRunning) {
-            await slotManager.startSlot(added.id);
-            await ctx.reply(`🚀 Slot #${added.slotNo} auto-started in parallel cluster!`);
-          }
-        } else {
-          await ctx.reply(`⚠️ Login OK, par save fail: <code>${esc(added.reason)}</code>`, { parse_mode: 'HTML' });
-        }
+        await saveLoggedInAccount(ctx, res);
       } catch (err) {
         if (!flow.cancelled) {
           await ctx.reply(`❌ Account login fail: <code>${esc(String(err?.message || err).slice(0, 180))}</code>`, { parse_mode: 'HTML' }).catch(() => {});
         }
       } finally {
+        if (chatModes.get(chatId) === flow) chatModes.delete(chatId);
+      }
+    })();
+  }
+
+  // ── Helper: QR Code Login Flow (Zero SMS/OTP issues!) ──────────────────────
+  async function startQrLogin(ctx) {
+    const cfg = getRuntimeConfig();
+    if (!cfg.telegramApiId || !cfg.telegramApiHash) {
+      await ctx.reply('❌ Railway env me <code>TELEGRAM_API_ID</code> aur <code>TELEGRAM_API_HASH</code> pehle set karo (my.telegram.org).', { parse_mode: 'HTML' });
+      return;
+    }
+    const chatId = String(ctx.chat.id);
+    if (chatModes.get(chatId)?.type === 'login') {
+      await ctx.reply('⏳ Ek account login pehle se chal raha hai — pehle complete ya /cancel karo.');
+      return;
+    }
+
+    const abortController = new AbortController();
+    const flow = {
+      type: 'login',
+      cancelled: false,
+      abortController,
+      resolveInput: null,
+      rejectInput: null,
+    };
+    chatModes.set(chatId, flow);
+
+    const overallTimeout = setTimeout(() => {
+      if (!flow.cancelled) {
+        flow.cancelled = true;
+        try { abortController.abort(); } catch {}
+        ctx.reply('⏱ QR login timeout (2 min) — dobara try karne ke liye /addqr bhejo.').catch(() => {});
+      }
+    }, 120_000);
+
+    let lastQrMsgId = 0;
+
+    (async () => {
+      try {
+        const res = await loginQrSession({
+          apiId: cfg.telegramApiId,
+          apiHash: cfg.telegramApiHash,
+          abortSignal: abortController.signal,
+          callbacks: {
+            qrCode: async ({ url }) => {
+              if (flow.cancelled) return;
+              const pngBuf = await QRCode.toBuffer(url, { width: 320, margin: 2 });
+              if (lastQrMsgId) {
+                await ctx.telegram.deleteMessage(ctx.chat.id, lastQrMsgId).catch(() => {});
+              }
+              const sent = await ctx.replyWithPhoto(
+                { source: pngBuf, filename: 'telegram-qr-login.png' },
+                {
+                  caption: [
+                    `📷 <b>QR LOGIN — ZERO OTP NEEDED!</b>`,
+                    ``,
+                    `1️⃣ Spare Telegram app kholo`,
+                    `2️⃣ <b>Settings → Devices → Link Desktop Device</b>`,
+                    `3️⃣ Ye QR scan karo (30s me auto-refresh hota hai)`,
+                  ].join('\n'),
+                  parse_mode: 'HTML',
+                  ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'act_login_cancel')]]),
+                }
+              );
+              lastQrMsgId = sent?.message_id || 0;
+            },
+            password: async (hint) => {
+              if (flow.cancelled) throw new Error('Cancelled');
+              await ctx.reply(
+                `🔐 QR scan OK! Is account par 2FA ON hai${hint ? ` (hint: <code>${esc(hint)}</code>)` : ''}. <b>2FA password</b> bhejo:`,
+                { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('❌ Cancel', 'act_login_cancel')]]) }
+              );
+              return new Promise((resolve, reject) => {
+                const timer = setTimeout(() => {
+                  flow.resolveInput = null;
+                  flow.rejectInput = null;
+                  reject(new Error('2FA input timeout'));
+                }, 120_000);
+                flow.resolveInput = (val) => { clearTimeout(timer); flow.resolveInput = null; flow.rejectInput = null; resolve(val); };
+                flow.rejectInput = (err) => { clearTimeout(timer); flow.resolveInput = null; flow.rejectInput = null; reject(err); };
+              });
+            },
+            onError: async (err) => {
+              await ctx.reply(`⚠️ QR login error: <code>${esc(String(err?.message || err).slice(0, 180))}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+              return false;
+            },
+          },
+        });
+
+        if (lastQrMsgId) {
+          await ctx.telegram.deleteMessage(ctx.chat.id, lastQrMsgId).catch(() => {});
+        }
+        await saveLoggedInAccount(ctx, res);
+      } catch (err) {
+        if (!flow.cancelled && err?.name !== 'AbortError') {
+          await ctx.reply(`❌ QR login fail: <code>${esc(String(err?.message || err).slice(0, 180))}</code>`, { parse_mode: 'HTML' }).catch(() => {});
+        }
+      } finally {
+        clearTimeout(overallTimeout);
         if (chatModes.get(chatId) === flow) chatModes.delete(chatId);
       }
     })();
@@ -556,6 +709,45 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
   bot.action('act_add_phone', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     await startInteractivePhoneLogin(ctx);
+  });
+
+  bot.action('act_add_qr', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    await startQrLogin(ctx);
+  });
+
+  bot.action('act_login_cancel', async (ctx) => {
+    await ctx.answerCbQuery('Cancelled').catch(() => {});
+    abortChatFlow(ctx.chat.id);
+    await ctx.reply('✅ Login cancelled.');
+  });
+
+  bot.action('act_login_switch_qr', async (ctx) => {
+    await ctx.answerCbQuery('Switching to QR...').catch(() => {});
+    abortChatFlow(ctx.chat.id);
+    await startQrLogin(ctx);
+  });
+
+  bot.action('act_login_resend', async (ctx) => {
+    const flow = chatModes.get(String(ctx.chat.id));
+    if (!flow || flow.type !== 'login' || typeof flow.resendFn !== 'function') {
+      await ctx.answerCbQuery('Resend available nahi hai abhi.', { show_alert: true }).catch(() => {});
+      return;
+    }
+    await ctx.answerCbQuery('🔄 Resending code...').catch(() => {});
+    try {
+      const nextInfo = await flow.resendFn();
+      const summary = formatCodeDeliverySummary(nextInfo);
+      flow.resendFn = typeof nextInfo?.resend === 'function' ? nextInfo.resend : null;
+      flow.nextType = summary.nextType;
+      await ctx.reply([
+        `🔄 <b>Code Resent!</b>`,
+        summary.channelLine,
+        summary.tipLine,
+      ].join('\n'), { parse_mode: 'HTML' });
+    } catch (err) {
+      await ctx.reply(`⚠️ Resend fail: <code>${esc(String(err?.message || err).slice(0, 160))}</code>\n<i>Tip: /addqr se QR login use karo (zero SMS needed).</i>`, { parse_mode: 'HTML' });
+    }
   });
 
   bot.action('act_settings', async (ctx) => {

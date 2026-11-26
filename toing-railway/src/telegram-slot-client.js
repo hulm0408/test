@@ -41,22 +41,6 @@ export async function loadTeleproto() {
         if (Logger?.setLevel) Logger.setLevel('error');
       } catch {}
 
-      try {
-        const CodeSettings = apiMod.Api?.CodeSettings;
-        if (CodeSettings && !CodeSettings.__smsPatched) {
-          const origCtor = CodeSettings;
-          CodeSettings.__smsPatched = true;
-          const patched = function CodeSettingsSmsOnly(...args) {
-            const inst = new origCtor(...args);
-            inst.appSandbox = false;
-            return inst;
-          };
-          patched.prototype = origCtor.prototype;
-          Object.assign(patched, origCtor);
-          apiMod.Api.CodeSettings = patched;
-        }
-      } catch {}
-
       return {
         TelegramClient: main.TelegramClient,
         StringSession: sessions.StringSession,
@@ -657,50 +641,71 @@ export function normalizeTelegramLoginPhone(value = '') {
   return '';
 }
 
-export async function loginInteractiveSession({ apiId, apiHash, callbacks, shouldAbort = null } = {}) {
+export function formatCodeDeliverySummary(info = {}) {
+  const type = String(info?.type || 'unknown').toLowerCase();
+  const nextType = String(info?.nextType || '').toLowerCase();
+  const length = Number(info?.length) || 5;
+
+  let channelLine = '';
+  let tipLine = '';
+
+  switch (type) {
+    case 'app':
+      channelLine = `📲 <b>Telegram App</b> me code bheja gaya hai (<code>${length}-digit</code> — spare account ke <b>"Telegram"</b> official chat me check karo, SMS me nahi!)`;
+      tipLine = nextType
+        ? `<i>App open nahi hai? Neeche <b>🔄 Resend (${nextType.toUpperCase()})</b> daba sakte ho — ya <b>/addqr</b> se 3 sec me QR scan kar lo.</i>`
+        : `<i>Tip: Spare account kisi phone/desktop Telegram me login hona chahiye, ya <b>/addqr</b> use karo.</i>`;
+      break;
+    case 'sms':
+      channelLine = `📩 <b>SMS</b> par code bheja gaya hai (<code>${length}-digit</code>).`;
+      tipLine = `<i>⚠️ Agar 30s me SMS na aaye: Telegram custom API ID par aksar SMS block/delay karta hai. Is number ko pehle phone ke official Telegram app me login kar lo (phir code turant app me aayega), ya <b>/addqr</b> se QR scan karo!</i>`;
+      break;
+    case 'call':
+    case 'flashcall':
+    case 'missedcall':
+      channelLine = `📞 <b>Phone Call</b> par code aa raha hai (<code>${type}</code>).`;
+      tipLine = `<i>Call me bole gaye / last digits code ke roop me bhejo.</i>`;
+      break;
+    case 'fragment':
+      channelLine = `💎 <b>Fragment</b> par code bheja gaya hai${info?.url ? ` (${info.url})` : ''}.`;
+      tipLine = `<i>Fragment par aaya code paste karo.</i>`;
+      break;
+    default:
+      channelLine = `📩 Code bheja gaya hai (channel: <code>${type}</code>).`;
+      tipLine = `<i>Agar code na mile to /cancel karke <b>/addqr</b> try karo.</i>`;
+  }
+
+  return { type, nextType, channelLine, tipLine };
+}
+
+export function qrLoginUrlFromToken(token) {
+  const buf = Buffer.isBuffer(token) ? token : Buffer.from(token || '');
+  return `tg://login?token=${buf.toString('base64url')}`;
+}
+
+export async function loginInteractiveSession({
+  apiId,
+  apiHash,
+  forceSMS = false,
+  callbacks,
+  shouldAbort = null,
+} = {}) {
   if (!apiId || !apiHash) {
     throw new Error('TELEGRAM_API_ID / TELEGRAM_API_HASH env me set karo (my.telegram.org).');
   }
-  const { TelegramClient, StringSession, apiMod } = await loadTeleproto();
+  const { TelegramClient, StringSession } = await loadTeleproto();
   const client = new TelegramClient(new StringSession(''), Number(apiId), String(apiHash), {
     connectionRetries: 3,
     requestRetries: 2,
     autoReconnect: true,
     receiveUpdates: false,
-    deviceModel: 'ToingRailwayLogin',
-    systemVersion: process.version,
-    appVersion: '2.0.0',
+    deviceModel: 'Desktop',
+    systemVersion: 'Linux',
+    appVersion: '5.10.0',
     langCode: 'en',
     systemLangCode: 'en',
   });
   try { client.setLogLevel?.('error'); } catch {}
-
-  // Force SMS delivery on SendCode if Telegram tried app/call first
-  const originalInvoke = client.invoke.bind(client);
-  let smsForceAttempted = false;
-  client.invoke = async (request) => {
-    try {
-      const result = await originalInvoke(request);
-      if (request?.className === 'SendCode' && result && apiMod?.Api) {
-        const Api = apiMod.Api;
-        if (result instanceof Api.auth?.SentCode && !(result.type instanceof Api.auth?.SentCodeTypeSms) && !smsForceAttempted) {
-          smsForceAttempted = true;
-          try {
-            const resend = await originalInvoke(new Api.auth.ResendCode({
-              phoneNumber: request.phoneNumber,
-              phoneCodeHash: result.phoneCodeHash,
-            }));
-            if (resend instanceof Api.auth?.SentCode && resend.type instanceof Api.auth?.SentCodeTypeSms) {
-              return resend;
-            }
-          } catch {}
-        }
-      }
-      return result;
-    } finally {
-      if (request?.className === 'SendCode') smsForceAttempted = false;
-    }
-  };
 
   const checkAbort = () => {
     if (shouldAbort?.()) throw new Error('Login cancelled');
@@ -709,7 +714,11 @@ export async function loginInteractiveSession({ apiId, apiHash, callbacks, shoul
   try {
     let phoneUsed = '';
     await client.start({
-      forceSMS: true,
+      // CRITICAL: Default forceSMS=false! Telegram sends instant in-app code
+      // (SentCodeTypeApp) when logged into any Telegram app. Previously forceSMS=true
+      // called auth.ResendCode immediately, cancelling the App code and requesting
+      // SMS which Telegram drops on third-party my.telegram.org API IDs.
+      forceSMS: Boolean(forceSMS),
       phoneNumber: async () => {
         checkAbort();
         const raw = await callbacks.phoneNumber();
@@ -718,14 +727,26 @@ export async function loginInteractiveSession({ apiId, apiHash, callbacks, shoul
         if (!phoneUsed) throw new Error('Valid phone number daalo (e.g. +919876543210)');
         return phoneUsed;
       },
-      phoneCode: async () => {
+      phoneCode: async (isCodeViaApp, info) => {
         checkAbort();
-        const raw = await callbacks.phoneCode();
+        console.log(
+          `[TelegramLogin] Code sent for ${phoneUsed}: type=${info?.type || (isCodeViaApp ? 'app' : 'unknown')}`
+          + ` nextType=${info?.nextType || 'none'} timeout=${info?.timeout || 0}s`
+        );
+        const raw = await callbacks.phoneCode(isCodeViaApp, info);
         checkAbort();
         const code = String(raw || '').replace(/[\s-]+/g, '').trim();
         if (!code) throw new Error('OTP code khali hai');
         return code;
       },
+      emailVerification: typeof callbacks?.emailVerification === 'function'
+        ? async (emailInfo) => {
+          checkAbort();
+          const raw = await callbacks.emailVerification(emailInfo);
+          checkAbort();
+          return String(raw || '').trim();
+        }
+        : undefined,
       password: async (hint) => {
         checkAbort();
         const raw = await callbacks.password(hint);
@@ -733,6 +754,7 @@ export async function loginInteractiveSession({ apiId, apiHash, callbacks, shoul
         return String(raw || '');
       },
       onError: async (err) => {
+        console.warn('[TelegramLogin] Step error:', String(err?.message || err).slice(0, 180));
         if (shouldAbort?.()) return true;
         if (typeof callbacks.onError === 'function') return Boolean(await callbacks.onError(err));
         return false;
@@ -745,6 +767,65 @@ export async function loginInteractiveSession({ apiId, apiHash, callbacks, shoul
     let me = '';
     try { me = accountMeLabel(await client.getMe()); } catch {}
     return { ok: true, session, me, phone: phoneUsed };
+  } finally {
+    try { await client.disconnect(); } catch {}
+    try { await client.destroy?.(); } catch {}
+  }
+}
+
+// ── QR Code Login (for /addqr — ZERO SMS / OTP headaches!) ──────────────────
+export async function loginQrSession({ apiId, apiHash, callbacks, abortSignal = null } = {}) {
+  if (!apiId || !apiHash) {
+    throw new Error('TELEGRAM_API_ID / TELEGRAM_API_HASH env me set karo (my.telegram.org).');
+  }
+  const { TelegramClient, StringSession } = await loadTeleproto();
+  // receiveUpdates MUST be true for QR login so UpdateLoginToken arrives immediately on scan!
+  const client = new TelegramClient(new StringSession(''), Number(apiId), String(apiHash), {
+    connectionRetries: 3,
+    requestRetries: 2,
+    autoReconnect: true,
+    receiveUpdates: true,
+    deviceModel: 'Desktop',
+    systemVersion: 'Linux',
+    appVersion: '5.10.0',
+    langCode: 'en',
+    systemLangCode: 'en',
+  });
+  try { client.setLogLevel?.('error'); } catch {}
+
+  try {
+    await client.connect();
+    await client.signInUserWithQrCode(
+      { apiId: Number(apiId), apiHash: String(apiHash) },
+      {
+        abortSignal: abortSignal || undefined,
+        qrCode: async ({ token, expires }) => {
+          const url = qrLoginUrlFromToken(token);
+          await callbacks.qrCode({ url, token, expires });
+        },
+        password: async (hint) => {
+          const raw = await callbacks.password(hint);
+          return String(raw || '');
+        },
+        onError: async (err) => {
+          console.warn('[TelegramQrLogin] Error:', String(err?.message || err).slice(0, 180));
+          if (abortSignal?.aborted) return true;
+          if (typeof callbacks.onError === 'function') return Boolean(await callbacks.onError(err));
+          return false;
+        },
+      }
+    );
+
+    const session = String(client.session?.save?.() || '').trim();
+    if (!session) throw new Error('QR login ke baad session khali mili');
+    let me = '';
+    let phone = '';
+    try {
+      const user = await client.getMe();
+      me = accountMeLabel(user);
+      if (user?.phone) phone = `+${String(user.phone).replace(/^\+/, '')}`;
+    } catch {}
+    return { ok: true, session, me, phone };
   } finally {
     try { await client.disconnect(); } catch {}
     try { await client.destroy?.(); } catch {}
