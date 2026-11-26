@@ -105,6 +105,9 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
       ],
       [
         Markup.button.callback('📜 Number Log', 'act_logs'),
+        Markup.button.callback('🧊 Cooldowns', 'act_cooldowns'),
+      ],
+      [
         Markup.button.callback('♻️ Reset Health', 'act_reset_health'),
       ],
     ];
@@ -279,12 +282,67 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     const rows = [
       [
         Markup.button.callback('🔄 Refresh Log', 'act_logs'),
+        Markup.button.callback('🧊 Cooldowns', 'act_cooldowns'),
         Markup.button.callback('🏠 Dashboard', 'act_dash'),
       ],
     ];
 
     return {
       text: lines.join('\n').slice(0, 3950),
+      extra: { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) },
+    };
+  }
+
+  // ── Cooldowns View (Clear Breakdown + 1-Tap Controls) ──────────────────────
+  function buildCooldownsView({ confirmAll = false } = {}) {
+    const bd = db.getCooldownBreakdown();
+    const snap = slotManager.getDashboardSnapshot();
+    const coolSlots = snap.slots.filter((s) => s.cooldownLeftSec > 0 || s.stage === 'cooldown');
+    const tempCount = (bd.otp_timeout_cool || 0) + (bd.send_otp_blocked || 0);
+
+    const lines = [
+      `🧊 <b>COOLDOWNS — FULL BREAKDOWN &amp; CONTROLS</b>`,
+      ``,
+      `📱 <b>1. Mobile Number Cooldown Pool (Total: <code>${bd.total}</code>)</b>`,
+      `<i>Ye numbers isliye skip hote hain taaki OTP &amp; time waste na ho:</i>`,
+      `• ✅ <b>extracted</b> (banaye hue accounts, 30d): <code>${bd.extracted}</code>`,
+      `• 🚫 <b>already_registered</b> (Toing par pehle se reg, 30d): <code>${bd.already_registered}</code>`,
+      `• 📦 <b>seed</b> (purane JSON backups, 30d): <code>${bd.seed}</code>`,
+      `• ⏱ <b>otp_timeout_cool</b> (OTP nahi aaya, 10m): <code>${bd.otp_timeout_cool}</code>`,
+      `• 🛑 <b>send_otp_blocked</b> (Swiggy limit, 2h): <code>${bd.send_otp_blocked}</code>`,
+      bd.other ? `• 🔹 <b>other</b>: <code>${bd.other}</code>` : '',
+      ``,
+      `🤖 <b>2. Slot Telegram Cooldown (FLOOD_WAIT): <code>${coolSlots.length}</code> slot(s)</b>`,
+      coolSlots.length
+        ? coolSlots.slice(0, 8).map((s) => `• Slot <b>#${s.slotNo}</b>: ⏳ <code>${fmtDuration(s.cooldownLeftSec)}</code>`).join('\n')
+        : `• <i>Sabhi slots fresh hain — koi TG FLOOD_WAIT nahi!</i>`,
+    ].filter(Boolean);
+
+    const rows = [
+      [
+        Markup.button.callback(`🧹 Clear Temp (${tempCount})`, 'cool_clear_temp'),
+        Markup.button.callback(`🚫 Clear Already-Reg (${bd.already_registered})`, 'cool_clear_reg'),
+      ],
+      [
+        Markup.button.callback(`📦 Clear Seed (${bd.seed})`, 'cool_clear_seed'),
+        Markup.button.callback('♻️ Reset Slot TG Health', 'act_reset_health'),
+      ],
+      confirmAll
+        ? [
+          Markup.button.callback('⚠️ YES, CLEAR ALL NUMBERS', 'cool_clear_all_yes'),
+          Markup.button.callback('❌ Cancel', 'act_cooldowns'),
+        ]
+        : [
+          Markup.button.callback('🗑 Clear ALL Number Cooldowns', 'cool_clear_all_ask'),
+        ],
+      [
+        Markup.button.callback('🔄 Refresh', 'act_cooldowns'),
+        Markup.button.callback('🏠 Dashboard', 'act_dash'),
+      ],
+    ];
+
+    return {
+      text: lines.join('\n'),
       extra: { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) },
     };
   }
@@ -312,6 +370,7 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
       `🔄 Auto-Resume on Restart: <b>${cfg.autoResume ? 'ON' : 'OFF'}</b>`,
       ``,
       `<i>Commands:</i>`,
+      `• <code>/cooldowns</code> — Cooldown pool breakdown &amp; clear controls`,
       `• <code>/logs</code> — Har number ka skip/drop/success exact reason dekho`,
       `• <code>/spreadbots</code> — Saare slots ko 3 OTP bots me equally spread karo`,
       `• <code>/setkey KEY1,KEY2</code> — Update Toing keys live`,
@@ -383,6 +442,11 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     await ctx.reply(text, extra);
   });
 
+  bot.command(['cooldowns', 'cooldown'], async (ctx) => {
+    const { text, extra } = buildCooldownsView();
+    await ctx.reply(text, extra);
+  });
+
   bot.command('slots', async (ctx) => {
     const page = Number((ctx.message.text || '').split(/\s+/)[1]) || 1;
     const { text, extra } = buildSlotsPage(page);
@@ -403,6 +467,7 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
 
   bot.command('resethealth', async (ctx) => {
     const count = db.resetAllAccountHealth();
+    slotManager.wakeCooldownSlots();
     await ctx.reply(`♻️ Reset health/cooldown on <b>${count}</b> slots.`, { parse_mode: 'HTML' });
     if (slotManager.desiredRunning) {
       await slotManager.startAll();
@@ -843,6 +908,52 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     await editOrReply(ctx, text, extra);
   });
 
+  bot.action('act_cooldowns', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const { text, extra } = buildCooldownsView();
+    await editOrReply(ctx, text, extra);
+  });
+
+  bot.action('cool_clear_temp', async (ctx) => {
+    const removed = db.clearCooldownsByStatus(['otp_timeout_cool', 'send_otp_blocked']);
+    slotManager.clearAllLocalExcludes();
+    await ctx.answerCbQuery(`🧹 Cleared ${removed} temp cooldown(s)`).catch(() => {});
+    const { text, extra } = buildCooldownsView();
+    await editOrReply(ctx, text, extra);
+  });
+
+  bot.action('cool_clear_reg', async (ctx) => {
+    const removed = db.clearCooldownsByStatus(['already_registered']);
+    slotManager.clearAllLocalExcludes();
+    await ctx.answerCbQuery(`🚫 Cleared ${removed} already_registered`).catch(() => {});
+    const { text, extra } = buildCooldownsView();
+    await editOrReply(ctx, text, extra);
+  });
+
+  bot.action('cool_clear_seed', async (ctx) => {
+    const removed = db.clearCooldownsByStatus(['seed']);
+    db.setSetting('skipSeedOnBoot', true);
+    slotManager.clearAllLocalExcludes();
+    await ctx.answerCbQuery(`📦 Cleared ${removed} seed number(s)`).catch(() => {});
+    const { text, extra } = buildCooldownsView();
+    await editOrReply(ctx, text, extra);
+  });
+
+  bot.action('cool_clear_all_ask', async (ctx) => {
+    await ctx.answerCbQuery('Confirm to clear ALL number cooldowns').catch(() => {});
+    const { text, extra } = buildCooldownsView({ confirmAll: true });
+    await editOrReply(ctx, text, extra);
+  });
+
+  bot.action('cool_clear_all_yes', async (ctx) => {
+    const removed = db.clearCooldownsByStatus('all');
+    db.setSetting('skipSeedOnBoot', true);
+    slotManager.clearAllLocalExcludes();
+    await ctx.answerCbQuery(`🗑 Cleared ALL ${removed} cooldown(s)`).catch(() => {});
+    const { text, extra } = buildCooldownsView();
+    await editOrReply(ctx, text, extra);
+  });
+
   bot.action('act_settings', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     const { text, extra } = buildSettingsView();
@@ -856,6 +967,7 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
 
   bot.action('act_reset_health', async (ctx) => {
     const count = db.resetAllAccountHealth();
+    slotManager.wakeCooldownSlots();
     await ctx.answerCbQuery(`♻️ Reset ${count} slots`).catch(() => {});
     if (slotManager.desiredRunning) {
       await slotManager.startAll();
@@ -959,6 +1071,7 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
   bot.action('cfg_toggle_skip_reg', async (ctx) => {
     const next = !(getRuntimeConfig().skipRegistered !== false);
     db.setSetting('skipRegistered', next);
+    if (!next) slotManager.clearAllLocalExcludes();
     await ctx.answerCbQuery(`🆕 Skip Registered: ${next ? 'ON' : 'OFF'}`).catch(() => {});
     const { text, extra } = buildSettingsView();
     await editOrReply(ctx, text, extra);

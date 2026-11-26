@@ -9,6 +9,14 @@ import { TelegramSlotClient } from './telegram-slot-client.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, Number(ms) || 0)));
 
+function formatCooldownLeft(ms = 0) {
+  const sec = Math.max(0, Math.round((Number(ms) || 0) / 1000));
+  if (sec >= 86_400) return `${Math.ceil(sec / 86_400)}d left`;
+  if (sec >= 3_600) return `${Math.floor(sec / 3_600)}h${Math.floor((sec % 3_600) / 60)}m left`;
+  if (sec >= 60) return `${Math.ceil(sec / 60)}m left`;
+  return `${sec}s left`;
+}
+
 export class SlotWorker {
   constructor({
     account,
@@ -31,6 +39,7 @@ export class SlotWorker {
     this.running = false;
     this.stopRequested = false;
     this._cycleAborted = false;
+    this._wakeCooldown = false;
     this._loopPromise = null;
 
     this.stage = 'idle'; // idle|connecting|claiming|sending_otp|waiting_otp|verifying|exporting|cooldown|dead|stopped
@@ -100,7 +109,21 @@ export class SlotWorker {
     if (!phone) return;
     if (!this.localExcludes.includes(phone)) {
       this.localExcludes.push(phone);
-      while (this.localExcludes.length > 40) this.localExcludes.shift();
+      while (this.localExcludes.length > 120) this.localExcludes.shift();
+    }
+  }
+
+  clearLocalExcludes() {
+    this.localExcludes = [];
+    this.consecutivePoolSkips = 0;
+  }
+
+  wakeFromCooldown() {
+    if (this.healthStatus === 'cooldown' || this.stage === 'cooldown') {
+      this._wakeCooldown = true;
+      this.healthStatus = 'ready';
+      this.cooldownUntil = 0;
+      this.lastError = '';
     }
   }
 
@@ -193,10 +216,14 @@ export class SlotWorker {
     }
   }
 
-  async _sleepInterruptible(ms) {
+  async _sleepInterruptible(ms, { wakeOnCooldownReset = false } = {}) {
     const end = Date.now() + Math.max(0, Number(ms) || 0);
     while (Date.now() < end) {
       if (this._isAborted()) return;
+      if (wakeOnCooldownReset && this._wakeCooldown) {
+        this._wakeCooldown = false;
+        return;
+      }
       await sleep(Math.min(250, end - Date.now()));
     }
   }
@@ -276,7 +303,8 @@ export class SlotWorker {
 
   async _claimLockedPhone(cfg) {
     const excludeSet = new Set(this.localExcludes);
-    const maxFastSkips = 8;
+    const maxFastSkips = 14;
+    const ignoreAlreadyRegistered = cfg.skipRegistered === false;
 
     for (let skip = 0; skip < maxFastSkips; skip++) {
       if (this._isAborted()) return { ok: false, aborted: true };
@@ -314,11 +342,18 @@ export class SlotWorker {
         if (this._rotateBotIfPoolExhausted(cfg, claimRes.reason || 'claim_empty')) {
           return { ok: false, rotated: true, reason: 'pool_rotated' };
         }
+        if (claimRes.reason === 'bot_returned_excluded') {
+          // Bot IS replying normally; it simply returned already-seen numbers — do NOT sleep 5s as CLAIM_FAIL!
+          return { ok: false, poolDuplicate: true, reason: 'bot_returned_excluded' };
+        }
         return { ok: false, reason: claimRes.reason || 'claim_empty' };
       }
 
       const phone = claimRes.phone;
-      const lockRes = this.db.tryClaimPhone(phone, this.account.id, { ttlMs: cfg.claimLockTtlMs });
+      const lockRes = this.db.tryClaimPhone(phone, this.account.id, {
+        ttlMs: cfg.claimLockTtlMs,
+        ignoreAlreadyRegistered,
+      });
       if (lockRes.ok) {
         this._rememberExclude(phone);
         return { ok: true, phone, card: claimRes.card, reusedOnScreen: Boolean(claimRes.reusedOnScreen) };
@@ -332,11 +367,12 @@ export class SlotWorker {
 
       if (lockRes.reason === 'cooldown') {
         const sub = lockRes.status || 'used';
+        const leftStr = lockRes.remainingMs > 0 ? formatCooldownLeft(lockRes.remainingMs) : 'cooldown active';
         this._logNumberEvent({
           phone,
           outcome: 'skip',
           reason: 'used_cooldown',
-          detail: `pehle ${sub} list me hai (cooldown active) — OTP nahi bheja`,
+          detail: `pehle ${sub} list me hai (${leftStr}) — OTP nahi bheja`,
         });
       } else if (lockRes.reason === 'in_flight') {
         this._logNumberEvent({
@@ -359,7 +395,7 @@ export class SlotWorker {
       }
     }
 
-    return { ok: false, reason: 'all_claimed_duplicates' };
+    return { ok: false, poolDuplicate: true, reason: 'all_claimed_duplicates' };
   }
 
   async _runSingleCycle() {
@@ -377,6 +413,14 @@ export class SlotWorker {
       if (claimed.aborted || this._isAborted()) return;
 
       if (claimed.rotated) {
+        this._lastCycleWasFastSkip = true;
+        return;
+      }
+
+      if (claimed.poolDuplicate) {
+        // Single-bot pool scan hit repeated used/excluded numbers while bot IS responsive:
+        // do NOT count as a broken-bot CLAIM_FAIL and do NOT stack 5s backoff sleep!
+        this.consecutiveClaimFails = 0;
         this._lastCycleWasFastSkip = true;
         return;
       }
@@ -672,8 +716,9 @@ export class SlotWorker {
       if (action === 'dead') {
         this.stopRequested = true;
       } else if (action === 'cooldown') {
+        this._wakeCooldown = false;
         const waitMs = Math.max(2_000, this.cooldownUntil - Date.now());
-        await this._sleepInterruptible(waitMs);
+        await this._sleepInterruptible(waitMs, { wakeOnCooldownReset: true });
         if (!this.stopRequested) {
           this.healthStatus = 'ready';
           this.cooldownUntil = 0;
@@ -693,8 +738,9 @@ export class SlotWorker {
   async _runLoop() {
     // Respect existing persisted cooldown on startup
     if (this.healthStatus === 'cooldown' && this.cooldownUntil > Date.now()) {
+      this._wakeCooldown = false;
       this._setStage('cooldown', '');
-      await this._sleepInterruptible(this.cooldownUntil - Date.now());
+      await this._sleepInterruptible(this.cooldownUntil - Date.now(), { wakeOnCooldownReset: true });
       if (this.stopRequested) return;
       this.healthStatus = 'ready';
       this.cooldownUntil = 0;

@@ -1199,3 +1199,137 @@ test('Push-driven TelegramSlotClient claims fresh cards and catches OTP edits wi
   assert.equal(getMessagesCalls, 1, 'waitForOtp must catch pushed OTP with ZERO polling GetHistory RPCs!');
   assert.ok(otpRes.elapsedMs < 1_000, `Expected instant push delivery (<1s), got ${otpRes.elapsedMs}ms`);
 });
+
+// ---------------------------------------------------------------------------
+// 15. Single-Bot Pool Duplicates Do NOT Trigger False CLAIM_FAIL or 5s Backoff
+// ---------------------------------------------------------------------------
+test('Single-bot bot_returned_excluded / pool duplicates fast-yield without CLAIM_FAIL backoff', async () => {
+  const dir = makeTmpDir();
+  try {
+    const db = new ToingDb({
+      dbPath: path.join(dir, 'toing.db'),
+      dataDir: dir,
+      encryptionKey: 'single-bot-key',
+      sessionsDir: path.join(dir, 'sessions'),
+    });
+    const added = db.addAccount({
+      session: '1BVtsMOCK_SINGLE_BOT_POOL_DUPLICATE_TEST_00001',
+      label: 'HathiOnly',
+      otpBotProfile: 'hathi',
+    });
+    const acc = db.getAccountById(added.id, { includeSession: true });
+
+    const toingClient = new ToingClient({
+      getBaseUrl: () => 'https://storelex.store/toing_web',
+      getAccessKeys: () => ['TEST-KEY'],
+      fetchImpl: async () => new Response(JSON.stringify({ registered: false }), { status: 200 }),
+    });
+
+    const worker = new SlotWorker({
+      account: acc,
+      db,
+      toingClient,
+      getRuntimeConfig: () => ({
+        telegramApiId: 12345,
+        telegramApiHash: 'hash',
+        claimTimeoutMs: 2_000,
+        claimLockTtlMs: 60_000,
+        autoFailoverBots: false,
+        skipRegistered: true,
+        claimFailBackoffMs: 2_500, // Would sleep 2.5s+ if falsely treated as CLAIM_FAIL!
+      }),
+      clientFactory: () => ({
+        connected: false,
+        async connect() { this.connected = true; return { ok: true, me: 'HathiOnly' }; },
+        async disconnect() { this.connected = false; },
+        async claimFreshNumber() {
+          return { ok: false, reason: 'bot_returned_excluded', excludedPhonesSeen: ['9811111111'] };
+        },
+      }),
+    });
+
+    const t0 = Date.now();
+    await worker._runSingleCycle();
+    const elapsedMs = Date.now() - t0;
+
+    assert.equal(worker.consecutiveClaimFails, 0, 'bot_returned_excluded must NOT increment consecutiveClaimFails');
+    assert.equal(worker._lastCycleWasFastSkip, true, 'must mark fast skip for quick next scan');
+    assert.ok(elapsedMs < 800, `Expected immediate yield (<800ms), got ${elapsedMs}ms`);
+    const summary = db.getNumberEventSummary(60_000);
+    assert.equal(summary.byReason.bot_duplicate || 0, 1);
+    assert.equal(summary.byOutcome?.claim_fail || 0, 0, 'must NOT record a fake claim_fail event');
+
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 16. Cooldown Breakdown, Selective Clear & Skip-Registered-OFF Bypass
+// ---------------------------------------------------------------------------
+test('getCooldownBreakdown, clearCooldownsByStatus & tryClaimPhone(ignoreAlreadyRegistered) work accurately', () => {
+  const dir = makeTmpDir();
+  try {
+    const db = new ToingDb({
+      dbPath: path.join(dir, 'toing.db'),
+      dataDir: dir,
+      encryptionKey: 'cool-ctrl-key',
+      sessionsDir: path.join(dir, 'sessions'),
+    });
+
+    db.markNumberUsed('9000000001', { status: 'extracted', cooldownDays: 30, source: 'toing' });
+    db.markNumberUsed('9000000002', { status: 'already_registered', cooldownDays: 30, source: 'toing_check' });
+    db.markNumberUsed('9000000003', { status: 'seed', cooldownDays: 30, source: 'seed' });
+    db.markNumberUsed('9000000004', { status: 'otp_timeout_cool', cooldownMs: 10 * 60_000, source: 'otp_timeout' });
+    db.markNumberUsed('9000000005', { status: 'send_otp_blocked', cooldownMs: 2 * 3600_000, source: 'swiggy_block' });
+
+    const bd = db.getCooldownBreakdown();
+    assert.equal(bd.extracted, 1);
+    assert.equal(bd.already_registered, 1);
+    assert.equal(bd.seed, 1);
+    assert.equal(bd.otp_timeout_cool, 1);
+    assert.equal(bd.send_otp_blocked, 1);
+    assert.equal(bd.total, 5);
+
+    // Default tryClaimPhone blocks already_registered with remainingMs > 0
+    const blocked = db.tryClaimPhone('9000000002', 1);
+    assert.equal(blocked.ok, false);
+    assert.equal(blocked.reason, 'cooldown');
+    assert.equal(blocked.status, 'already_registered');
+    assert.ok(blocked.remainingMs > 20 * 24 * 3600_000);
+
+    // When Skip Registered is OFF (ignoreAlreadyRegistered=true), already_registered is claimable
+    // while extracted/seed remain protected!
+    const allowed = db.tryClaimPhone('9000000002', 1, { ignoreAlreadyRegistered: true });
+    assert.equal(allowed.ok, true);
+    db.releaseClaim('9000000002', 1);
+
+    const stillBlockedExtracted = db.tryClaimPhone('9000000001', 1, { ignoreAlreadyRegistered: true });
+    assert.equal(stillBlockedExtracted.ok, false);
+    assert.equal(stillBlockedExtracted.status, 'extracted');
+
+    // Selective clear temp (otp_timeout_cool + send_otp_blocked)
+    const clearedTemp = db.clearCooldownsByStatus(['otp_timeout_cool', 'send_otp_blocked']);
+    assert.equal(clearedTemp, 2);
+    const bd2 = db.getCooldownBreakdown();
+    assert.equal(bd2.otp_timeout_cool, 0);
+    assert.equal(bd2.send_otp_blocked, 0);
+    assert.equal(bd2.total, 3);
+
+    // Selective clear seed only
+    const clearedSeed = db.clearCooldownsByStatus(['seed']);
+    assert.equal(clearedSeed, 1);
+    assert.equal(db.getCooldownBreakdown().seed, 0);
+    assert.equal(db.getCooldownBreakdown().total, 2);
+
+    // Clear all remaining
+    const clearedAll = db.clearCooldownsByStatus('all');
+    assert.equal(clearedAll, 2);
+    assert.equal(db.getCooldownBreakdown().total, 0);
+
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

@@ -68,7 +68,7 @@ export function loadConfig(env = process.env) {
     toingHttpConcurrency: envInt(env, 'TOING_HTTP_CONCURRENCY', 20, 1, 100),
 
     defaultOtpBot: String(env.DEFAULT_OTP_BOT || 'hathi').trim().toLowerCase(),
-    otpTimeoutMs: envInt(env, 'OTP_TIMEOUT_MS', 26_000, 5_000, 120_000),
+    otpTimeoutMs: envInt(env, 'OTP_TIMEOUT_MS', 30_000, 5_000, 120_000),
     otpRefreshMs: envInt(env, 'OTP_REFRESH_MS', 2_200, 800, 10_000),
     claimTimeoutMs: envInt(env, 'CLAIM_TIMEOUT_MS', 16_000, 4_000, 60_000),
     autoFailoverBots: envBool(env, 'AUTO_FAILOVER_BOTS', false),
@@ -79,7 +79,7 @@ export function loadConfig(env = process.env) {
     maxSlots: envInt(env, 'MAX_SLOTS', DEFAULT_MAX_SLOTS, 1, 100),
     bootBatchSize: envInt(env, 'BOOT_BATCH_SIZE', 5, 1, 25),
     bootBatchDelayMs: envInt(env, 'BOOT_BATCH_DELAY_MS', 1_500, 100, 15_000),
-    slotStuckTimeoutMs: envInt(env, 'SLOT_STUCK_TIMEOUT_MS', 55_000, 20_000, 300_000),
+    slotStuckTimeoutMs: envInt(env, 'SLOT_STUCK_TIMEOUT_MS', 65_000, 20_000, 300_000),
     slotJitterMinMs: envInt(env, 'SLOT_JITTER_MIN_MS', 250, 0, 10_000),
     slotJitterMaxMs: envInt(env, 'SLOT_JITTER_MAX_MS', 900, 0, 20_000),
 
