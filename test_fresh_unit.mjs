@@ -3435,7 +3435,7 @@ Thanks`)),
   'otp bot: refresh ka text fallback set hai (Hermes/Hathi/HardXotp)');
   const tgRefreshSrc = await fsp.readFile(new URL('./telegram-otp-source.js', import.meta.url), 'utf8');
   ok(tgRefreshSrc.includes('async function refreshHermesChatUnlocked')
-    && tgRefreshSrc.includes('fetchIncomingUnlocked(12)')
+    && tgRefreshSrc.includes('fetchIncomingUnlocked(12, ctx)')
     && tgRefreshSrc.includes('lastClickedButton = `${text} (text)`'),
   'otp bot refresh: 12 screens tak button dhoondhta hai, na mile to text bhejta hai');
   ok(tgRefreshSrc.includes('|| 1_000)') && tgRefreshSrc.includes('refreshAttempts += 1'),

@@ -527,8 +527,226 @@ const providerState = {
   lastOtpScan: null,
 };
 
-export function isTelegramLoginInProgress() {
-  return Boolean(providerState.loginInProgress);
+// ---------------------------------------------------------------------------
+// Per-slot parallel context — 5 (or more) spare accounts ko ek saath chalane
+// ke liye. Har slot ke apne client, entity cache, providerState aur lock hai.
+// Global singleton sirf fallback hai (slot 0 / legacy single-account flow).
+// ---------------------------------------------------------------------------
+const slotContexts = new Map(); // slot -> SlotContext
+
+function createSlotContext(slot, config) {
+  return {
+    slot,
+    config,
+    clientRef: null,
+    clientPromise: null,
+    entityRef: null,
+    entityCacheKey: '',
+    lockTail: Promise.resolve(),
+    providerState: {
+      connected: false,
+      authorized: false,
+      loginInProgress: false,
+      meLabel: '',
+      currentPhone: '',
+      currentEntry: null,
+      currentConsumed: false,
+      currentMessageId: 0,
+      lastError: '',
+      lastActionAt: 0,
+      lastCheckedAt: 0,
+      lastScreenButtons: [],
+      lastClickedButton: '',
+      lastClickedRole: '',
+      lastCallbackMessage: '',
+      claimPhase: '',
+      trackedOtpMessageIds: [],
+      lastOtpText: '',
+      lastOtpScan: null,
+    },
+  };
+}
+
+export function getSlotContext(slot, config) {
+  const s = Number(slot) || 0;
+  let ctx = slotContexts.get(s);
+  if (!ctx) {
+    ctx = createSlotContext(s, config);
+    slotContexts.set(s, ctx);
+  }
+  return ctx;
+}
+
+// Helper: resolve a context reference — null means "use global singleton"
+function resolveCtx(ctx) {
+  return ctx || null;
+}
+
+function getClientRef(ctx) {
+  return ctx ? ctx.clientRef : clientRef;
+}
+
+function getProviderState(ctx) {
+  return ctx ? ctx.providerState : providerState;
+}
+
+function getEntityRef(ctx) {
+  return ctx ? ctx.entityRef : entityRef;
+}
+
+function getEntityCacheKey(ctx) {
+  return ctx ? ctx.entityCacheKey : entityCacheKey;
+}
+
+function setClientRef(client, ctx) {
+  if (ctx) ctx.clientRef = client; else clientRef = client;
+}
+
+function setEntityRef(entity, key, ctx) {
+  if (ctx) { ctx.entityRef = entity; ctx.entityCacheKey = key; }
+  else { entityRef = entity; entityCacheKey = key; }
+}
+
+function resetClientForContext(reason, ctx) {
+  if (ctx) {
+    try { ctx.clientRef?.disconnect?.(); } catch {}
+    ctx.clientRef = null;
+    ctx.clientPromise = null;
+    ctx.entityRef = null;
+    ctx.entityCacheKey = '';
+    ctx.providerState.connected = false;
+    ctx.providerState.authorized = false;
+    ctx.providerState.lastActionAt = Date.now();
+    ctx.providerState.lastScreenButtons = [];
+    ctx.providerState.claimPhase = reason;
+  } else {
+    try { clientRef?.disconnect?.(); } catch {}
+    clientRef = null;
+    clientPromise = null;
+    entityRef = null;
+    entityCacheKey = '';
+    providerState.connected = false;
+    providerState.authorized = false;
+    providerState.lastActionAt = Date.now();
+    providerState.lastScreenButtons = [];
+    providerState.claimPhase = reason;
+  }
+}
+
+// Per-slot lock — har slot ka apna lockTail, alag accounts ek saath chal sakte hain.
+async function withSlotLock(slot, fn) {
+  const ctx = getSlotContext(slot, null);
+  if (telegramLockCtx.getStore() === TELEGRAM_LOCK_TOKEN) {
+    return fn();
+  }
+  const previous = ctx.lockTail.catch(() => {});
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  ctx.lockTail = previous.then(() => gate);
+  try {
+    await previous;
+  } finally {}
+  try {
+    return await telegramLockCtx.run(TELEGRAM_LOCK_TOKEN, fn);
+  } finally {
+    release();
+  }
+}
+
+// Parallel claim — N slots par ek saath number claim.
+// Har slot apne client se claim karta hai, alag lock per slot.
+export async function claimNumbersParallel(slots, opts = {}) {
+  const slotList = (Array.isArray(slots) ? slots : [slots])
+    .map((s) => Number(s) || 0)
+    .filter((s) => s >= 0);
+  const maxParallel = Math.max(1, Number(opts.maxParallel) || slotList.length || 1);
+  const results = await Promise.allSettled(
+    slotList.slice(0, maxParallel).map(async (slot) => {
+      const config = getTelegramOtpConfigForSlot(slot);
+      const ctx = getSlotContext(slot, config);
+      const entry = await withSlotLock(slot, () => claimNumberWithActiveAccount(opts, ctx));
+      return { slot, entry };
+    })
+  );
+  const claimed = [];
+  const errors = [];
+  for (let i = 0; i < results.length; i++) {
+    if (results[i].status === 'fulfilled') {
+      claimed.push(results[i].value);
+    } else {
+      errors.push({ slot: slotList[i], error: results[i].reason });
+    }
+  }
+  return { claimed, errors };
+}
+
+function getTelegramOtpConfigForSlot(slot) {
+  const env = process.env;
+  const baseConfig = getTelegramOtpConfig(env);
+  if (slot === 0 || Number(baseConfig.accountCount || 1) <= 1) return baseConfig;
+  const sessionEnvKey = `TELEGRAM_SESSION_${slot}`;
+  const session = String(env[sessionEnvKey] || env[`TELEGRAM_SESSION_${slot}`] || '');
+  return {
+    ...baseConfig,
+    session: session || baseConfig.session,
+    accountSlot: slot,
+    accountTag: baseConfig.accountTag ? `${baseConfig.accountTag}-${slot}` : `slot-${slot}`,
+  };
+}
+
+// Get list of configured spare account slots from env.
+export function getParallelSlots(min = 1) {
+  const baseConfig = getTelegramOtpConfig(process.env);
+  const slots = [];
+  if (baseConfig.configured) slots.push(0);
+  for (let s = 1; s <= 8; s++) {
+    const sessionEnvKey = `TELEGRAM_SESSION_${s}`;
+    if (String(process.env[sessionEnvKey] || '').trim()) slots.push(s);
+  }
+  // At least `min` slots — agar kam hain to slot 0 hi repeat kar do
+  while (slots.length < min) slots.push(0);
+  return slots.slice(0, Math.max(min, slots.length));
+}
+
+// Parallel OTP wait — N slots par ek saath OTP wait.
+// Har slot apne client se OTP poll karta hai, alag lock per slot.
+export async function waitForOtpCodesParallel(entries, opts = {}) {
+  const items = (Array.isArray(entries) ? entries : [entries])
+    .filter((e) => e && e.phone);
+  const maxParallel = Math.max(1, Number(opts.maxParallel) || items.length || 1);
+  const results = await Promise.allSettled(
+    items.slice(0, maxParallel).map(async (item) => {
+      const slot = Number(item.slot) || 0;
+      const config = getTelegramOtpConfigForSlot(slot);
+      const ctx = getSlotContext(slot, config);
+      const code = await withSlotLock(slot, () =>
+        waitForTelegramOtpCode(item.phone, opts, ctx)
+      );
+      return { slot, phone: item.phone, ...code };
+    })
+  );
+  const codes = [];
+  const errors = [];
+  for (let i = 0; i < results.length; i++) {
+    if (results[i].status === 'fulfilled') {
+      codes.push(results[i].value);
+    } else {
+      errors.push({ slot: Number(items[i].slot) || 0, phone: items[i].phone, error: results[i].reason });
+    }
+  }
+  return { codes, errors };
+}
+
+// Parallel discard — N slots ka current number discard karo.
+export function discardCurrentNumbersParallel(items, ctx) {
+  for (const item of (Array.isArray(items) ? items : [items])) {
+    if (!item) continue;
+    discardCurrentTelegramNumber(item.phone || item.reason || '', ctx || (item.slot ? getSlotContext(item.slot, null) : null));
+  }
+}
+
+export function isTelegramLoginInProgress(ctx) {
+  return Boolean(getProviderState(ctx).loginInProgress);
 }
 
 export function normalizeTelegramLoginPhone(value = '') {
@@ -547,13 +765,14 @@ export function normalizeTelegramLoginPhone(value = '') {
   return '';
 }
 
-function setLastError(error) {
+function setLastError(error, ctx) {
+  const ps = getProviderState(ctx);
   const classified = classifyTelegramError(error);
   const raw = String(error?.message || error || '').slice(0, 190);
-  providerState.lastErrorCode = classified.code;
-  providerState.lastErrorHint = classified.hint;
-  providerState.lastErrorLabel = classified.label;
-  providerState.lastError = classified.code && classified.code !== 'UNKNOWN'
+  ps.lastErrorCode = classified.code;
+  ps.lastErrorHint = classified.hint;
+  ps.lastErrorLabel = classified.label;
+  ps.lastError = classified.code && classified.code !== 'UNKNOWN'
     ? `${classified.label} — ${raw}`
     : raw.slice(0, 220);
 }
@@ -563,24 +782,24 @@ function setLastError(error) {
 // (jaise @SwiggyByWorldBot) ko bhi ISI client/lock par chalane ke liye.
 // Ek hi session par do client = FLOOD_WAIT/session revoke, isliye lock shared.
 // ---------------------------------------------------------------------------
-export function withTelegramUserClient(fn) {
+export function withTelegramUserClient(fn, ctx) {
   return withTelegramLock(async () => {
-    const { client, config } = await ensureClientUnlocked();
+    const { client, config } = await ensureClientUnlocked(ctx);
     return fn({ client, config });
   });
 }
 
-export async function telegramUserClientStatus() {
+export async function telegramUserClientStatus(ctx) {
   try {
     const config = getTelegramOtpConfig();
     return {
       configured: Boolean(config.configured),
       missing: [...(config.missing || [])],
-      connected: Boolean(providerState.connected),
-      authorized: Boolean(providerState.authorized),
-      me: providerState.meLabel || '',
-      loginInProgress: Boolean(providerState.loginInProgress),
-      lastError: providerState.lastError || '',
+      connected: Boolean(getProviderState(ctx).connected),
+      authorized: Boolean(getProviderState(ctx).authorized),
+      me: getProviderState(ctx).meLabel || '',
+      loginInProgress: Boolean(getProviderState(ctx).loginInProgress),
+      lastError: getProviderState(ctx).lastError || '',
     };
   } catch (e) {
     return { configured: false, missing: [], connected: false, authorized: false, me: '', loginInProgress: false, lastError: String(e?.message || e) };
@@ -713,14 +932,9 @@ export function _isTelegramClientConnectionError(error) {
   return /(AUTH_KEY|SESSION_REVOKED|USER_DEACTIVATED|not connected|disconnected|Connection closed|ECONNRESET|EPIPE|socket|timed?\s*out|timeout|network)/i.test(msg);
 }
 
-function invalidateClient(error) {
+function invalidateClient(error, ctx) {
   if (!_isTelegramClientConnectionError(error)) return;
-  clientRef = null;
-  clientPromise = null;
-  entityRef = null;
-  entityCacheKey = '';
-  providerState.connected = false;
-  providerState.authorized = false;
+  resetClientForContext('invalidate', ctx);
 }
 
 function telegramClientLooksConnected(client) {
@@ -735,29 +949,29 @@ function telegramClientLooksConnected(client) {
 
 export { telegramClientLooksConnected as _telegramClientLooksConnected };
 
-async function ensureClientUnlocked() {
-  if (providerState.loginInProgress) {
+async function ensureClientUnlocked(ctx) {
+  const ps = getProviderState(ctx);
+  if (ps.loginInProgress) {
     throw new Error('Telegram account login chal raha hai — pehle Add Telegram Account complete ya cancel karo.');
   }
-  const config = getTelegramOtpConfig();
+  const ctxObj = ctx || globalContext;
+  const config = ctxObj.config || getTelegramOtpConfig();
+  ctxObj.config = config;
   if (!config.configured) {
     throw new Error(`Telegram Hermes setup missing hai: ${config.missing.join(', ')}`);
   }
-  if (clientRef && providerState.connected && telegramClientLooksConnected(clientRef)) return { client: clientRef, config };
-  if (clientRef && !telegramClientLooksConnected(clientRef)) {
+  const curClient = getClientRef(ctx);
+  if (curClient && ps.connected && telegramClientLooksConnected(curClient)) return { client: curClient, config };
+  if (curClient && !telegramClientLooksConnected(curClient)) {
     // Render/network jhatke ke baad Teleproto socket mar sakta hai lekin
     // providerState purana connected=true dikhata rehta tha — phir har
     // claim wahi murda client use karke batch ko exhausted bana deta tha.
-    clientRef = null;
-    clientPromise = null;
-    entityRef = null;
-    entityCacheKey = '';
-    providerState.connected = false;
-    providerState.authorized = false;
+    resetClientForContext('stale-client', ctx);
   }
-  if (clientPromise) return clientPromise;
+  const curPromise = ctx ? ctx.clientPromise : clientPromise;
+  if (curPromise) return curPromise;
 
-  clientPromise = (async () => {
+  const newPromise = (async () => {
     const client = await createTelegramUserClient(config.session, config);
     await client.connect();
     const authorized = await client.checkAuthorization();
@@ -772,9 +986,9 @@ async function ensureClientUnlocked() {
       const me = await client.getMe();
       meLabel = me?.username ? `@${me.username}` : [me?.firstName, me?.lastName].filter(Boolean).join(' ');
     } catch {}
-    clientRef = client;
+    setClientRef(client, ctx);
     roster.markAccountHealthy(config.accountSlot, { me: meLabel });
-    Object.assign(providerState, {
+    Object.assign(ps, {
       connected: true,
       authorized: true,
       meLabel,
@@ -785,24 +999,23 @@ async function ensureClientUnlocked() {
     });
     return { client, config };
   })().catch((error) => {
-    clientPromise = null;
-    clientRef = null;
-    entityRef = null;
-    entityCacheKey = '';
-    providerState.connected = false;
-    providerState.authorized = false;
-    setLastError(error);
+    if (ctx) { ctx.clientPromise = null; ctx.clientRef = null; ctx.entityRef = null; ctx.entityCacheKey = ''; }
+    else { clientPromise = null; clientRef = null; entityRef = null; entityCacheKey = ''; }
+    ps.connected = false;
+    ps.authorized = false;
+    setLastError(error, ctx);
     throw error;
   });
-  return clientPromise;
+  if (ctx) ctx.clientPromise = newPromise; else clientPromise = newPromise;
+  return newPromise;
 }
 
-async function ensureEntityUnlocked(client, config) {
+async function ensureEntityUnlocked(client, config, ctx) {
   const key = String(config.botUsername || '').toLowerCase();
-  if (entityRef && entityCacheKey === key) return entityRef;
-  entityRef = await client.getEntity(`@${config.botUsername}`);
-  entityCacheKey = key;
-  return entityRef;
+  if (getEntityRef(ctx) && getEntityCacheKey(ctx) === key) return getEntityRef(ctx);
+  const entity = await client.getEntity(`@${config.botUsername}`);
+  setEntityRef(entity, key, ctx);
+  return entity;
 }
 
 function isIncomingMessage(message) {
@@ -895,17 +1108,17 @@ export function _selectLatestFreshHermesNumberCard(messages = [], {
   return { status: 'none', result: null };
 }
 
-async function fetchIncomingUnlocked(limit = 10) {
+async function fetchIncomingUnlocked(limit = 10, ctx) {
   try {
-    const { client, config } = await ensureClientUnlocked();
-    const entity = await ensureEntityUnlocked(client, config);
+    const { client, config } = await ensureClientUnlocked(ctx);
+    const entity = await ensureEntityUnlocked(client, config, ctx);
     const messages = await client.getMessages(entity, { limit: Math.max(1, Number(limit) || 10) });
     const arr = Array.isArray(messages) ? messages : [...(messages || [])];
-    providerState.lastCheckedAt = Date.now();
+    getProviderState(ctx).lastCheckedAt = Date.now();
     return arr.filter(isIncomingMessage);
   } catch (error) {
-    invalidateClient(error);
-    setLastError(error);
+    invalidateClient(error, ctx);
+    setLastError(error, ctx);
     throw error;
   }
 }
@@ -961,9 +1174,9 @@ function roleForHermesButton(button, config) {
   return '';
 }
 
-async function latestHermesScreenUnlocked(limit = 6) {
-  const { config } = await ensureClientUnlocked();
-  const messages = await fetchIncomingUnlocked(limit);
+async function latestHermesScreenUnlocked(limit = 6, ctx) {
+  const { config } = await ensureClientUnlocked(ctx);
+  const messages = await fetchIncomingUnlocked(limit, ctx);
   for (const message of messages) {
     const buttons = await getMessageButtons(message);
     const entries = buttons
@@ -984,22 +1197,23 @@ async function latestHermesScreenUnlocked(limit = 6) {
       buttonRoles: entries.map((entry) => entry.role),
       card: parseTelegramNumberCard(text),
     };
-    providerState.lastScreenButtons = [...screen.buttons];
+    getProviderState(ctx).lastScreenButtons = [...screen.buttons];
     return screen;
   }
-  providerState.lastScreenButtons = [];
+  getProviderState(ctx).lastScreenButtons = [];
   return null;
 }
 
-async function clickLatestHermesButtonUnlocked({ mode = 'claim', phone = '' } = {}) {
-  const screen = await latestHermesScreenUnlocked(6);
+async function clickLatestHermesButtonUnlocked({ mode = 'claim', phone = '' } = {}, ctx) {
+  const screen = await latestHermesScreenUnlocked(6, ctx);
+  const ps = getProviderState(ctx);
   if (!screen) {
-    providerState.claimPhase = 'no-latest-screen';
+    ps.claimPhase = 'no-latest-screen';
     return { ok: false, reason: 'no-latest-screen', screenButtons: [] };
   }
 
   const action = _selectHermesLatestScreenAction([screen], { mode, phone });
-  providerState.claimPhase = action?.role
+  ps.claimPhase = action?.role
     ? `click-${action.role}`
     : (action?.reason || 'no-button-on-latest-screen');
   if (!action?.role || action.buttonIndex < 0) {
@@ -1016,12 +1230,12 @@ async function clickLatestHermesButtonUnlocked({ mode = 'claim', phone = '' } = 
   const entry = screen.entries[action.buttonIndex];
   const answer = await entry.button.click({});
   const callbackMessage = String(answer?.message || '').trim().slice(0, 180);
-  providerState.lastActionAt = Date.now();
-  providerState.lastError = '';
-  providerState.lastClickedButton = entry.text;
-  providerState.lastClickedRole = action.role;
-  providerState.lastCallbackMessage = callbackMessage;
-  providerState.claimPhase = `clicked-${action.role}`;
+  ps.lastActionAt = Date.now();
+  ps.lastError = '';
+  ps.lastClickedButton = entry.text;
+  ps.lastClickedRole = action.role;
+  ps.lastCallbackMessage = callbackMessage;
+  ps.claimPhase = `clicked-${action.role}`;
   console.log(
     `[Hermes] Latest screen button click: ${entry.text} (${action.role})` +
     `${callbackMessage ? ` — callback: ${callbackMessage}` : ''}`
@@ -1053,8 +1267,8 @@ async function clickButtonUnlocked(role, { phone = '' } = {}) {
 //  2) Button na mile / click phate to button ka TEXT likh kar bhejo.
 // Pehle sirf "latest" screen dekhi jati thi — agar latest screen kisi aur
 // number ki card hoti to refresh hi nahi hota tha aur bot Cancel kar deta tha.
-async function refreshHermesChatUnlocked({ phone = '', attempt = 0 } = {}) {
-  const { client, config } = await ensureClientUnlocked();
+async function refreshHermesChatUnlocked({ phone = '', attempt = 0 } = {}, ctx) {
+  const { client, config } = await ensureClientUnlocked(ctx);
   const wanted = String(phone || '').replace(/\D/g, '').slice(-10);
   const profile = getActiveOtpBotProfile();
   // 🎓 Custom trained bot — owner ki refresh training hi chalti hai.
@@ -1069,20 +1283,20 @@ async function refreshHermesChatUnlocked({ phone = '', attempt = 0 } = {}) {
         timeoutMs: 12_000,
       });
       if (r?.ok) {
-        providerState.claimPhase = `refresh-training-${attempt || 1}`;
-        providerState.lastActionAt = Date.now();
-        providerState.lastError = '';
-        providerState.lastClickedButton = String(r.steps?.[r.steps.length - 1]?.detail || 'training').slice(0, 90);
-        console.log(`[CustomBot] 🔄 REFRESH #${attempt || 1} (training) — ${providerState.lastClickedButton}`);
-        return { ok: true, via: 'training', buttonText: providerState.lastClickedButton || 'training' };
+        getProviderState(ctx).claimPhase = `refresh-training-${attempt || 1}`;
+        getProviderState(ctx).lastActionAt = Date.now();
+        getProviderState(ctx).lastError = '';
+        getProviderState(ctx).lastClickedButton = String(r.steps?.[r.steps.length - 1]?.detail || 'training').slice(0, 90);
+        console.log(`[CustomBot] 🔄 REFRESH #${attempt || 1} (training) — ${getProviderState(ctx).lastClickedButton}`);
+        return { ok: true, via: 'training', buttonText: getProviderState(ctx).lastClickedButton || 'training' };
       }
-      providerState.claimPhase = 'refresh-training-failed';
-      providerState.lastError = String(r?.error || 'refresh training failed').slice(0, 180);
+      getProviderState(ctx).claimPhase = 'refresh-training-failed';
+      getProviderState(ctx).lastError = String(r?.error || 'refresh training failed').slice(0, 180);
       console.warn(`[CustomBot] REFRESH training fail: ${String(r?.error || 'unknown').slice(0, 140)}`);
       return { ok: false, reason: `training: ${String(r?.error || 'refresh training failed').slice(0, 90)}` };
     } catch (error) {
-      providerState.claimPhase = 'refresh-training-error';
-      providerState.lastError = String(error?.message || error).slice(0, 180);
+      getProviderState(ctx).claimPhase = 'refresh-training-error';
+      getProviderState(ctx).lastError = String(error?.message || error).slice(0, 180);
       return { ok: false, reason: `training-error: ${String(error?.message || error).slice(0, 80)}` };
     }
   }
@@ -1097,7 +1311,7 @@ async function refreshHermesChatUnlocked({ phone = '', attempt = 0 } = {}) {
   let fallbackRefresh = null;
 
   try {
-    const recent = await fetchIncomingUnlocked(12);
+    const recent = await fetchIncomingUnlocked(12, ctx);
     // Window se bahar gaya number-card bhi dekho — usi par asli REFRESH button
     // hota hai. Sirf text fallback par depend karna bot ke hisaab se fail tha.
     const tracked = await fetchTrackedMessagesUnlocked(recent);
@@ -1124,11 +1338,11 @@ async function refreshHermesChatUnlocked({ phone = '', attempt = 0 } = {}) {
       const entry = entries[index];
       try {
         const answer = await entry.button.click({});
-        providerState.lastActionAt = Date.now();
-        providerState.lastClickedButton = entry.text;
-        providerState.lastClickedRole = entry.role;
-        providerState.lastCallbackMessage = String(answer?.message || '').trim().slice(0, 180);
-        providerState.claimPhase = `refresh-${attempt || 1}`;
+        getProviderState(ctx).lastActionAt = Date.now();
+        getProviderState(ctx).lastClickedButton = entry.text;
+        getProviderState(ctx).lastClickedRole = entry.role;
+        getProviderState(ctx).lastCallbackMessage = String(answer?.message || '').trim().slice(0, 180);
+        getProviderState(ctx).claimPhase = `refresh-${attempt || 1}`;
         console.log(`[Hermes] 🔄 REFRESH #${attempt || 1} (click: ${entry.text})`);
         return { ok: true, via: 'click', buttonText: entry.text };
       } catch (error) {
@@ -1143,11 +1357,11 @@ async function refreshHermesChatUnlocked({ phone = '', attempt = 0 } = {}) {
   if (fallbackRefresh && Number(attempt) >= 2) {
     try {
       const answer = await fallbackRefresh.entry.button.click({});
-      providerState.lastActionAt = Date.now();
-      providerState.lastClickedButton = fallbackRefresh.entry.text;
-      providerState.lastClickedRole = fallbackRefresh.entry.role;
-      providerState.lastCallbackMessage = String(answer?.message || '').trim().slice(0, 180);
-      providerState.claimPhase = `refresh-${attempt || 1}`;
+      getProviderState(ctx).lastActionAt = Date.now();
+      getProviderState(ctx).lastClickedButton = fallbackRefresh.entry.text;
+      getProviderState(ctx).lastClickedRole = fallbackRefresh.entry.role;
+      getProviderState(ctx).lastCallbackMessage = String(answer?.message || '').trim().slice(0, 180);
+      getProviderState(ctx).claimPhase = `refresh-${attempt || 1}`;
       console.log(`[Hermes] 🔄 REFRESH #${attempt || 1} (click: ${fallbackRefresh.entry.text} — card +${fallbackRefresh.phone}, wanted +${wanted || '?'}: naye card ke liye) `);
       return { ok: true, via: 'click-fallback', buttonText: fallbackRefresh.entry.text, reason: 'different-number-card' };
     } catch (error) {
@@ -1160,28 +1374,28 @@ async function refreshHermesChatUnlocked({ phone = '', attempt = 0 } = {}) {
   try {
     const entity = await ensureEntityUnlocked(client, config);
     await client.sendMessage(entity, { message: text });
-    providerState.lastActionAt = Date.now();
-    providerState.lastClickedButton = `${text} (text)`;
-    providerState.lastClickedRole = 'refresh';
-    providerState.claimPhase = `refresh-text-${attempt || 1}`;
+    getProviderState(ctx).lastActionAt = Date.now();
+    getProviderState(ctx).lastClickedButton = `${text} (text)`;
+    getProviderState(ctx).lastClickedRole = 'refresh';
+    getProviderState(ctx).claimPhase = `refresh-text-${attempt || 1}`;
     console.log(`[Hermes] 🔄 REFRESH #${attempt || 1} (text: "${text}") — button nahi mila (${lastReason})`);
     return { ok: true, via: 'text', buttonText: text, reason: lastReason };
   } catch (error) {
-    providerState.claimPhase = 'refresh-failed';
+    getProviderState(ctx).claimPhase = 'refresh-failed';
     console.warn(`[Hermes] REFRESH fail: ${String(error?.message || error).slice(0, 90)}`);
     return { ok: false, reason: lastReason };
   }
 }
 
-async function sendStartUnlocked() {
-  const { client, config } = await ensureClientUnlocked();
+async function sendStartUnlocked(ctx) {
+  const { client, config } = await ensureClientUnlocked(ctx);
   const entity = await ensureEntityUnlocked(client, config);
   await client.sendMessage(entity, { message: '/start' });
-  providerState.lastActionAt = Date.now();
+  getProviderState(ctx).lastActionAt = Date.now();
 }
 
-async function latestNumberCardUnlocked(excludePhones = new Set()) {
-  const messages = await fetchIncomingUnlocked(20);
+async function latestNumberCardUnlocked(excludePhones = new Set(), ctx) {
+  const messages = await fetchIncomingUnlocked(20, ctx);
   // "Latest" ka matlab sach-much sabse nayi card hai. Woh excluded ho to
   // usse peeche wali purani card ko chup-chaap try nahi karenge.
   const selection = _selectLatestFreshHermesNumberCard(messages, { excludePhones });
@@ -1196,11 +1410,11 @@ async function waitForNumberCardUnlocked({
   afterMessageId = 0,
   afterSignature = '',
   afterPhone = '',
-} = {}) {
+} = {}, ctx) {
   const deadline = Date.now() + Math.max(1_000, Number(timeoutMs) || 20_000);
   while (Date.now() < deadline) {
     if (typeof shouldAbort === 'function' && shouldAbort()) return null;
-    const messages = await fetchIncomingUnlocked(20);
+    const messages = await fetchIncomingUnlocked(20, ctx);
     const selection = _selectLatestFreshHermesNumberCard(messages, {
       baselineSignatures,
       excludePhones,
@@ -1230,12 +1444,12 @@ async function obtainCardUnlocked({
   excludePhones = new Set(),
   timeoutMs = 20_000,
   shouldAbort = null,
-} = {}) {
+} = {}, ctx) {
   const totalMs = Math.max(3_000, Number(timeoutMs) || 20_000);
   const deadline = Date.now() + totalMs;
   const remainingMs = () => Math.max(0, deadline - Date.now());
   const currentSignatures = async () => new Set(
-    (await fetchIncomingUnlocked(20)).map(messageSignature)
+    (await fetchIncomingUnlocked(20, ctx)).map(messageSignature)
   );
 
   // 🎓 Custom trained bot — coding wala claim flow nahi, owner ki training chalegi.
@@ -1253,13 +1467,13 @@ async function obtainCardUnlocked({
           shouldAbort,
         });
         if (r?.ok && r.card?.phone) return { card: r.card, message: r.message || null };
-        providerState.claimPhase = 'custom-claim-failed';
-        providerState.lastError = String(r?.error || 'custom claim training failed').slice(0, 180);
+        getProviderState(ctx).claimPhase = 'custom-claim-failed';
+        getProviderState(ctx).lastError = String(r?.error || 'custom claim training failed').slice(0, 180);
         console.warn(`[CustomBot] Claim training fail: ${String(r?.error || 'unknown').slice(0, 140)}`);
         return null;
       } catch (error) {
-        providerState.claimPhase = 'custom-claim-error';
-        providerState.lastError = String(error?.message || error).slice(0, 180);
+        getProviderState(ctx).claimPhase = 'custom-claim-error';
+        getProviderState(ctx).lastError = String(error?.message || error).slice(0, 180);
         return null;
       }
     }
@@ -1273,7 +1487,7 @@ async function obtainCardUnlocked({
   let baselineSignatures = await currentSignatures();
   let lastClaimCursor = { afterMessageId: 0, afterSignature: '', afterPhone: '' };
   const freshSinceBaseline = async () => {
-    const messages = await fetchIncomingUnlocked(20);
+    const messages = await fetchIncomingUnlocked(20, ctx);
     const selection = _selectLatestFreshHermesNumberCard(messages, {
       baselineSignatures,
       excludePhones,
@@ -1288,13 +1502,13 @@ async function obtainCardUnlocked({
   // padhkar sahi button, ya ek baar /start se welcome reset karke FIND.
   for (let cycle = 0; cycle < 3 && remainingMs() > 500; cycle++) {
     if (typeof shouldAbort === 'function' && shouldAbort()) return null;
-    providerState.claimPhase = `latest-screen-cycle-${cycle + 1}`;
+    getProviderState(ctx).claimPhase = `latest-screen-cycle-${cycle + 1}`;
     const clicked = await clickLatestHermesButtonUnlocked({ mode: 'claim' });
 
     if (!clicked.ok) {
       if (sentStart || remainingMs() <= 1_500) break;
       sentStart = true;
-      providerState.claimPhase = 'send-start';
+      getProviderState(ctx).claimPhase = 'send-start';
       await sendStartUnlocked();
       await sleepInterruptibly(Math.min(900, remainingMs()), shouldAbort);
       const lateFresh = await freshSinceBaseline();
@@ -1333,13 +1547,13 @@ async function obtainCardUnlocked({
     if (latestAny?.card?.phone && excludePhones.has(latestAny.card.phone)) {
       // Hermes ne consumed/rejected number hi dikhaya hai — agle cycle me
       // usi latest card ka NEW NUMBER turant chalega, timeout nahi jalega.
-      providerState.claimPhase = 'excluded-card-new-number';
+      getProviderState(ctx).claimPhase = 'excluded-card-new-number';
       continue;
     }
 
     if (!sentStart && cycle === 0 && remainingMs() > 2_000) {
       sentStart = true;
-      providerState.claimPhase = 'no-response-send-start';
+      getProviderState(ctx).claimPhase = 'no-response-send-start';
       await sendStartUnlocked();
       await sleepInterruptibly(Math.min(900, remainingMs()), shouldAbort);
       const lateFreshAfterStart = await freshSinceBaseline();
@@ -1375,28 +1589,19 @@ function entryFromCard(result, config) {
 }
 
 // Account badalne ke liye client band karo (ek hi waqt par ek account).
-async function resetClientForSlotSwitch(reason = 'account-rotate') {
-  try { await clientRef?.disconnect?.(); } catch {}
-  clientRef = null;
-  clientPromise = null;
-  entityRef = null;
-  entityCacheKey = '';
-  providerState.connected = false;
-  providerState.authorized = false;
-  providerState.lastActionAt = Date.now();
-  providerState.lastScreenButtons = [];
-  providerState.claimPhase = reason;
+async function resetClientForSlotSwitch(reason = 'account-rotate', ctx) {
+  resetClientForContext(reason, ctx);
 }
 
 // Ek account ke saath number claim — account pin ho jata hai taaki us number
 // ka OTP/REFRESH bhi usi account se ho (doosre account ke chat me wo number
 // hota hi nahi).
-async function claimNumberWithActiveAccount(opts = {}) {
-    const { config } = await ensureClientUnlocked();
+async function claimNumberWithActiveAccount(opts = {}, ctx) {
+    const { config } = await ensureClientUnlocked(ctx);
     roster.pinSlot(Number(config.accountSlot) || 0);
     const excluded = new Set((Array.isArray(opts.excludePhones) ? opts.excludePhones : []).map(String));
-    if (providerState.currentConsumed && providerState.currentPhone) excluded.add(providerState.currentPhone);
-    let forceNew = Boolean(opts.forceNew || providerState.currentConsumed);
+    if (getProviderState(ctx).currentConsumed && getProviderState(ctx).currentPhone) excluded.add(getProviderState(ctx).currentPhone);
+    let forceNew = Boolean(opts.forceNew || getProviderState(ctx).currentConsumed);
     const maxAttempts = Math.max(1, Math.min(10, Number(opts.maxAttempts) || 5));
     const shouldAbort = typeof opts.shouldAbort === 'function' ? opts.shouldAbort : null;
     let lastEntry = null;
@@ -1408,16 +1613,16 @@ async function claimNumberWithActiveAccount(opts = {}) {
         excludePhones: excluded,
         timeoutMs: opts.timeoutMs ?? 20_000,
         shouldAbort,
-      });
+      }, ctx);
       if (!result) {
-        const screenButtons = providerState.lastScreenButtons?.length
-          ? providerState.lastScreenButtons.join(' | ')
+        const screenButtons = getProviderState(ctx).lastScreenButtons?.length
+          ? getProviderState(ctx).lastScreenButtons.join(' | ')
           : 'none';
-        const clicked = providerState.lastClickedButton
-          ? `last click ${providerState.lastClickedButton}`
+        const clicked = getProviderState(ctx).lastClickedButton
+          ? `last click ${getProviderState(ctx).lastClickedButton}`
           : 'koi click nahi ho paya';
-        const callback = providerState.lastCallbackMessage
-          ? `; callback: ${providerState.lastCallbackMessage}`
+        const callback = getProviderState(ctx).lastCallbackMessage
+          ? `; callback: ${getProviderState(ctx).lastCallbackMessage}`
           : '';
         throw new Error(`@${config.botUsername} se number card nahi mila (latest screen: ${screenButtons}; ${clicked}${callback})`);
       }
@@ -1428,11 +1633,11 @@ async function claimNumberWithActiveAccount(opts = {}) {
       if (typeof opts.acceptEntry === 'function') {
         try { accepted = Boolean(await opts.acceptEntry(entry)); } catch { accepted = false; }
       }
-      providerState.currentPhone = entry.phone;
-      providerState.currentEntry = { ...entry };
-      providerState.currentMessageId = entry.telegramMessageId || 0;
-      providerState.currentConsumed = true;
-      providerState.lastError = '';
+      getProviderState(ctx).currentPhone = entry.phone;
+      getProviderState(ctx).currentEntry = { ...entry };
+      getProviderState(ctx).currentMessageId = entry.telegramMessageId || 0;
+      getProviderState(ctx).currentConsumed = true;
+      getProviderState(ctx).lastError = '';
       if (accepted) return entry;
 
       excluded.add(entry.phone);
@@ -1446,17 +1651,17 @@ async function claimNumberWithActiveAccount(opts = {}) {
 // dead nikle to us account ko side par rakh kar doosra spare account try karo.
 // (Sirf claim par rotate — number mil jane ke baad account badalna galat hai,
 // kyunki OTP usi account ke chat me aata hai.)
-export async function getNextTelegramNumber(opts = {}) {
+export async function getNextTelegramNumber(opts = {}, ctx) {
   return withTelegramLock(async () => {
     let lastAccountError = null;
     for (let accountAttempt = 0; accountAttempt < 2; accountAttempt++) {
       try {
-        return await claimNumberWithActiveAccount(opts);
+        return await claimNumberWithActiveAccount(opts, ctx);
       } catch (error) {
         const classified = classifyTelegramError(error);
         const actionable = classified.fatal || classified.kind === 'flood' || classified.cooldownMs > 0;
         if (!actionable) throw error;
-        const config = getTelegramOtpConfig();
+        const config = ctx?.config || getTelegramOtpConfig();
         const slot = Number(config.accountSlot) || 0;
         roster.markAccountFailure(slot, error);
         lastAccountError = classified;
@@ -1467,17 +1672,17 @@ export async function getNextTelegramNumber(opts = {}) {
           throw new Error(`${classified.label}. ${classified.hint}`);
         }
         roster.pinSlot(next);
-        await resetClientForSlotSwitch(`rotate-from-slot-${slot}`);
+        await resetClientForSlotSwitch(`rotate-from-slot-${slot}`, ctx);
       }
     }
     throw new Error(`${lastAccountError?.label || 'Telegram account error'}. ${lastAccountError?.hint || ''}`.trim());
   });
 }
 
-export function discardCurrentTelegramNumber(phoneOrReason = '') {
+export function discardCurrentTelegramNumber(phoneOrReason = '', ctx) {
   const maybePhone = String(phoneOrReason || '').replace(/\D/g, '').slice(-10);
-  if (!maybePhone || !providerState.currentPhone || maybePhone === providerState.currentPhone) {
-    providerState.currentConsumed = true;
+  if (!maybePhone || !getProviderState(ctx).currentPhone || maybePhone === getProviderState(ctx).currentPhone) {
+    getProviderState(ctx).currentConsumed = true;
   }
 }
 
@@ -1514,20 +1719,20 @@ function snapshotFromParsed(phone, message, parsed) {
   };
 }
 
-export async function snapshotTelegramOtpState(phone, opts = {}) {
+export async function snapshotTelegramOtpState(phone, opts = {}, ctx) {
   return withTelegramLock(async () => {
     try {
-      const messages = await fetchIncomingUnlocked(12);
+      const messages = await fetchIncomingUnlocked(12, ctx);
       for (const message of messages) {
         const parsed = parseTelegramOtpText(messageText(message));
         if (!parsed?.code) continue;
         if (parsed.phone && parsed.phone !== phone) continue;
-        if (!parsed.phone && providerState.currentPhone && providerState.currentPhone !== phone) continue;
+        if (!parsed.phone && getProviderState(ctx).currentPhone && getProviderState(ctx).currentPhone !== phone) continue;
         return snapshotFromParsed(phone, message, parsed);
       }
       return emptySnapshot(phone);
     } catch (error) {
-      setLastError(error);
+      setLastError(error, ctx);
       return { ...emptySnapshot(phone), error: String(error?.message || error) };
     }
   });
@@ -1686,10 +1891,10 @@ export function parseTelegramOtpMessage(phone = '', message = null) {
   };
 }
 
-function trackOtpMessageId(id = 0) {
+function trackOtpMessageId(id = 0, ctx) {
   const n = Number(id) || 0;
   if (!n) return;
-  const list = providerState.trackedOtpMessageIds;
+  const list = getProviderState(ctx).trackedOtpMessageIds;
   if (list.includes(n)) return;
   list.push(n);
   while (list.length > 10) list.shift();
@@ -1699,16 +1904,16 @@ function trackOtpMessageId(id = 0) {
 // (Har second refresh chat me naye messages jodta hai, isliye asli SMS card
 //  latest window ke baahar chala jata hai. Pehle wahi card chup-chaap miss hota
 //  tha aur bot ko OTP kabhi nahi milta tha.)
-async function fetchTrackedMessagesUnlocked(knownMessages = []) {
+async function fetchTrackedMessagesUnlocked(knownMessages = [], ctx) {
   const known = new Set((knownMessages || []).map(messageId));
-  const ids = [...new Set([...providerState.trackedOtpMessageIds, providerState.currentMessageId])]
+  const ids = [...new Set([...getProviderState(ctx).trackedOtpMessageIds, getProviderState(ctx).currentMessageId])]
     .map(Number)
     .filter((id) => id > 0 && !known.has(id))
     .slice(-10);
   if (!ids.length) return [];
   try {
-    const { client, config } = await ensureClientUnlocked();
-    const entity = await ensureEntityUnlocked(client, config);
+    const { client, config } = await ensureClientUnlocked(ctx);
+    const entity = await ensureEntityUnlocked(client, config, ctx);
     const extra = await client.getMessages(entity, { ids });
     const out = [];
     for (const message of (Array.isArray(extra) ? extra : [...(extra || [])])) {
@@ -1719,17 +1924,17 @@ async function fetchTrackedMessagesUnlocked(knownMessages = []) {
     }
     return out;
   } catch (error) {
-    providerState.lastOtpScan = {
-      ...(providerState.lastOtpScan || {}),
+    getProviderState(ctx).lastOtpScan = {
+      ...(getProviderState(ctx).lastOtpScan || {}),
       extraError: String(error?.message || error).slice(0, 80),
     };
     return [];
   }
 }
 
-async function readOtpCandidatesUnlocked(phone) {
+async function readOtpCandidatesUnlocked(phone, ctx) {
   const limit = otpScanLimit();
-  const windowMessages = await fetchIncomingUnlocked(limit);
+  const windowMessages = await fetchIncomingUnlocked(limit, ctx);
   const tracked = await fetchTrackedMessagesUnlocked(windowMessages);
   const messages = [...(windowMessages || []), ...tracked];
   const extraIds = tracked.map(messageId);
@@ -1751,7 +1956,7 @@ async function readOtpCandidatesUnlocked(phone) {
     // Kisi DOOSRE number ka card hai to chhodo. Number likha hi nahi (sirf
     // "OTP: 123456") to bhi lo — pehle yahan silent drop ho raha tha.
     if (parsed.phone && parsed.phone !== phone) continue;
-    if (!parsed.phone && providerState.currentPhone && providerState.currentPhone !== phone) continue;
+    if (!parsed.phone && getProviderState(ctx).currentPhone && getProviderState(ctx).currentPhone !== phone) continue;
     out.push({
       message,
       parsed,
@@ -1763,17 +1968,17 @@ async function readOtpCandidatesUnlocked(phone) {
   }
   // Apne number ka card pehle, phir baaki.
   out.sort((a, b) => Number(b.phoneMatched) - Number(a.phoneMatched));
-  providerState.lastOtpScan = {
+  getProviderState(ctx).lastOtpScan = {
     at: Date.now(),
     limit,
     scanned: messages.length,
     extraIds: extraIds.length,
     otpLike,
-    tracked: providerState.trackedOtpMessageIds.length,
+    tracked: getProviderState(ctx).trackedOtpMessageIds.length,
     codes: out.map((c) => c.parsed.code).slice(0, 5),
     lastText: lastText.slice(0, 160),
   };
-  if (!out.length && lastText) providerState.lastOtpText = lastText.slice(0, 200);
+  if (!out.length && lastText) getProviderState(ctx).lastOtpText = lastText.slice(0, 200);
   return out;
 }
 
@@ -1849,7 +2054,7 @@ export async function waitForGoldDropReward(phone, { baseline = [], deliveredCod
   });
 }
 
-export async function waitForTelegramOtpCode(phone, opts = {}) {
+export async function waitForTelegramOtpCode(phone, opts = {}, ctx) {
   return withTelegramLock(async () => {
     const timeoutMs = Math.max(1_000, Number(opts.timeoutMs) || 20_000);
     const refreshMs = Math.max(800, Number(opts.refreshMs ?? opts.pollMs) || 1_000);
@@ -1886,7 +2091,7 @@ export async function waitForTelegramOtpCode(phone, opts = {}) {
         if (aborted()) return { code: '', aborted: true };
         const iterStartedAt = Date.now();
         try {
-          const candidates = await readOtpCandidatesUnlocked(phone);
+          const candidates = await readOtpCandidatesUnlocked(phone, ctx);
           const accepted = candidates.filter((candidate) => candidateIsNew(candidate, baseline)
             && (typeof opts.candidateFilter !== 'function' || opts.candidateFilter(candidate)));
           const swiggy = accepted.find((candidate) => (
@@ -1895,9 +2100,9 @@ export async function waitForTelegramOtpCode(phone, opts = {}) {
           ));
           const chosen = swiggy || ((Date.now() - startedAt) >= acceptAnyAfterMs ? accepted[0] : null);
           if (chosen) {
-            providerState.currentPhone = phone;
-            providerState.currentMessageId = messageId(chosen.message);
-            providerState.lastError = '';
+            getProviderState(ctx).currentPhone = phone;
+            getProviderState(ctx).currentMessageId = messageId(chosen.message);
+            getProviderState(ctx).lastError = '';
             return {
               code: chosen.parsed.code,
               via: 'telegram-hermes',
@@ -1908,7 +2113,7 @@ export async function waitForTelegramOtpCode(phone, opts = {}) {
           }
         } catch (error) {
           lastError = error;
-          setLastError(error);
+          setLastError(error, ctx);
         }
 
         if (aborted()) return { code: '', aborted: true };
@@ -1918,15 +2123,15 @@ export async function waitForTelegramOtpCode(phone, opts = {}) {
           lastRefreshAt = now;
           refreshAttempts += 1;
           try {
-            await refreshHermesChatUnlocked({ phone, attempt: refreshAttempts });
+            await refreshHermesChatUnlocked({ phone, attempt: refreshAttempts }, ctx);
           } catch (error) {
             lastError = error;
-            setLastError(error);
+            setLastError(error, ctx);
           }
           // 🔍 Har 10th refresh par scan summary — owner ko console me saaf
           // dikhe ki chat me kya mila (kitne messages, kitne OTP-like).
           if (refreshAttempts % 10 === 0) {
-            const scan = providerState.lastOtpScan || {};
+            const scan = getProviderState(ctx).lastOtpScan || {};
             console.log(
               `[Hermes] 👀 scan ${scan.scanned || 0} msgs (limit ${scan.limit || otpScanLimit()})`
               + ` · otp-like ${scan.otpLike || 0} · tracked ${scan.tracked || 0}`
@@ -1966,21 +2171,21 @@ export async function waitForTelegramOtpCode(phone, opts = {}) {
         : {
           code: '',
           error: `OTP bot chat me ${Math.round(timeoutMs / 1000)}s tak code nahi mila`
-            + ` (scan: ${providerState.lastOtpScan?.scanned ?? 0} msgs, otp-like ${providerState.lastOtpScan?.otpLike ?? 0}`
+            + ` (scan: ${getProviderState(ctx).lastOtpScan?.scanned ?? 0} msgs, otp-like ${getProviderState(ctx).lastOtpScan?.otpLike ?? 0}`
             + `, refresh ${refreshAttempts}x)`
-            + (providerState.lastOtpScan?.lastText
-              ? ` · last message: "${String(providerState.lastOtpScan.lastText).replace(/\s+/g, ' ').slice(0, 100)}"`
+            + (getProviderState(ctx).lastOtpScan?.lastText
+              ? ` · last message: "${String(getProviderState(ctx).lastOtpScan.lastText).replace(/\s+/g, ' ').slice(0, 100)}"`
               : ''),
-          otpScan: providerState.lastOtpScan || null,
+          otpScan: getProviderState(ctx).lastOtpScan || null,
         };
     } catch (error) {
-      setLastError(error);
+      setLastError(error, ctx);
       return { code: '', error: `Telegram Hermes OTP wait fail: ${String(error?.message || error).slice(0, 180)}` };
     }
   });
 }
 
-export function getTelegramOtpStatus(env = process.env) {
+export function getTelegramOtpStatus(env = process.env, ctx) {
   const config = getTelegramOtpConfig(env);
   return {
     configured: config.configured,
@@ -1996,35 +2201,35 @@ export function getTelegramOtpStatus(env = process.env) {
     otpBotTitle: config.otpBotTitle || '',
     sessionFile: config.sessionFile,
     sessionSource: config.sessionSource,
-    connected: providerState.connected,
-    authorized: providerState.authorized,
-    loginInProgress: Boolean(providerState.loginInProgress),
-    me: providerState.meLabel,
-    currentPhone: providerState.currentPhone,
-    lastError: providerState.lastError,
-    lastErrorCode: providerState.lastErrorCode || '',
-    lastErrorLabel: providerState.lastErrorLabel || '',
-    lastErrorHint: providerState.lastErrorHint || '',
-    accountSlot: Number.isInteger(providerState.accountSlot) ? providerState.accountSlot : (config.accountSlot || 0),
+    connected: getProviderState(ctx).connected,
+    authorized: getProviderState(ctx).authorized,
+    loginInProgress: Boolean(getProviderState(ctx).loginInProgress),
+    me: getProviderState(ctx).meLabel,
+    currentPhone: getProviderState(ctx).currentPhone,
+    lastError: getProviderState(ctx).lastError,
+    lastErrorCode: getProviderState(ctx).lastErrorCode || '',
+    lastErrorLabel: getProviderState(ctx).lastErrorLabel || '',
+    lastErrorHint: getProviderState(ctx).lastErrorHint || '',
+    accountSlot: Number.isInteger(getProviderState(ctx).accountSlot) ? getProviderState(ctx).accountSlot : (config.accountSlot || 0),
     accountTag: config.accountTag || '',
     accounts: roster.rosterSummary(config.accounts || []),
     accountLines: roster.rosterSummary(config.accounts || []).accounts.map((a) => a.line),
-    lastActionAt: providerState.lastActionAt,
-    lastCheckedAt: providerState.lastCheckedAt,
-    lastScreenButtons: [...(providerState.lastScreenButtons || [])],
-    lastClickedButton: providerState.lastClickedButton || '',
-    lastClickedRole: providerState.lastClickedRole || '',
-    lastCallbackMessage: providerState.lastCallbackMessage || '',
-    claimPhase: providerState.claimPhase || '',
-    otpScan: providerState.lastOtpScan || null,
-    lastOtpText: providerState.lastOtpText || '',
-    trackedOtpMessages: [...(providerState.trackedOtpMessageIds || [])],
+    lastActionAt: getProviderState(ctx).lastActionAt,
+    lastCheckedAt: getProviderState(ctx).lastCheckedAt,
+    lastScreenButtons: [...(getProviderState(ctx).lastScreenButtons || [])],
+    lastClickedButton: getProviderState(ctx).lastClickedButton || '',
+    lastClickedRole: getProviderState(ctx).lastClickedRole || '',
+    lastCallbackMessage: getProviderState(ctx).lastCallbackMessage || '',
+    claimPhase: getProviderState(ctx).claimPhase || '',
+    otpScan: getProviderState(ctx).lastOtpScan || null,
+    lastOtpText: getProviderState(ctx).lastOtpText || '',
+    trackedOtpMessages: [...(getProviderState(ctx).trackedOtpMessageIds || [])],
   };
 }
 
-export async function verifyTelegramOtpConnection(opts = {}) {
+export async function verifyTelegramOtpConnection(opts = {}, ctx) {
   return withTelegramLock(async () => {
-    const { config } = await ensureClientUnlocked();
+    const { config } = await ensureClientUnlocked(ctx);
 
     const collect = async (messages) => {
       let currentPhone = '';
@@ -2061,7 +2266,7 @@ export async function verifyTelegramOtpConnection(opts = {}) {
       ok: true,
       configured: true,
       botUsername: config.botUsername,
-      me: providerState.meLabel,
+      me: getProviderState(ctx).meLabel,
       currentPhone: found.currentPhone,
       buttons: found.buttons,
       sentStart,
@@ -2101,16 +2306,16 @@ function normalizeTelegramFirstAndLastNames(value) {
     : [clean, ''];
 }
 
-export async function loginTelegramUserInteractive(callbacks = {}, opts = {}) {
-  if (providerState.loginInProgress) {
+export async function loginTelegramUserInteractive(callbacks = {}, opts = {}, ctx) {
+  if (getProviderState(ctx).loginInProgress) {
     throw new Error('Telegram account login pehle se chal raha hai — pehle use complete ya cancel karo.');
   }
   if (typeof callbacks?.phoneNumber !== 'function' || typeof callbacks?.phoneCode !== 'function') {
     throw new Error('Telegram login ke liye phoneNumber aur phoneCode callbacks chahiye.');
   }
 
-  providerState.loginInProgress = true;
-  providerState.lastError = '';
+  getProviderState(ctx).loginInProgress = true;
+  getProviderState(ctx).lastError = '';
 
   let loginClient = null;
   let result = null;
@@ -2199,7 +2404,7 @@ export async function loginTelegramUserInteractive(callbacks = {}, opts = {}) {
           return normalizeTelegramFirstAndLastNames(value);
         },
         onError: async (error) => {
-          setLastError(error);
+          setLastError(error, ctx);
           if (typeof opts.shouldAbort === 'function' && opts.shouldAbort()) return true;
           if (typeof callbacks.onError !== 'function') return false;
           try {
@@ -2250,21 +2455,21 @@ export async function loginTelegramUserInteractive(callbacks = {}, opts = {}) {
 
     return result;
   } catch (error) {
-    setLastError(error);
+    setLastError(error, ctx);
     throw error;
   } finally {
     try { await loginClient?.disconnect?.(); } catch {}
-    clientRef = null;
+    getClientRef(ctx) = null;
     clientPromise = null;
-    entityRef = null;
-    entityCacheKey = '';
-    providerState.connected = false;
-    providerState.loginInProgress = false;
+    getEntityRef(ctx) = null;
+    getEntityCacheKey(ctx) = '';
+    getProviderState(ctx).connected = false;
+    getProviderState(ctx).loginInProgress = false;
     if (result) {
-      providerState.authorized = true;
-      providerState.meLabel = result.me || providerState.meLabel;
+      getProviderState(ctx).authorized = true;
+      getProviderState(ctx).meLabel = result.me || getProviderState(ctx).meLabel;
     } else {
-      providerState.authorized = false;
+      getProviderState(ctx).authorized = false;
     }
   }
 }
@@ -2274,7 +2479,7 @@ export async function clearTelegramSessionString({
   deleteFile = true,
   clearProcessEnv = true,
 } = {}) {
-  if (providerState.loginInProgress) {
+  if (getProviderState(ctx).loginInProgress) {
     throw new Error('Telegram account login chal raha hai — pehle use complete ya cancel karo.');
   }
 
@@ -2332,13 +2537,13 @@ export async function clearTelegramApiCredentials({
   env = process.env,
   deleteFile = true,
   clearProcessEnv = true,
-} = {}) {
-  if (providerState.loginInProgress) {
+} = {}, ctx) {
+  if (getProviderState(ctx).loginInProgress) {
     throw new Error('Telegram account login chal raha hai — pehle use complete ya cancel karo.');
   }
 
   return withTelegramLock(async () => {
-    if (providerState.loginInProgress) {
+    if (getProviderState(ctx).loginInProgress) {
       throw new Error('Telegram account login chal raha hai — pehle use complete ya cancel karo.');
     }
     const before = getTelegramOtpConfig(env);
@@ -2404,18 +2609,16 @@ export async function clearTelegramApiCredentials({
   });
 }
 
-export async function disconnectTelegramUserClient() {
-  const client = clientRef;
-  clientRef = null;
-  clientPromise = null;
-  entityRef = null;
-  entityCacheKey = '';
-  providerState.connected = false;
-  providerState.authorized = false;
+export async function disconnectTelegramUserClient(ctx) {
+  const client = getClientRef(ctx);
+  if (ctx) { ctx.clientRef = null; ctx.clientPromise = null; ctx.entityRef = null; ctx.entityCacheKey = ''; }
+  else { clientRef = null; clientPromise = null; entityRef = null; entityCacheKey = ''; }
+  getProviderState(ctx).connected = false;
+  getProviderState(ctx).authorized = false;
   // loginInProgress lock reset karo — purana failed/interrupted login
   // is lock ko stuck kar sakta tha, jisse spare account add hamesha block
   // ho jata tha. Disconnect ke saath lock bhi khol do.
-  providerState.loginInProgress = false;
+  getProviderState(ctx).loginInProgress = false;
   try { await client?.disconnect?.(); } catch {}
 }
 
@@ -2504,4 +2707,6 @@ export function _resetTelegramOtpSourceForTests() {
     lastCallbackMessage: '',
     claimPhase: '',
   });
+  // Clear all slot contexts too
+  slotContexts.clear();
 }
