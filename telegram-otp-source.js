@@ -873,8 +873,18 @@ async function loadTeleproto() {
       // teleproto ke requestCode() me `new Api.CodeSettings({})` hardcoded hai,
       // jisse server khud delivery type (app/call/SMS) decide karta hai.
       // forceSMS sirf tab kaam karta hai jab server pehle se SMS offer karta hai.
-      // Is liye CodeSettings ko patch karke app/call/flashcall/firebase disable
-      // karte hain — sirf SMS remain karta hai.
+      //
+      // ⚠️ DHAYAN RAHE: TL serializer (`fieldCodec.js` → `isAbsent()`) ke karan
+      // `false` bhi "absent" maanta hai boolean flag fields ke liye. Isliye
+      // `allowAppHash = false` etc. set karne ka koi asar nahi — serializer
+      // unhe skip karta hai. Patch sirf `appSandbox` (Bool type) par kaam karta
+      // hai, jo SMS delivery se related nahi hai.
+      //
+      // Sahi fix: `client.invoke` ko wrap karke `SendCode` response intercept
+      // karta hai. Agar code SMS nahi aaya (app/call/firebase), to forced
+      // `ResendCode` se dobara SMS request karta hai. Yeh `forceSMS` se bhi
+      // zyada reliable hai kyunki yeh server ki `nextType` limitation se
+      // baahar nikal kar directly ResendCode bhejta hai.
       try {
         const CodeSettings = apiMod.Api?.CodeSettings;
         if (CodeSettings && !CodeSettings.__smsPatched) {
@@ -882,10 +892,9 @@ async function loadTeleproto() {
           CodeSettings.__smsPatched = true;
           const patched = function CodeSettingsSmsOnly(...args) {
             const inst = new origCtor(...args);
-            inst.allowAppHash = false;     // app delivery block
-            inst.allowMissedCall = false;  // missed call block
-            inst.allowFlashcall = false;   // flash call block
-            inst.allowFirebase = false;    // firebase delivery block
+            // TL serializer `false` ko absent maanta hai boolean flags ke liye,
+            // isliye inhe explicitly set karne ka asar nahi. Par `appSandbox`
+            // Bool type hai — yahan `false` serialized hota hai.
             inst.appSandbox = false;
             return inst;
           };
@@ -894,11 +903,12 @@ async function loadTeleproto() {
           apiMod.Api.CodeSettings = patched;
         }
       } catch {
-        // Patch fail to normal flow chale — forceSMS still try karega
+        // Patch fail to normal flow chale — invoke wrapper forceSMS try karega
       }
       return {
         TelegramClient: main.TelegramClient,
         StringSession: sessions.StringSession,
+        apiMod,
       };
     });
   }
@@ -912,8 +922,8 @@ export async function createTelegramUserClient(sessionString = '', config = getT
   if (!cfg.apiId || !cfg.apiHash) {
     throw new Error('TELEGRAM_API_ID / TELEGRAM_API_HASH missing hai (my.telegram.org se spare account ki API app banao)');
   }
-  const { TelegramClient, StringSession } = await loadTeleproto();
-  return new TelegramClient(new StringSession(String(sessionString || '')), cfg.apiId, cfg.apiHash, {
+  const { TelegramClient, StringSession, apiMod } = await loadTeleproto();
+  const client = new TelegramClient(new StringSession(String(sessionString || '')), cfg.apiId, cfg.apiHash, {
     connectionRetries: 3,
     requestRetries: 2,
     autoReconnect: true,
@@ -925,6 +935,53 @@ export async function createTelegramUserClient(sessionString = '', config = getT
     langCode: 'en',
     systemLangCode: 'en',
   });
+
+  // ⚡ Invoke wrapper — SendCode response intercept karke SMS-only enforce karta hai.
+  // teleproto ke preferSms() sirf tab kaam karta hai jab server ki `nextType`
+  // SMS ho. Agar server app/call/firebase bhejta hai aur nextType SMS nahi hai,
+  // to forceSMS bekaar ho jata hai. Is wrapper se hum direct ResendCode bhejte
+  // hain agar SendCode ka response SMS nahi hai — server ko dobara SMS ke liye
+  // force karta hai.
+  const originalInvoke = client.invoke.bind(client);
+  let smsForceAttempted = false;
+  client.invoke = async (request) => {
+    try {
+      const result = await originalInvoke(request);
+      // Agar yeh auth.SendCode request tha aur result SentCode hai
+      if (request?.className === 'SendCode' && result) {
+        const Api = apiMod?.Api;
+        if (Api && result instanceof Api.auth?.SentCode) {
+          const isSms = result.type instanceof Api.auth?.SentCodeTypeSms;
+          if (!isSms && !smsForceAttempted) {
+            smsForceAttempted = true;
+            console.log('[TelegramLogin] ⚡ SendCode response SMS nahi — ResendCode se SMS enforce kar raha');
+            try {
+              const resendResult = await originalInvoke(new Api.auth.ResendCode({
+                phoneNumber: request.phoneNumber,
+                phoneCodeHash: result.phoneCodeHash,
+              }));
+              // ResendCode bhi SMS nahi laya to wapas original result de do
+              if (resendResult instanceof Api.auth?.SentCode
+                && resendResult.type instanceof Api.auth?.SentCodeTypeSms) {
+                return resendResult;
+              }
+              console.warn('[TelegramLogin] ⚠️ ResendCode se bhi SMS nahi aaya — original result use kar raha');
+            } catch (resendErr) {
+              console.warn('[TelegramLogin] ⚠️ ResendCode fail:', String(resendErr?.message || resendErr).slice(0, 120));
+            }
+          }
+        }
+      }
+      return result;
+    } finally {
+      // Next SendCode attempt pe reset karo
+      if (request?.className === 'SendCode') {
+        smsForceAttempted = false;
+      }
+    }
+  };
+
+  return client;
 }
 
 export function _isTelegramClientConnectionError(error) {
