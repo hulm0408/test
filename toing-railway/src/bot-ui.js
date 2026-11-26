@@ -292,13 +292,19 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
   // ── Settings View ──────────────────────────────────────────────────────────
   function buildSettingsView() {
     const cfg = getRuntimeConfig();
+    const accounts = db.listAccounts({ includeSession: false });
+    const botDist = { hathi: 0, hermes: 0, chauhan: 0 };
+    for (const acc of accounts) {
+      const pid = normalizeOtpBotProfileId(acc.otpBotProfile);
+      botDist[pid] = (botDist[pid] || 0) + 1;
+    }
     const maskedKeys = cfg.toingAccessKeys.map((k) => k.length > 8 ? `${k.slice(0, 6)}…${k.slice(-4)}` : k).join(', ');
     const lines = [
       `⚙️ <b>TOING CLUSTER SETTINGS</b>`,
       ``,
       `🆕 Skip Already Registered: <b>${cfg.skipRegistered !== false ? 'ON ✅ (Only Fresh Numbers)' : 'OFF (Existing Allowed)'}</b>`,
-      `🤖 Default OTP Bot: <code>${esc(cfg.defaultOtpBot)}</code>`,
-      `🔁 Auto-Failover Bots: <b>${cfg.autoFailoverBots ? 'ON' : 'OFF'}</b>`,
+      `🤖 Default OTP Bot: <code>${esc(cfg.defaultOtpBot)}</code> (🐘 ${botDist.hathi} | 📨 ${botDist.hermes} | 🔐 ${botDist.chauhan})`,
+      `🔁 Auto-Failover & Pool Rotate: <b>${cfg.autoFailoverBots ? `ON (every ${cfg.poolRotateThreshold || 12} skips)` : 'OFF'}</b>`,
       `⏱ OTP Fast-Fail Timeout: <code>${Math.round(cfg.otpTimeoutMs / 1000)}s</code>`,
       `🚦 Toing HTTP Concurrency: <code>${cfg.toingHttpConcurrency}</code>`,
       `🔑 Toing Access Keys (${cfg.toingAccessKeys.length}): <code>${esc(maskedKeys)}</code>`,
@@ -307,6 +313,7 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
       ``,
       `<i>Commands:</i>`,
       `• <code>/logs</code> — Har number ka skip/drop/success exact reason dekho`,
+      `• <code>/spreadbots</code> — Saare slots ko 3 OTP bots me equally spread karo`,
       `• <code>/setkey KEY1,KEY2</code> — Update Toing keys live`,
       `• <code>/setchat -100123...</code> — Set delivery chat (or <code>/setchat here</code>)`,
       `• <code>/session 9876543210</code> — Fetch saved .json by phone`,
@@ -319,6 +326,7 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
           `🆕 Skip Registered: ${cfg.skipRegistered !== false ? 'ON ✅' : 'OFF'}`,
           'cfg_toggle_skip_reg'
         ),
+        Markup.button.callback('🔀 Spread 3 Bots', 'cfg_spread_bots'),
       ],
       [
         Markup.button.callback('🐘 All → Hathi', 'cfg_allbot_hathi'),
@@ -326,10 +334,10 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
         Markup.button.callback('🔐 All → HardX', 'cfg_allbot_chauhan'),
       ],
       [
-        Markup.button.callback(`⏱ 15s`, 'cfg_otp_15000'),
         Markup.button.callback(`⏱ 20s`, 'cfg_otp_20000'),
-        Markup.button.callback(`⏱ 25s`, 'cfg_otp_25000'),
+        Markup.button.callback(`⏱ 26s`, 'cfg_otp_26000'),
         Markup.button.callback(`⏱ 30s`, 'cfg_otp_30000'),
+        Markup.button.callback(`⏱ 40s`, 'cfg_otp_40000'),
       ],
       [
         Markup.button.callback('🚦 HTTP 15', 'cfg_http_15'),
@@ -411,6 +419,15 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     db.setSetting('defaultOtpBot', profile);
     const res = slotManager.setAllSlotsOtpBot(profile);
     await ctx.reply(`🤖 Default + all <b>${res.updated}</b> slots switched to <b>${esc(OTP_BOT_PROFILES[profile].uiLabel)}</b>.`, { parse_mode: 'HTML' });
+  });
+
+  bot.command('spreadbots', async (ctx) => {
+    const res = slotManager.spreadSlotsAcrossBots();
+    const d = res.distribution || {};
+    await ctx.reply(
+      `🔀 Spread <b>${res.updated}</b> slots across all 3 OTP bots:\n🐘 Hathi: <b>${d.hathi || 0}</b> | 📨 Hermes: <b>${d.hermes || 0}</b> | 🔐 HardX: <b>${d.chauhan || 0}</b>`,
+      { parse_mode: 'HTML' }
+    );
   });
 
   bot.command('setkey', async (ctx) => {
@@ -902,6 +919,14 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     await slotManager.removeSlot(id);
     await ctx.answerCbQuery('🗑 Slot deleted').catch(() => {});
     const { text, extra } = buildSlotsPage(page);
+    await editOrReply(ctx, text, extra);
+  });
+
+  bot.action('cfg_spread_bots', async (ctx) => {
+    const res = slotManager.spreadSlotsAcrossBots();
+    const d = res.distribution || {};
+    await ctx.answerCbQuery(`🔀 Spread: 🐘${d.hathi || 0} 📨${d.hermes || 0} 🔐${d.chauhan || 0}`).catch(() => {});
+    const { text, extra } = buildSettingsView();
     await editOrReply(ctx, text, extra);
   });
 

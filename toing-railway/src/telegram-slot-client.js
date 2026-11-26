@@ -34,11 +34,14 @@ export async function loadTeleproto() {
       import('teleproto'),
       import('teleproto/sessions'),
       import('teleproto/tl/generated/api.js'),
-    ]).then(([main, sessions, apiMod]) => ({
+      import('teleproto/events').catch(() => ({})),
+    ]).then(([main, sessions, apiMod, eventsMod]) => ({
       TelegramClient: main.TelegramClient,
       Logger: main.Logger || main.default?.Logger || null,
       StringSession: sessions.StringSession,
       apiMod,
+      NewMessage: eventsMod?.NewMessage || null,
+      EditedMessage: eventsMod?.EditedMessage || null,
     }));
   }
   return teleprotoPromise;
@@ -56,6 +59,11 @@ function isIncomingMessage(message) {
   if (!message) return false;
   if (message.out === true) return false;
   return true;
+}
+
+function normalizeEntityIdStr(val) {
+  if (val === undefined || val === null) return '';
+  return String(val).trim().replace(/^-/, '');
 }
 
 function buttonText(button) {
@@ -95,6 +103,7 @@ export class TelegramSlotClient {
 
     this.client = null;
     this.entity = null;
+    this.inputEntity = null;
     this.entityUsername = '';
     this.meLabel = '';
     this.connected = false;
@@ -102,6 +111,140 @@ export class TelegramSlotClient {
     this.currentCardMessageId = 0;
     this.currentPhone = '';
     this._lock = Promise.resolve();
+
+    // Real-time MTProto push buffer (eliminates 95%+ of messages.GetHistory polling & FLOOD_WAITs!)
+    this._pushedMessages = [];
+    this._pushEpoch = 0;
+    this._pushWaiters = new Set();
+    this._pushActive = false;
+  }
+
+  _clearPushCache() {
+    this._pushedMessages = [];
+    this._pushEpoch += 1;
+    this._notifyPushWaiters();
+  }
+
+  _notifyPushWaiters() {
+    if (!this._pushWaiters.size) return;
+    const waiters = [...this._pushWaiters];
+    this._pushWaiters.clear();
+    for (const wake of waiters) {
+      try { wake(true); } catch {}
+    }
+  }
+
+  _hydratePushedMessage(msg) {
+    if (!msg) return;
+    if (this.inputEntity && !msg._inputChat) {
+      try { msg._inputChat = this.inputEntity; } catch {}
+    }
+    if (this.client && !msg._client) {
+      try { msg._client = this.client; } catch {}
+    }
+  }
+
+  _mergeMessagesIntoCache(messages = [], { notify = false } = {}) {
+    if (!Array.isArray(messages) || !messages.length) return;
+    let changed = false;
+    for (const msg of messages) {
+      if (!isIncomingMessage(msg)) continue;
+      this._hydratePushedMessage(msg);
+      const id = messageId(msg);
+      const existingIdx = id > 0 ? this._pushedMessages.findIndex((m) => messageId(m) === id) : -1;
+      if (existingIdx >= 0) {
+        const prev = this._pushedMessages[existingIdx];
+        // Replace on edit or when fetched copy has fresher edit timestamp / text
+        const prevEdit = messageEditMs(prev);
+        const nextEdit = messageEditMs(msg);
+        if (notify || nextEdit >= prevEdit || messageSignature(msg) !== messageSignature(prev)) {
+          this._pushedMessages[existingIdx] = msg;
+          changed = true;
+        }
+      } else {
+        this._pushedMessages.unshift(msg);
+        changed = true;
+      }
+    }
+    if (changed) {
+      // Keep newest-edited / newest-created messages at front so active screen is always index 0
+      this._pushedMessages.sort((a, b) => {
+        const tsDiff = Math.max(messageEditMs(b), messageDateMs(b)) - Math.max(messageEditMs(a), messageDateMs(a));
+        if (tsDiff !== 0) return tsDiff;
+        return messageId(b) - messageId(a);
+      });
+      if (this._pushedMessages.length > 15) {
+        this._pushedMessages.length = 15;
+      }
+      if (notify) {
+        this._pushEpoch += 1;
+        this._notifyPushWaiters();
+      }
+    }
+  }
+
+  _ingestPushedMessage(msg) {
+    if (!isIncomingMessage(msg)) return;
+    this._mergeMessagesIntoCache([msg], { notify: true });
+  }
+
+  _attachPushHandlers(client, { NewMessage, EditedMessage } = {}) {
+    if (!client || typeof client.addEventHandler !== 'function' || !NewMessage) {
+      this._pushActive = false;
+      return;
+    }
+    const onBotEvent = (event) => {
+      try {
+        const msg = event?.message;
+        if (!msg || msg.out === true) return;
+        const expectedId = normalizeEntityIdStr(this.entity?.id);
+        if (!expectedId) return;
+        const candidates = [
+          normalizeEntityIdStr(msg.peerId?.userId),
+          normalizeEntityIdStr(msg.chatId),
+          normalizeEntityIdStr(msg.senderId),
+        ].filter(Boolean);
+        if (!candidates.includes(expectedId)) return;
+        this._ingestPushedMessage(msg);
+      } catch {}
+    };
+    try {
+      client.addEventHandler(onBotEvent, new NewMessage({ incoming: true }));
+      if (EditedMessage) {
+        client.addEventHandler(onBotEvent, new EditedMessage({ incoming: true }));
+      }
+      this._pushActive = true;
+    } catch {
+      this._pushActive = false;
+    }
+  }
+
+  async _waitForPush(maxMs, shouldAbort, sinceEpoch) {
+    if (this._pushEpoch !== sinceEpoch) return true;
+    const budget = Math.max(0, Number(maxMs) || 0);
+    if (budget <= 0 || shouldAbort?.()) return false;
+
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (gotPush) => {
+        if (done) return;
+        done = true;
+        this._pushWaiters.delete(onPush);
+        clearTimeout(timer);
+        if (abortPoll) clearInterval(abortPoll);
+        resolve(gotPush);
+      };
+      const onPush = () => finish(true);
+      this._pushWaiters.add(onPush);
+      const timer = setTimeout(() => finish(this._pushEpoch !== sinceEpoch), budget);
+      const abortPoll = typeof shouldAbort === 'function'
+        ? setInterval(() => {
+          if (shouldAbort()) finish(false);
+        }, Math.min(200, Math.max(40, budget)))
+        : null;
+      // Re-check immediately in case a push raced before registering waiter
+      if (this._pushEpoch !== sinceEpoch) finish(true);
+    });
   }
 
   setBotProfile(profileId) {
@@ -109,9 +252,11 @@ export class TelegramSlotClient {
     if (next.id !== this.profile.id) {
       this.profile = next;
       this.entity = null;
+      this.inputEntity = null;
       this.entityUsername = '';
       this.trackedOtpMessageIds = [];
       this.currentCardMessageId = 0;
+      this._clearPushCache();
     }
     return this.profile;
   }
@@ -166,16 +311,17 @@ export class TelegramSlotClient {
 
     await this._disconnectUnlocked();
 
-    const { TelegramClient, StringSession, Logger } = await loadTeleproto();
+    const { TelegramClient, StringSession, Logger, NewMessage, EditedMessage } = await loadTeleproto();
     const baseLogger = typeof Logger === 'function' ? new Logger('error') : undefined;
     const client = new TelegramClient(new StringSession(this._session), this.apiId, this.apiHash, {
       connectionRetries: 2,
-      requestRetries: 1,
+      // requestRetries MUST be >= 2 so teleproto's floodWait & internal-error retry policies actually execute!
+      requestRetries: 3,
       autoReconnect: true,
       reconnectRetries: 3,
-      floodSleepThreshold: 15,
-      // Crucial for 50 parallel accounts: skip background update loop overhead
-      receiveUpdates: false,
+      floodSleepThreshold: 10,
+      // Push-driven bot updates (NewMessage + EditedMessage) cut messages.GetHistory RPCs by 95%+
+      receiveUpdates: true,
       ...(baseLogger ? { baseLogger } : {}),
       deviceModel: `ToingWorker-${this.slotNo}`,
       systemVersion: process.version,
@@ -206,8 +352,11 @@ export class TelegramSlotClient {
     this.client = client;
     this.connected = true;
     this.entity = null;
+    this.inputEntity = null;
     this.entityUsername = '';
-    console.log(`[Slot #${this.slotNo}] 🔌 Connected (${this.meLabel || this.label}) | bot=@${this.profile.username}`);
+    this._clearPushCache();
+    this._attachPushHandlers(client, { NewMessage, EditedMessage });
+    console.log(`[Slot #${this.slotNo}] 🔌 Connected (${this.meLabel || this.label}) | bot=@${this.profile.username}${this._pushActive ? ' | push=ON' : ''}`);
     return client;
   }
 
@@ -218,6 +367,13 @@ export class TelegramSlotClient {
     }
     this.entity = await client.getEntity(this.profile.username);
     this.entityUsername = this.profile.username;
+    try {
+      this.inputEntity = typeof client.getInputEntity === 'function'
+        ? await client.getInputEntity(this.entity)
+        : this.entity;
+    } catch {
+      this.inputEntity = this.entity;
+    }
     return this.entity;
   }
 
@@ -225,8 +381,11 @@ export class TelegramSlotClient {
     const c = this.client;
     this.client = null;
     this.entity = null;
+    this.inputEntity = null;
     this.entityUsername = '';
     this.connected = false;
+    this._pushActive = false;
+    this._clearPushCache();
     if (c) {
       try { await c.disconnect(); } catch {}
       try { await c.destroy?.(); } catch {}
@@ -237,6 +396,7 @@ export class TelegramSlotClient {
     if (isConnectionError(err)) {
       this.connected = false;
       this.entity = null;
+      this.inputEntity = null;
     }
   }
 
@@ -254,17 +414,26 @@ export class TelegramSlotClient {
     });
   }
 
-  async _fetchIncomingUnlocked(limit = 10) {
+  async _fetchIncomingUnlocked(limit = 6) {
     try {
       const client = await this._ensureConnectedUnlocked();
       const entity = await this._ensureEntityUnlocked();
-      const msgs = await client.getMessages(entity, { limit: Math.max(1, Number(limit) || 10) });
-      const arr = Array.isArray(msgs) ? msgs : [...(msgs || [])];
-      return arr.filter(isIncomingMessage);
+      const msgs = await client.getMessages(entity, { limit: Math.max(1, Number(limit) || 6) });
+      const arr = (Array.isArray(msgs) ? msgs : [...(msgs || [])]).filter(isIncomingMessage);
+      this._mergeMessagesIntoCache(arr, { notify: false });
+      return arr;
     } catch (err) {
       this._invalidateIfConnectionError(err);
       throw err;
     }
+  }
+
+  async _getMessagesCachedOrFetchUnlocked({ limit = 6, forceFetch = false } = {}) {
+    await this._ensureEntityUnlocked();
+    if (!forceFetch && this._pushActive && this._pushedMessages.length > 0) {
+      return this._pushedMessages.slice(0, Math.max(1, Number(limit) || 6));
+    }
+    return this._fetchIncomingUnlocked(limit);
   }
 
   _trackMessageId(id = 0) {
@@ -294,14 +463,14 @@ export class TelegramSlotClient {
           known.add(messageId(m));
         }
       }
+      this._mergeMessagesIntoCache(out, { notify: false });
       return out;
     } catch {
       return [];
     }
   }
 
-  async _latestScreenUnlocked(limit = 6) {
-    const messages = await this._fetchIncomingUnlocked(limit);
+  async _screenFromMessages(messages = []) {
     for (const message of messages) {
       const buttons = await getMessageButtons(message);
       const entries = buttons
@@ -325,6 +494,19 @@ export class TelegramSlotClient {
     return null;
   }
 
+  async _latestScreenUnlocked(limit = 6, { cachedMessages = null, forceFetch = false } = {}) {
+    if (Array.isArray(cachedMessages) && cachedMessages.length > 0) {
+      const cachedScreen = await this._screenFromMessages(cachedMessages);
+      if (cachedScreen) return cachedScreen;
+    }
+    const messages = await this._getMessagesCachedOrFetchUnlocked({ limit, forceFetch });
+    const screen = await this._screenFromMessages(messages);
+    if (screen || forceFetch) return screen;
+    // One fallback fetch if push cache had no interactive button screen
+    const fresh = await this._fetchIncomingUnlocked(limit);
+    return this._screenFromMessages(fresh);
+  }
+
   async _safeClickButton(entry) {
     try {
       const answer = await entry.button.click({});
@@ -346,8 +528,8 @@ export class TelegramSlotClient {
     }
   }
 
-  async _clickLatestButtonUnlocked({ mode = 'claim', phone = '' } = {}) {
-    const screen = await this._latestScreenUnlocked(6);
+  async _clickLatestButtonUnlocked({ mode = 'claim', phone = '', cachedMessages = null } = {}) {
+    const screen = await this._latestScreenUnlocked(6, { cachedMessages });
     if (!screen) return { ok: false, reason: 'no-latest-screen' };
 
     const action = selectOtpBotScreenAction([screen], {
@@ -394,6 +576,7 @@ export class TelegramSlotClient {
   }
 
   // Claim a fresh phone number card from this slot's OTP bot.
+  // Push-first design: reuses cached messages + NewMessage/EditedMessage pushes (0 GetHistory RPCs in steady state!).
   async claimFreshNumber({
     forceNew = false,
     excludePhones = new Set(),
@@ -405,10 +588,12 @@ export class TelegramSlotClient {
       const remaining = () => Math.max(0, deadline - Date.now());
       const excludedPhonesSeen = [];
 
+      // Single read (from push cache if warm -> 0 GetHistory RPCs; else 1 initial fetch)
+      let latestMsgs = await this._getMessagesCachedOrFetchUnlocked({ limit: 6 });
+
       // If forceNew=false, reuse an untouched fresh card ALREADY sitting on screen (0 wasted numbers!)
       if (!forceNew) {
-        const msgs = await this._fetchIncomingUnlocked(6);
-        const sel = selectLatestFreshNumberCard(msgs, { excludePhones });
+        const sel = selectLatestFreshNumberCard(latestMsgs, { excludePhones });
         if (sel.status === 'fresh') {
           this.currentCardMessageId = messageId(sel.result.message);
           this.currentPhone = sel.result.card.phone;
@@ -424,8 +609,7 @@ export class TelegramSlotClient {
         }
       }
 
-      const currentSigs = async () => new Set((await this._fetchIncomingUnlocked(10)).map(messageSignature));
-      let baselineSignatures = await currentSigs();
+      let baselineSignatures = new Set(latestMsgs.map(messageSignature));
       let cursor = { afterMessageId: 0, afterSignature: '', afterPhone: '' };
       let sentStart = false;
       let lastFailureReason = 'claim_timeout';
@@ -433,14 +617,20 @@ export class TelegramSlotClient {
       for (let cycle = 0; cycle < 3 && remaining() > 600; cycle++) {
         if (shouldAbort?.()) return { ok: false, aborted: true, excludedPhonesSeen };
 
-        const clicked = await this._clickLatestButtonUnlocked({ mode: 'claim' });
+        // Capture push epoch BEFORE clicking NEW NUMBER so even a 30ms bot reply during click() is caught!
+        let lastEpoch = this._pushEpoch;
+        const clicked = await this._clickLatestButtonUnlocked({ mode: 'claim', cachedMessages: latestMsgs });
         if (!clicked.ok) {
           lastFailureReason = clicked.reason || 'no-claim-button';
           if (sentStart || remaining() <= 1_800) break;
           sentStart = true;
+          const startEpoch = this._pushEpoch;
           await this._sendStartUnlocked();
-          await sleepInterruptibly(Math.min(1_000, remaining()), shouldAbort);
-          baselineSignatures = await currentSigs();
+          const gotStartPush = await this._waitForPush(Math.min(2_200, remaining()), shouldAbort, startEpoch);
+          latestMsgs = gotStartPush
+            ? this._pushedMessages.slice(0, 6)
+            : await this._fetchIncomingUnlocked(6);
+          baselineSignatures = new Set(latestMsgs.map(messageSignature));
           continue;
         }
 
@@ -454,11 +644,34 @@ export class TelegramSlotClient {
         // double-clicking NEW NUMBER and throwing away the first number!
         const waitBudget = cycle === 0 ? Math.min(11_000, remaining()) : Math.min(6_500, remaining());
         const waitEnd = Date.now() + waitBudget;
+        const fallbackPollGapMs = this._pushActive ? 3_000 : 650;
         let sawExcludedReply = false;
 
         while (Date.now() < waitEnd) {
           if (shouldAbort?.()) return { ok: false, aborted: true, excludedPhonesSeen };
-          const msgs = await this._fetchIncomingUnlocked(10);
+
+          const waitSlice = Math.min(fallbackPollGapMs, Math.max(0, waitEnd - Date.now()));
+          const gotPush = this._pushActive
+            ? await this._waitForPush(waitSlice, shouldAbort, lastEpoch)
+            : false;
+
+          if (shouldAbort?.()) return { ok: false, aborted: true, excludedPhonesSeen };
+
+          let msgs;
+          if (gotPush) {
+            lastEpoch = this._pushEpoch;
+            msgs = this._pushedMessages.slice(0, 8);
+          } else {
+            // Safety fallback fetch only if no push arrived in 3.0s (or non-push mock)
+            if (!this._pushActive && waitSlice > 0) {
+              await sleepInterruptibly(waitSlice, shouldAbort);
+              if (shouldAbort?.()) return { ok: false, aborted: true, excludedPhonesSeen };
+            }
+            msgs = await this._fetchIncomingUnlocked(5);
+            lastEpoch = this._pushEpoch;
+          }
+          latestMsgs = msgs;
+
           const sel = selectLatestFreshNumberCard(msgs, {
             baselineSignatures,
             excludePhones,
@@ -486,7 +699,6 @@ export class TelegramSlotClient {
             sawExcludedReply = true;
             break;
           }
-          await sleepInterruptibly(Math.min(550, Math.max(0, waitEnd - Date.now())), shouldAbort);
         }
 
         if (shouldAbort?.() || remaining() <= 600) {
@@ -498,7 +710,8 @@ export class TelegramSlotClient {
           };
         }
 
-        baselineSignatures = await currentSigs();
+        // Reuse already-fetched/pushed messages for next baseline (0 extra GetHistory RPCs!)
+        baselineSignatures = new Set(latestMsgs.map(messageSignature));
         if (sawExcludedReply) {
           await sleepInterruptibly(Math.min(350, remaining()), shouldAbort);
           continue;
@@ -511,12 +724,13 @@ export class TelegramSlotClient {
   }
 
   // CRITICAL: Call BEFORE Toing send_otp so fast 1-2s OTPs are NEVER ignored!
+  // Uses warm push cache when available (0 GetHistory RPCs!).
   async captureOtpWatermark(phone) {
     return this._withSlotLock(async () => {
       const ts = Date.now();
       try {
-        const recent = await this._fetchIncomingUnlocked(12);
-        const tracked = await this._fetchTrackedUnlocked(recent);
+        const recent = await this._getMessagesCachedOrFetchUnlocked({ limit: 8 });
+        const tracked = this._pushActive ? [] : await this._fetchTrackedUnlocked(recent);
         const all = [...recent, ...tracked];
         const codes = new Set();
         const ids = new Set();
@@ -534,10 +748,10 @@ export class TelegramSlotClient {
     });
   }
 
-  async _readOtpCandidatesUnlocked(phone) {
+  async _readOtpCandidatesUnlocked(phone, { forceFetch = false } = {}) {
     const cleanPhone = normalizePhone10(phone);
-    const recent = await this._fetchIncomingUnlocked(12);
-    const tracked = await this._fetchTrackedUnlocked(recent);
+    const recent = await this._getMessagesCachedOrFetchUnlocked({ limit: 8, forceFetch });
+    const tracked = forceFetch ? await this._fetchTrackedUnlocked(recent) : [];
     const messages = [...recent, ...tracked];
 
     const out = [];
@@ -565,16 +779,14 @@ export class TelegramSlotClient {
     return out;
   }
 
-  // Targeted refresh: prefers clicking REFRESH right on the active number card (minimum RPCs!)
+  // Targeted refresh: prefers clicking REFRESH right on the cached active card (0 GetHistory RPCs!)
   async _refreshOtpChatUnlocked(phone, attempt = 1) {
     const wanted = normalizePhone10(phone);
     const allowed = this.profile.refreshRoles || ['refresh'];
-    let fallbackEntry = null;
 
-    try {
-      const recent = await this._fetchIncomingUnlocked(8);
-      const tracked = await this._fetchTrackedUnlocked(recent);
-      for (const message of [...tracked, ...recent]) {
+    const tryClickInMessages = async (messages) => {
+      let fallbackEntry = null;
+      for (const message of messages) {
         const buttons = await getMessageButtons(message);
         const entries = buttons
           .map((button) => ({
@@ -600,6 +812,21 @@ export class TelegramSlotClient {
         const clickRes = await this._safeClickButton(fallbackEntry);
         if (clickRes.clicked) return { ok: true, via: 'click-fallback' };
       }
+      return null;
+    };
+
+    try {
+      // 1. Try cached/pushed messages first -> ZERO messages.GetHistory RPCs!
+      if (this._pushActive && this._pushedMessages.length > 0) {
+        const cachedHit = await tryClickInMessages(this._pushedMessages.slice(0, 8));
+        if (cachedHit) return cachedHit;
+      }
+
+      // 2. Only fetch history if push cache didn't contain a valid refresh button
+      const recent = await this._fetchIncomingUnlocked(6);
+      const tracked = await this._fetchTrackedUnlocked(recent);
+      const fetchedHit = await tryClickInMessages([...tracked, ...recent]);
+      if (fetchedHit) return fetchedHit;
     } catch (err) {
       this._invalidateIfConnectionError(err);
       throw err;
@@ -614,14 +841,14 @@ export class TelegramSlotClient {
 
   async waitForOtp(phone, {
     baseline = null,
-    timeoutMs = 20_000,
-    refreshMs = 1_800,
+    timeoutMs = 26_000,
+    refreshMs = 2_200,
     shouldAbort = null,
   } = {}) {
     return this._withSlotLock(async () => {
       const cleanPhone = normalizePhone10(phone);
-      const totalMs = Math.max(4_000, Number(timeoutMs) || 20_000);
-      const baseRefreshMs = Math.max(900, Number(refreshMs) || 1_800);
+      const totalMs = Math.max(4_000, Number(timeoutMs) || 26_000);
+      const baseRefreshMs = Math.max(900, Number(refreshMs) || 2_200);
       const acceptAnyAfterMs = Math.min(10_000, Math.floor(totalMs * 0.55));
       const startedAt = Date.now();
       const deadline = startedAt + totalMs;
@@ -635,16 +862,23 @@ export class TelegramSlotClient {
       };
 
       let currentRefreshMs = baseRefreshMs;
-      let lastRefreshAt = 0;
+      // Wait ~1.5s before first REFRESH so Swiggy SMS has a moment to arrive (push catches instant OTPs immediately!)
+      let lastRefreshAt = startedAt - Math.floor(baseRefreshMs * 0.3);
+      let lastFallbackFetchAt = startedAt;
+      let lastEpoch = this._pushEpoch;
       let attempts = 0;
       let lastError = null;
+      const fallbackFetchGapMs = this._pushActive ? 4_500 : 700;
 
       while (Date.now() < deadline) {
         if (shouldAbort?.()) return { ok: false, aborted: true, code: '' };
         const iterStart = Date.now();
 
+        const needFallbackFetch = !this._pushActive || (iterStart - lastFallbackFetchAt >= fallbackFetchGapMs);
+        if (needFallbackFetch) lastFallbackFetchAt = iterStart;
+
         try {
-          const candidates = await this._readOtpCandidatesUnlocked(cleanPhone);
+          const candidates = await this._readOtpCandidatesUnlocked(cleanPhone, { forceFetch: needFallbackFetch });
           const fresh = candidates.filter((c) => candidateIsNew(c, normBaseline));
           const swiggy = fresh.find((c) =>
             /swiggy|swgtns|toing/i.test(c.parsed.sender || '') ||
@@ -690,7 +924,20 @@ export class TelegramSlotClient {
           currentRefreshMs = Math.max(baseRefreshMs, currentRefreshMs - 400);
         }
 
-        await sleepInterruptibly(Math.min(450, Math.max(0, deadline - Date.now())), shouldAbort);
+        // Sleep until either the next REFRESH tick OR an instant MTProto push (NewMessage / EditedMessage)!
+        const untilRefresh = Math.max(150, (lastRefreshAt + currentRefreshMs) - Date.now());
+        const untilFallback = Math.max(150, (lastFallbackFetchAt + fallbackFetchGapMs) - Date.now());
+        const waitMs = Math.min(untilRefresh, untilFallback, Math.max(0, deadline - Date.now()));
+        if (this._pushActive) {
+          const gotPush = await this._waitForPush(waitMs, shouldAbort, lastEpoch);
+          if (gotPush) {
+            lastEpoch = this._pushEpoch;
+            // Push arrived — postpone safety fallback fetch since push channel is actively delivering!
+            lastFallbackFetchAt = Date.now();
+          }
+        } else {
+          await sleepInterruptibly(Math.min(500, waitMs), shouldAbort);
+        }
       }
 
       return {

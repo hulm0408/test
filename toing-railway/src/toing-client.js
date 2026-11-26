@@ -7,6 +7,48 @@
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, Number(ms) || 0)));
 
+export function sanitizeErrorText(raw = '', maxLen = 180) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  if (/<(?:!doctype|html|head|body|title)\b/i.test(s)) {
+    const titleMatch = s.match(/<title[^>]*>([^<]+)<\/title>/i);
+    if (titleMatch?.[1]) {
+      return titleMatch[1].replace(/\s+/g, ' ').trim().slice(0, maxLen);
+    }
+    return s.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, maxLen);
+  }
+  return s.replace(/\s+/g, ' ').trim().slice(0, maxLen);
+}
+
+export function parseSendOtpCooldownMs(reason = '') {
+  const text = String(reason || '').trim();
+  if (!text) return 0;
+
+  // e.g. "Number of login attempts exceeded. Please retry after 2 hours."
+  const hoursMatch = text.match(/(?:retry|try\s*again)\s*(?:after|in)\s*(\d+)\s*h(?:ours?|rs?)?\b/i);
+  if (hoursMatch) {
+    const hours = Math.max(1, Math.min(6, Number(hoursMatch[1]) || 1));
+    return hours * 60 * 60_000;
+  }
+
+  // e.g. "Swiggy is blocking OTPs for this number right now. Try again in 5 min."
+  const minsMatch = text.match(/(?:retry|try\s*again)\s*(?:after|in)\s*(\d+)\s*m(?:in(?:utes?)?)?\b/i);
+  if (minsMatch) {
+    // Enforce at least 10 min cooldown so 15–50 slots don't keep re-hitting a blocked number
+    const mins = Math.max(10, Math.min(360, Number(minsMatch[1]) || 10));
+    return mins * 60_000;
+  }
+
+  // Generic Swiggy / Toing phone-level OTP block without an explicit duration
+  if (/(attempts?\s+exceeded|blocking\s+otps?|otp\s+blocked|too\s+many\s+(?:attempts?|requests?|otps?)|temporarily\s+blocked|rate\s*limit)/i.test(text)) {
+    return 30 * 60_000;
+  }
+
+  return 0;
+}
+
+const TRANSIENT_UPSTREAM_ERROR_RE = /(expecting\s+value|unexpected\s+token|json\s*decode|empty\s+response|bad\s+gateway|service\s+unavailable|gateway\s+time-?out|\b50[234]\b|upstream|timed?\s*out)/i;
+
 export class AsyncSemaphore {
   constructor(limit = 20) {
     this.limit = Math.max(1, Number(limit) || 20);
@@ -149,10 +191,10 @@ export class ToingClient {
 
         const text = await res.text().catch(() => '');
         let data = null;
-        try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text.slice(0, 200) }; }
+        try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: sanitizeErrorText(text, 200) }; }
 
         if (res.status >= 500 && attempt < retries) {
-          lastError = `HTTP ${res.status}`;
+          lastError = `HTTP ${res.status}${data?.raw ? ` (${data.raw})` : ''}`;
           await sleep(600 * (attempt + 1));
           continue;
         }
@@ -161,7 +203,7 @@ export class ToingClient {
       } catch (err) {
         if (shouldAbort?.()) return { ok: false, aborted: true, error: 'aborted' };
         this.metrics.networkErrors += 1;
-        lastError = String(err?.message || err).slice(0, 180);
+        lastError = sanitizeErrorText(err?.message || err, 180);
         if (attempt < retries) {
           await sleep(500 * (attempt + 1));
           continue;
@@ -173,53 +215,67 @@ export class ToingClient {
   }
 
   async checkMobile(mobile, { shouldAbort = null } = {}) {
-    const res = await this._postJson('/api/auth/check_mobile', { mobile }, {
-      timeoutMs: this.timeouts.checkMobileMs,
-      retries: 1,
-      shouldAbort,
-    });
-    if (res.aborted) return { ok: false, aborted: true, registered: null, isNew: false, key: '' };
-
-    const d = res.data && typeof res.data === 'object' ? res.data : {};
-    const msgText = String(d.message || d.error || d.detail || d.status || d.raw || '').trim();
     const alreadyRe = /(already\s*registered|mobile\s+number\s+is\s+already\s+registered|user\s+already\s+exists)/i;
+    let lastResult = null;
 
-    if (res.ok) {
-      let registered = null;
-      if (typeof d.registered === 'boolean') registered = d.registered;
-      else if (typeof d.is_registered === 'boolean') registered = d.is_registered;
-      else if (typeof d.already_registered === 'boolean') registered = d.already_registered;
-      else if (typeof d.exists === 'boolean') registered = d.exists;
-      else if (typeof d.is_new === 'boolean') registered = !d.is_new;
-      else if (alreadyRe.test(msgText)) registered = true;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const res = await this._postJson('/api/auth/check_mobile', { mobile }, {
+        timeoutMs: this.timeouts.checkMobileMs,
+        retries: 1,
+        shouldAbort,
+      });
+      if (res.aborted) return { ok: false, aborted: true, registered: null, isNew: false, key: '' };
 
-      if (typeof registered === 'boolean') {
+      const d = res.data && typeof res.data === 'object' ? res.data : {};
+      const msgText = sanitizeErrorText(d.message || d.error || d.detail || d.status || d.raw || '', 180);
+
+      if (res.ok) {
+        let registered = null;
+        if (typeof d.registered === 'boolean') registered = d.registered;
+        else if (typeof d.is_registered === 'boolean') registered = d.is_registered;
+        else if (typeof d.already_registered === 'boolean') registered = d.already_registered;
+        else if (typeof d.exists === 'boolean') registered = d.exists;
+        else if (typeof d.is_new === 'boolean') registered = !d.is_new;
+        else if (alreadyRe.test(msgText)) registered = true;
+
+        if (typeof registered === 'boolean') {
+          return {
+            ok: true,
+            registered,
+            isNew: !registered,
+            key: res.key || '',
+            message: msgText.slice(0, 160),
+          };
+        }
+      } else if (alreadyRe.test(msgText) || res.status === 409) {
         return {
           ok: true,
-          registered,
-          isNew: !registered,
+          registered: true,
+          isNew: false,
           key: res.key || '',
-          message: msgText.slice(0, 160),
+          message: msgText.slice(0, 160) || `HTTP ${res.status} already registered`,
         };
       }
-    } else if (alreadyRe.test(msgText) || res.status === 409) {
-      return {
-        ok: true,
-        registered: true,
+
+      const cleanErr = sanitizeErrorText(msgText || res.error || `HTTP ${res.status || 0} invalid check_mobile response`, 180);
+      lastResult = {
+        ok: false,
+        registered: null,
         isNew: false,
+        status: res.status || 0,
         key: res.key || '',
-        message: msgText.slice(0, 160) || `HTTP ${res.status} already registered`,
+        error: cleanErr,
       };
+
+      // Retry once on transient HTTP 200 upstream parse/empty-body glitches (e.g. "Expecting value: line 1 column 1")
+      if (attempt === 0 && !shouldAbort?.() && TRANSIENT_UPSTREAM_ERROR_RE.test(cleanErr)) {
+        await sleep(450);
+        continue;
+      }
+      break;
     }
 
-    return {
-      ok: false,
-      registered: null,
-      isNew: false,
-      status: res.status || 0,
-      key: res.key || '',
-      error: (msgText || res.error || `HTTP ${res.status || 0} invalid check_mobile response`).slice(0, 180),
-    };
+    return lastResult;
   }
 
   async sendOtp(mobile, { shouldAbort = null, preferredKey = '' } = {}) {
@@ -241,12 +297,14 @@ export class ToingClient {
         mobile,
       };
     }
-    const reason = String(d.error || d.detail || d.message || res.error || 'Toing send_otp failed').slice(0, 180);
+    const reason = sanitizeErrorText(d.error || d.detail || d.message || d.raw || res.error || 'Toing send_otp failed', 180);
     const alreadyRegistered = /(already\s*registered|mobile\s+number\s+is\s+already\s+registered)/i.test(reason);
+    const retryCooldownMs = alreadyRegistered ? 0 : parseSendOtpCooldownMs(reason);
     return {
       ok: false,
       status: res.status,
       alreadyRegistered,
+      retryCooldownMs,
       reason,
     };
   }
@@ -273,7 +331,7 @@ export class ToingClient {
     return {
       ok: false,
       status: res.status,
-      reason: String(d.error || d.detail || d.message || res.error || 'Toing verify_otp failed').slice(0, 180),
+      reason: sanitizeErrorText(d.error || d.detail || d.message || d.raw || res.error || 'Toing verify_otp failed', 180),
     };
   }
 

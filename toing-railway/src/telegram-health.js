@@ -51,13 +51,17 @@ export function classifyTelegramError(error) {
   }
   if (code === 'FLOOD_WAIT' || code.startsWith('FLOOD_WAIT_')) {
     const seconds = floodWaitSeconds(code, error);
+    // Respect Telegram's exact flood duration (+2s safety buffer) instead of forcing a 30s penalty on FLOOD_WAIT_3!
+    const cooldownMs = seconds > 0
+      ? Math.max(3_000, (seconds + 2) * 1000)
+      : 10_000;
     return {
       ...base,
       seconds,
       kind: 'flood',
       healthStatus: 'cooldown',
       fatal: false,
-      cooldownMs: Math.max(30_000, (seconds + 5) * 1000),
+      cooldownMs,
       label: seconds ? `FLOOD_WAIT ${seconds}s` : 'FLOOD_WAIT',
     };
   }
