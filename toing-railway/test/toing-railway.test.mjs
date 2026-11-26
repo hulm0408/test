@@ -1412,3 +1412,137 @@ test('18. _safeClickButton soft timeout prevents 10s hangs on slow OTP bot callb
   assert.equal(pacer.getClaimGapMs('hathi'), 950);
 });
 
+test('19. Strict single-click on NEW NUMBER: never re-clicks while waiting across calls & returns immediately when any new card arrives', async () => {
+  const handlers = [];
+  let newNumberClicks = 0;
+
+  const baseDateSec = Math.floor(Date.now() / 1000) - 5;
+  const makeMsg = (id, text, editSec = 0) => ({
+    id,
+    out: false,
+    date: baseDateSec,
+    editDate: editSec || baseDateSec,
+    peerId: { userId: 777001n },
+    message: text,
+    buttons: [[
+      {
+        text: '⏭ NEW NUMBER',
+        async click() {
+          newNumberClicks += 1;
+          return { message: '🔍 Finding new number...' };
+        },
+      },
+      { text: '🔄 REFRESH', async click() { return { message: 'ok' }; } },
+    ]],
+  });
+
+  const emitPush = (msg) => {
+    for (const h of handlers) h({ message: msg });
+  };
+
+  let historyMsgs = [makeMsg(200, '📱 Number: +91 9111222333\nStatus: Active')];
+  const mockMtClient = {
+    connected: true,
+    disconnected: false,
+    _destroyed: false,
+    addEventHandler(fn) { handlers.push(fn); },
+    async getMessages() { return historyMsgs; },
+  };
+
+  const client = new TelegramSlotClient({
+    slotId: 1,
+    slotNo: 1,
+    label: 'StrictSingleClick',
+    session: 'dummy',
+    apiId: 123,
+    apiHash: 'abc',
+    otpBotProfile: 'hathi',
+  });
+  client.client = mockMtClient;
+  client.connected = true;
+  client.entity = { id: 777001n, username: 'Hathi_otp_bot' };
+  client.inputEntity = client.entity;
+  client.entityUsername = 'Hathi_otp_bot';
+  client._attachPushHandlers(mockMtClient, {
+    NewMessage: class MockNew {},
+    EditedMessage: class MockEdit {},
+  });
+
+  // 1. Click NEW NUMBER once -> bot only sends a loading text, no phone yet -> returns pendingWait without re-clicking!
+  setTimeout(() => {
+    emitPush(makeMsg(201, '🔍 Searching for an active Indian number...', baseDateSec + 1));
+  }, 40);
+
+  const wait1 = await client.claimFreshNumber({
+    forceNew: true,
+    excludePhones: new Set(['9111222333']),
+    timeoutMs: 300,
+    pendingMaxWaitMs: 5_000,
+  });
+  assert.equal(wait1.ok, false);
+  assert.equal(wait1.reason, 'claim_waiting');
+  assert.equal(wait1.pendingWait, true);
+  assert.equal(newNumberClicks, 1, 'Must click NEW NUMBER ONLY ONCE while waiting!');
+
+  // 2. Next call MUST resume waiting for the SAME click (ZERO second click!) and catch the delayed new number!
+  setTimeout(() => {
+    const arrivedMsg = makeMsg(202, '📱 Number: +91 9777888999\nStatus: Active', baseDateSec + 2);
+    historyMsgs = [arrivedMsg, ...historyMsgs];
+    emitPush(arrivedMsg);
+  }, 80);
+
+  const wait2 = await client.claimFreshNumber({
+    forceNew: true,
+    excludePhones: new Set(['9111222333']),
+    timeoutMs: 1_500,
+    pendingMaxWaitMs: 5_000,
+  });
+  assert.equal(wait2.ok, true);
+  assert.equal(wait2.phone, '9777888999');
+  assert.equal(newNumberClicks, 1, 'Second call MUST NOT click NEW NUMBER again while previous click is pending!');
+
+  // 3. After decision, next click returns an excluded number -> must return immediately for SlotWorker to decide (NO inner re-click!)
+  setTimeout(() => {
+    const dupMsg = makeMsg(203, '📱 Number: +91 9111222333\nStatus: Active', baseDateSec + 3);
+    historyMsgs = [dupMsg, ...historyMsgs];
+    emitPush(dupMsg);
+  }, 60);
+
+  const wait3 = await client.claimFreshNumber({
+    forceNew: true,
+    excludePhones: new Set(['9111222333', '9777888999']),
+    timeoutMs: 1_500,
+    pendingMaxWaitMs: 5_000,
+  });
+  assert.equal(wait3.ok, false);
+  assert.equal(wait3.reason, 'bot_returned_excluded');
+  assert.equal(wait3.arrivedNewCard, true);
+  assert.deepEqual(wait3.excludedPhonesSeen, ['9111222333']);
+  assert.equal(newNumberClicks, 2, 'Excluded arrival must return immediately with exactly 1 click (never double-click inside claimFreshNumber)');
+});
+
+test('20. selectLatestFreshNumberCard finds brand-new card id > cursorId even if old card was edited later and sits first', () => {
+  const oldEditedCard = {
+    id: 100,
+    date: 1700000000,
+    editDate: 1700000010, // edited AFTER new card arrived!
+    message: '📱 Number: +91 98765 43210\nStatus: Active',
+  };
+  const brandNewCard = {
+    id: 101,
+    date: 1700000005,
+    editDate: 1700000005,
+    message: '📱 Number: +91 98765 43219\nStatus: Active',
+  };
+
+  // Even with oldEditedCard at index 0, brandNewCard (id=101 > cursorId=100) MUST be detected!
+  const sel = selectLatestFreshNumberCard([oldEditedCard, brandNewCard], {
+    afterMessageId: 100,
+    afterPhone: '9876543210',
+    afterSignature: '100|1700000000000|📱 Number: +91 98765 43210\nStatus: Active',
+  });
+  assert.equal(sel.status, 'fresh');
+  assert.equal(sel.result.card.phone, '9876543219');
+});
+
+
