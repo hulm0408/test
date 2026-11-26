@@ -312,15 +312,15 @@ export class SlotWorker {
     for (let skip = 0; skip < maxFastSkips; skip++) {
       if (this._isAborted()) return { ok: false, aborted: true };
       if (skip > 0) {
-        // Gentle spacing between rapid NEW NUMBER clicks so OTP bot callback queue never stalls
-        await this._sleepInterruptible(300);
+        // Gentle spacing after deciding to skip the previous arrived number before clicking NEW NUMBER once again
+        await this._sleepInterruptible(500);
         if (this._isAborted()) return { ok: false, aborted: true };
       }
       this._setStage('claiming', '');
 
       // On first attempt (skip === 0), pass forceNew=false so an untouched fresh card
       // ALREADY sitting on screen is used immediately (0 wasted numbers!).
-      // Once we skip a card, forceNew=true requests a new number from the OTP bot.
+      // Once we decide to skip a card, forceNew=true clicks NEW NUMBER ONCE and waits for the reply.
       const claimRes = await this.client.claimFreshNumber({
         forceNew: skip > 0,
         excludePhones: excludeSet,
@@ -342,6 +342,15 @@ export class SlotWorker {
 
       if (claimRes.aborted || this._isAborted()) return { ok: false, aborted: true };
       if (!claimRes.ok || !claimRes.phone) {
+        if (claimRes.pendingWait) {
+          // Strict single-click rule: NEW NUMBER already clicked once; still waiting for reply — DO NOT re-click!
+          return {
+            ok: false,
+            pendingWait: true,
+            reason: claimRes.reason || 'claim_waiting',
+            waitedMs: claimRes.waitedMs || 0,
+          };
+        }
         if (this._rotateBotIfPoolExhausted(cfg, claimRes.reason || 'claim_empty')) {
           return { ok: false, rotated: true, reason: 'pool_rotated' };
         }
@@ -416,6 +425,14 @@ export class SlotWorker {
       if (claimed.aborted || this._isAborted()) return;
 
       if (claimed.rotated) {
+        this._lastCycleWasFastSkip = true;
+        return;
+      }
+
+      if (claimed.pendingWait) {
+        // Strict single-click rule: NEW NUMBER already clicked once — keep waiting WITHOUT re-clicking or backoff!
+        const sec = Math.max(1, Math.round((Number(claimed.waitedMs) || 0) / 1000));
+        console.log(`[Slot #${this.account.slotNo}] ⏳ WAIT_NUMBER | bot=${this.otpBotProfile} | ${sec}s ho gaye, abhi naya number nahi aaya — dubara NEW NUMBER click nahi kiya`);
         this._lastCycleWasFastSkip = true;
         return;
       }

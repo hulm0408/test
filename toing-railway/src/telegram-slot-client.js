@@ -119,11 +119,16 @@ export class TelegramSlotClient {
     this._pushEpoch = 0;
     this._pushWaiters = new Set();
     this._pushActive = false;
+
+    // Strict single-click state: once NEW NUMBER is clicked, NEVER click again until a new number
+    // actually arrives (or pendingMaxWaitMs expires with total silence from the bot).
+    this._pendingClaim = null;
   }
 
   _clearPushCache() {
     this._pushedMessages = [];
     this._pushEpoch += 1;
+    this._pendingClaim = null;
     this._notifyPushWaiters();
   }
 
@@ -608,119 +613,100 @@ export class TelegramSlotClient {
     await client.sendMessage(entity, { message: this.profile.startCommand || '/start' });
   }
 
-  // Claim a fresh phone number card from this slot's OTP bot.
-  // Push-first design: reuses cached messages + NewMessage/EditedMessage pushes (0 GetHistory RPCs in steady state!).
+  _parseBotCooldownToastMs(callbackMessage = '') {
+    const raw = String(callbackMessage || '').trim();
+    if (!raw) return 0;
+    // Ignore transport soft-timeout / loading indicators — those mean the click IS processing!
+    if (/^(click_soft_timeout|BOT_RESPONSE_TIMEOUT|QUERY_ID_INVALID|MESSAGE_NOT_MODIFIED)$/i.test(raw)) return 0;
+    if (/(searching|finding|fetching|loading|getting|generating|please wait while)/i.test(raw)) return 0;
+    if (!/(wait|slow|cooldown|too fast|try again|limit|seconds|\bsec\b|already)/i.test(raw)) return 0;
+    const secMatch = raw.match(/\b(\d{1,2})\s*(?:s|sec|second|seconds)\b/i);
+    if (secMatch) {
+      return Math.min(10_000, Math.max(2_000, Number(secMatch[1]) * 1_000));
+    }
+    return 4_000;
+  }
+
+  // Claim ONE fresh phone number card from this slot's OTP bot.
+  // STRICT SINGLE-CLICK RULE:
+  //   1. Click NEW NUMBER AT MOST ONCE.
+  //   2. NEVER click NEW NUMBER again while waiting for that click's new number to arrive
+  //      (even across calls, up to pendingMaxWaitMs = 60s).
+  //   3. The moment ANY new number card arrives (fresh OR already-seen/excluded), clear pending state
+  //      and return IMMEDIATELY so SlotWorker takes the next decision — ZERO double-clicks!
   async claimFreshNumber({
     forceNew = false,
     excludePhones = new Set(),
-    timeoutMs = 16_000,
+    timeoutMs = 25_000,
+    pendingMaxWaitMs = 60_000,
     shouldAbort = null,
   } = {}) {
     return this._withSlotLock(async () => {
-      const budgetMs = Math.max(4_000, Number(timeoutMs) || 16_000);
-      let deadline = Date.now() + budgetMs;
-      const remaining = () => Math.max(0, deadline - Date.now());
+      const budgetMs = Math.max(200, Number(timeoutMs) || 25_000);
+      const maxPendingMs = Math.max(budgetMs, Number(pendingMaxWaitMs) || 60_000);
       const excludedPhonesSeen = [];
 
       // Single read (from push cache if warm -> 0 GetHistory RPCs; else 1 initial fetch)
       let latestMsgs = await this._getMessagesCachedOrFetchUnlocked({ limit: 6 });
 
-      // If forceNew=false, reuse an untouched fresh card ALREADY sitting on screen (0 wasted numbers!)
-      if (!forceNew) {
-        const sel = selectLatestFreshNumberCard(latestMsgs, { excludePhones });
+      // Expire a genuinely dropped pending click only after maxPendingMs (default 60s of total silence)
+      if (this._pendingClaim && (Date.now() - this._pendingClaim.clickedAt) >= maxPendingMs) {
+        this._pendingClaim = null;
+      }
+
+      const evaluateArrival = (msgs, pending) => {
+        const sel = selectLatestFreshNumberCard(msgs, {
+          baselineSignatures: pending.baselineSignatures,
+          excludePhones,
+          ...pending.cursor,
+        });
         if (sel.status === 'fresh') {
+          this._pendingClaim = null;
+          this.botPacer?.noteBotFast(this.profile.id);
           this.currentCardMessageId = messageId(sel.result.message);
           this.currentPhone = sel.result.card.phone;
           this._trackMessageId(this.currentCardMessageId);
           return {
-            ok: true,
-            phone: sel.result.card.phone,
-            card: sel.result.card,
-            messageId: this.currentCardMessageId,
-            reusedOnScreen: true,
-            excludedPhonesSeen,
+            done: true,
+            response: {
+              ok: true,
+              phone: sel.result.card.phone,
+              card: sel.result.card,
+              messageId: this.currentCardMessageId,
+              reusedOnScreen: false,
+              excludedPhonesSeen,
+            },
           };
         }
-      }
-
-      let baselineSignatures = new Set(latestMsgs.map(messageSignature));
-      let cursor = { afterMessageId: 0, afterSignature: '', afterPhone: '' };
-      let sentStart = false;
-      let lastFailureReason = 'claim_timeout';
-
-      for (let cycle = 0; cycle < 3 && remaining() > 600; cycle++) {
-        if (shouldAbort?.()) return { ok: false, aborted: true, excludedPhonesSeen };
-
-        // Yield politely to shared per-bot pacer so NEW NUMBER scans never starve active OTP REFRESH clicks
-        if (this.botPacer) {
-          const granted = await this.botPacer.acquire(this.profile.id, { priority: 'claim', shouldAbort });
-          if (!granted) return { ok: false, aborted: true, excludedPhonesSeen };
-          // Pacer wait shouldn't eat the first click's response deadline
-          if (cycle === 0) {
-            deadline = Math.max(deadline, Date.now() + budgetMs);
-          }
+        if (sel.status === 'excluded-latest' && sel.result?.card?.phone) {
+          this._pendingClaim = null;
+          this.botPacer?.noteBotFast(this.profile.id);
+          const dupPhone = sel.result.card.phone;
+          if (!excludedPhonesSeen.includes(dupPhone)) excludedPhonesSeen.push(dupPhone);
+          // New number DID arrive (just already seen) -> return immediately so SlotWorker decides next step!
+          return {
+            done: true,
+            response: {
+              ok: false,
+              reason: 'bot_returned_excluded',
+              phone: dupPhone,
+              arrivedNewCard: true,
+              excludedPhonesSeen,
+            },
+          };
         }
+        return { done: false, sel };
+      };
 
-        // Capture push epoch BEFORE clicking NEW NUMBER so even a 30ms bot reply during click() is caught!
-        let lastEpoch = this._pushEpoch;
-        const clicked = await this._clickLatestButtonUnlocked({ mode: 'claim', cachedMessages: latestMsgs });
-        if (!clicked.ok) {
-          lastFailureReason = clicked.reason || 'no-claim-button';
-          if (sentStart || remaining() <= 1_800) break;
-          sentStart = true;
-          const startEpoch = this._pushEpoch;
-          await this._sendStartUnlocked();
-          const gotStartPush = await this._waitForPush(Math.min(2_200, remaining()), shouldAbort, startEpoch);
-          latestMsgs = gotStartPush
-            ? this._pushedMessages.slice(0, 6)
-            : await this._fetchIncomingUnlocked(6);
-          baselineSignatures = new Set(latestMsgs.map(messageSignature));
-          continue;
-        }
-
-        cursor = {
-          afterMessageId: clicked.messageId || 0,
-          afterSignature: clicked.screenSignature || '',
-          afterPhone: clicked.cardPhone || '',
-        };
-
-        // Generous first-click wait (up to 11s) so slow OTP bots finish replying instead of
-        // double-clicking NEW NUMBER and throwing away the first number!
-        const waitBudget = cycle === 0 ? Math.min(11_000, remaining()) : Math.min(6_500, remaining());
-        const waitEnd = Date.now() + waitBudget;
-        const fallbackPollGapMs = this._pushActive ? 3_000 : 650;
-        let sawExcludedReply = false;
-
-        while (Date.now() < waitEnd) {
-          if (shouldAbort?.()) return { ok: false, aborted: true, excludedPhonesSeen };
-
-          const waitSlice = Math.min(fallbackPollGapMs, Math.max(0, waitEnd - Date.now()));
-          const gotPush = this._pushActive
-            ? await this._waitForPush(waitSlice, shouldAbort, lastEpoch)
-            : false;
-
-          if (shouldAbort?.()) return { ok: false, aborted: true, excludedPhonesSeen };
-
-          let msgs;
-          if (gotPush) {
-            lastEpoch = this._pushEpoch;
-            msgs = this._pushedMessages.slice(0, 8);
-          } else {
-            // Safety fallback fetch only if no push arrived in 3.0s (or non-push mock)
-            if (!this._pushActive && waitSlice > 0) {
-              await sleepInterruptibly(waitSlice, shouldAbort);
-              if (shouldAbort?.()) return { ok: false, aborted: true, excludedPhonesSeen };
-            }
-            msgs = await this._fetchIncomingUnlocked(5);
-            lastEpoch = this._pushEpoch;
-          }
-          latestMsgs = msgs;
-
-          const sel = selectLatestFreshNumberCard(msgs, {
-            baselineSignatures,
-            excludePhones,
-            ...cursor,
-          });
+      // 1. If a previous NEW NUMBER click is STILL pending, DO NOT click again — check & resume waiting!
+      let lastEpoch = this._pushEpoch;
+      if (this._pendingClaim) {
+        const alreadyArrived = evaluateArrival(latestMsgs, this._pendingClaim);
+        if (alreadyArrived.done) return alreadyArrived.response;
+      } else {
+        // 2. If forceNew=false, reuse an untouched fresh card ALREADY sitting on screen (0 clicks!)
+        if (!forceNew) {
+          const sel = selectLatestFreshNumberCard(latestMsgs, { excludePhones });
           if (sel.status === 'fresh') {
             this.currentCardMessageId = messageId(sel.result.message);
             this.currentPhone = sel.result.card.phone;
@@ -730,44 +716,147 @@ export class TelegramSlotClient {
               phone: sel.result.card.phone,
               card: sel.result.card,
               messageId: this.currentCardMessageId,
-              reusedOnScreen: false,
+              reusedOnScreen: true,
               excludedPhonesSeen,
             };
           }
-          // Bot already replied with a brand-new card, but its phone is in excludePhones ->
-          // stop waiting immediately and request the next number!
-          if (sel.status === 'excluded-latest' && sel.result?.card?.phone) {
-            const dupPhone = sel.result.card.phone;
-            if (!excludedPhonesSeen.includes(dupPhone)) excludedPhonesSeen.push(dupPhone);
-            lastFailureReason = 'bot_returned_excluded';
-            sawExcludedReply = true;
-            break;
+        }
+
+        if (shouldAbort?.()) return { ok: false, aborted: true, excludedPhonesSeen };
+
+        // 3. Yield politely to shared per-bot pacer so NEW NUMBER scans never starve active OTP REFRESH clicks
+        if (this.botPacer) {
+          const granted = await this.botPacer.acquire(this.profile.id, { priority: 'claim', shouldAbort });
+          if (!granted) return { ok: false, aborted: true, excludedPhonesSeen };
+        }
+
+        // Capture push epoch + baseline BEFORE clicking so even a 30ms bot reply during click() is caught!
+        lastEpoch = this._pushEpoch;
+        let baselineSignatures = new Set(latestMsgs.map(messageSignature));
+        let clicked = await this._clickLatestButtonUnlocked({ mode: 'claim', cachedMessages: latestMsgs });
+
+        // If chat had no claim button yet (e.g. fresh chat before /start), send /start ONCE and click ONCE
+        if (!clicked.ok) {
+          const startEpoch = this._pushEpoch;
+          await this._sendStartUnlocked();
+          const gotStartPush = await this._waitForPush(Math.min(3_500, budgetMs), shouldAbort, startEpoch);
+          if (shouldAbort?.()) return { ok: false, aborted: true, excludedPhonesSeen };
+          latestMsgs = gotStartPush
+            ? this._pushedMessages.slice(0, 6)
+            : await this._fetchIncomingUnlocked(6);
+
+          // Check if /start itself already showed an untouched fresh number card
+          if (!forceNew) {
+            const startSel = selectLatestFreshNumberCard(latestMsgs, { excludePhones });
+            if (startSel.status === 'fresh') {
+              this.currentCardMessageId = messageId(startSel.result.message);
+              this.currentPhone = startSel.result.card.phone;
+              this._trackMessageId(this.currentCardMessageId);
+              return {
+                ok: true,
+                phone: startSel.result.card.phone,
+                card: startSel.result.card,
+                messageId: this.currentCardMessageId,
+                reusedOnScreen: true,
+                excludedPhonesSeen,
+              };
+            }
+          }
+
+          lastEpoch = this._pushEpoch;
+          baselineSignatures = new Set(latestMsgs.map(messageSignature));
+          clicked = await this._clickLatestButtonUnlocked({ mode: 'claim', cachedMessages: latestMsgs });
+          if (!clicked.ok) {
+            return { ok: false, reason: clicked.reason || 'no-claim-button', excludedPhonesSeen };
           }
         }
 
-        if (shouldAbort?.() || remaining() <= 600) {
+        // If the bot explicitly rejected our click with a cooldown toast ("Wait 5s"), respect it without hammering!
+        const cooldownToastMs = this._parseBotCooldownToastMs(clicked.callbackMessage);
+        if (cooldownToastMs > 0) {
+          this.botPacer?.noteBotSlow(this.profile.id);
+          await sleepInterruptibly(cooldownToastMs, shouldAbort);
           return {
             ok: false,
             aborted: Boolean(shouldAbort?.()),
-            reason: lastFailureReason,
+            reason: 'bot_click_cooldown',
+            pendingWait: true,
+            waitedMs: cooldownToastMs,
             excludedPhonesSeen,
           };
         }
 
-        // Reuse already-fetched/pushed messages for next baseline (0 extra GetHistory RPCs!)
-        baselineSignatures = new Set(latestMsgs.map(messageSignature));
-        if (sawExcludedReply) {
-          await sleepInterruptibly(Math.min(350, remaining()), shouldAbort);
-          continue;
-        }
-        lastFailureReason = 'claim_timeout';
-        this.botPacer?.noteBotSlow(this.profile.id);
+        // Click succeeded -> latch _pendingClaim so we NEVER click NEW NUMBER again until the new number arrives!
+        this._pendingClaim = {
+          clickedAt: Date.now(),
+          baselineSignatures,
+          cursor: {
+            afterMessageId: clicked.messageId || 0,
+            afterSignature: clicked.screenSignature || '',
+            afterPhone: clicked.cardPhone || '',
+          },
+        };
       }
 
-      if (lastFailureReason === 'claim_timeout') {
-        this.botPacer?.noteBotSlow(this.profile.id);
+      // 4. STRICT SINGLE-WAIT LOOP: wait patiently until the new number card actually arrives (ZERO re-clicks!)
+      const pending = this._pendingClaim;
+      const waitEnd = Math.min(Date.now() + budgetMs, pending.clickedAt + maxPendingMs);
+      const fallbackPollGapMs = this._pushActive ? 3_500 : 650;
+
+      while (Date.now() < waitEnd) {
+        if (shouldAbort?.()) return { ok: false, aborted: true, excludedPhonesSeen };
+
+        const waitSlice = Math.min(fallbackPollGapMs, Math.max(0, waitEnd - Date.now()));
+        const gotPush = this._pushActive
+          ? await this._waitForPush(waitSlice, shouldAbort, lastEpoch)
+          : false;
+
+        if (shouldAbort?.()) return { ok: false, aborted: true, excludedPhonesSeen };
+
+        let msgs;
+        if (gotPush) {
+          lastEpoch = this._pushEpoch;
+          msgs = this._pushedMessages.slice(0, 8);
+        } else {
+          if (!this._pushActive && waitSlice > 0) {
+            await sleepInterruptibly(waitSlice, shouldAbort);
+            if (shouldAbort?.()) return { ok: false, aborted: true, excludedPhonesSeen };
+          }
+          msgs = await this._fetchIncomingUnlocked(5);
+          lastEpoch = this._pushEpoch;
+        }
+        latestMsgs = msgs;
+
+        const arrived = evaluateArrival(msgs, pending);
+        if (arrived.done) return arrived.response;
       }
-      return { ok: false, reason: lastFailureReason, excludedPhonesSeen };
+
+      // One final check right at waitEnd so a reply arriving at the final millisecond is never missed
+      if (!shouldAbort?.()) {
+        try {
+          const finalMsgs = await this._fetchIncomingUnlocked(5);
+          const arrived = evaluateArrival(finalMsgs, pending);
+          if (arrived.done) return arrived.response;
+        } catch {}
+      }
+
+      const waitedMs = Date.now() - pending.clickedAt;
+      if (waitedMs < maxPendingMs) {
+        // Still within pending window -> KEEP _pendingClaim alive so next call resumes waiting WITHOUT clicking again!
+        return {
+          ok: false,
+          aborted: Boolean(shouldAbort?.()),
+          reason: 'claim_waiting',
+          pendingWait: true,
+          waitedMs,
+          excludedPhonesSeen,
+        };
+      }
+
+      // Full maxPendingMs (60s) passed with total silence -> clear pending so a clean single retry is allowed
+      this._pendingClaim = null;
+      this.botPacer?.noteBotSlow(this.profile.id);
+      return { ok: false, reason: 'claim_timeout', waitedMs, excludedPhonesSeen };
     });
   }
 

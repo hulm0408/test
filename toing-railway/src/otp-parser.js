@@ -257,8 +257,60 @@ export function selectLatestFreshNumberCard(messages = [], {
   );
   const cursorId = Number(afterMessageId) || 0;
   const cursorPhone = normalizePhone10(afterPhone);
+  const list = Array.isArray(messages) ? messages : [];
 
-  for (const message of Array.isArray(messages) ? messages : []) {
+  // Strict post-click matching: when waiting for a reply after clicking NEW NUMBER on cursorId,
+  // check ALL messages so a brand-new reply (id > cursorId) can NEVER be hidden behind an
+  // older message that happened to be edited at the same or later timestamp!
+  if (cursorId > 0) {
+    let newestNewMsg = null;
+    let editedCursorMsg = null;
+    let firstSeenCard = null;
+
+    for (const message of list) {
+      const card = parseTelegramNumberCard(messageText(message));
+      if (!card?.phone) continue;
+
+      const signature = messageSignature(message);
+      const id = messageId(message);
+      const result = { message, card, signature };
+      if (!firstSeenCard) firstSeenCard = result;
+
+      if (id > cursorId) {
+        if (baselineSignatures?.has?.(signature)) continue;
+        if (!newestNewMsg || id > messageId(newestNewMsg.message)) {
+          newestNewMsg = result;
+        }
+        continue;
+      }
+
+      if (id === cursorId && !editedCursorMsg) {
+        const changedSig = Boolean(afterSignature) && signature !== afterSignature;
+        const changedPhone = !cursorPhone || card.phone !== cursorPhone;
+        if (changedSig && changedPhone && !baselineSignatures?.has?.(signature)) {
+          editedCursorMsg = result;
+        }
+      }
+    }
+
+    const arrived = newestNewMsg || editedCursorMsg;
+    if (arrived) {
+      if (excluded.has(arrived.card.phone)) {
+        return { status: 'excluded-latest', result: arrived };
+      }
+      return { status: 'fresh', result: arrived };
+    }
+
+    if (!firstSeenCard) return { status: 'none', result: null };
+    const firstId = messageId(firstSeenCard.message);
+    if (firstId > 0 && firstId < cursorId) {
+      return { status: 'before-click-latest', result: firstSeenCard };
+    }
+    return { status: 'baseline-latest', result: firstSeenCard };
+  }
+
+  // No cursorId (initial on-screen check before any click): evaluate latest card in list
+  for (const message of list) {
     const card = parseTelegramNumberCard(messageText(message));
     if (!card?.phone) continue;
 
@@ -266,21 +318,6 @@ export function selectLatestFreshNumberCard(messages = [], {
     const result = { message, card, signature };
     if (baselineSignatures?.has?.(signature)) {
       return { status: 'baseline-latest', result };
-    }
-
-    const currentId = messageId(message);
-    if (cursorId > 0 && currentId > 0) {
-      if (currentId < cursorId) {
-        return { status: 'before-click-latest', result };
-      }
-      if (currentId === cursorId) {
-        if (!afterSignature || signature === afterSignature) {
-          return { status: 'baseline-latest', result };
-        }
-        if (cursorPhone && card.phone === cursorPhone) {
-          return { status: 'baseline-latest', result };
-        }
-      }
     }
 
     if (excluded.has(card.phone)) {
