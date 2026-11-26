@@ -28,7 +28,7 @@ async function main() {
   const clearedClaims = db.clearAllActiveClaims();
   const skipSeedOnBoot = Boolean(db.getSetting('skipSeedOnBoot', false));
   const seedRes = skipSeedOnBoot
-    ? { present: false, added: 0, kept: 0, expired: 0, skippedByUser: true }
+    ? { present: false, added: 0, kept: 0, expired: 0, purged: db.clearCooldownsByStatus(['seed']), skippedByUser: true }
     : db.seedUsedNumbersFromFile(baseConfig.seedUsedNumbersFile, {
       defaultCooldownDays: baseConfig.usedCooldownDays,
     });
@@ -38,7 +38,7 @@ async function main() {
   });
 
   console.log(`[Boot] SQLite WAL ready at ${baseConfig.dbPath} (encryption=${db.keySource})`);
-  console.log(`[Boot] Seeded used numbers: ${seedRes.skippedByUser ? 'skipped (cleared by owner)' : `added=${seedRes.added}, kept=${seedRes.kept}, expired=${seedRes.expired}`} | cleared stale claims=${clearedClaims}`);
+  console.log(`[Boot] Seeded used numbers: ${seedRes.skippedByUser ? `skipped (cleared by owner, purged=${seedRes.purged || 0})` : `added=${seedRes.added}, kept=${seedRes.kept}, expired=${seedRes.expired}`} | cleared stale claims=${clearedClaims}`);
   if (envBoot.added > 0) {
     console.log(`[Boot] Bootstrapped ${envBoot.added} TG spare account(s) from env`);
   }

@@ -20,6 +20,7 @@ import { SlotManager } from '../src/slot-manager.js';
 import { DeliveryWorker } from '../src/delivery-worker.js';
 import { startHealthServer } from '../src/health-server.js';
 import { TelegramSlotClient, formatCodeDeliverySummary, qrLoginUrlFromToken } from '../src/telegram-slot-client.js';
+import { BotClickPacer } from '../src/bot-pacer.js';
 import QRCode from 'qrcode';
 
 function makeTmpDir(prefix = 'toing-rail-test-') {
@@ -1333,3 +1334,81 @@ test('getCooldownBreakdown, clearCooldownsByStatus & tryClaimPhone(ignoreAlready
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('17. BotClickPacer gives OTP REFRESH VIP priority over queued NEW NUMBER claims and widens claim gap under load', async () => {
+  const pacer = new BotClickPacer({
+    claimGapMs: 60,
+    busyClaimGapMs: 140,
+    congestedClaimGapMs: 220,
+    refreshGapMs: 15,
+    congestionWindowMs: 5_000,
+  });
+
+  // Base claim gap
+  assert.equal(pacer.getClaimGapMs('hathi'), 60);
+
+  // When a slot is waiting for OTP, claim gap widens automatically
+  pacer.markOtpWaitStart('hathi');
+  assert.equal(pacer.getClaimGapMs('hathi'), 140);
+
+  // Congestion widens claim gap even further
+  pacer.noteBotSlow('hathi');
+  assert.equal(pacer.getClaimGapMs('hathi'), 220);
+
+  pacer.markOtpWaitEnd('hathi');
+
+  // Verify VIP priority: queue 2 claims, then immediately queue a refresh — refresh MUST jump ahead of claim #2!
+  const order = [];
+  const pacer2 = new BotClickPacer({ claimGapMs: 120, busyClaimGapMs: 120, congestedClaimGapMs: 120, refreshGapMs: 5 });
+  const c1 = pacer2.acquire('hathi', { priority: 'claim' }).then((ok) => { order.push(`claim1:${ok}`); });
+  const c2 = pacer2.acquire('hathi', { priority: 'claim' }).then((ok) => { order.push(`claim2:${ok}`); });
+  // Slight tick so c1 executes immediately, c2 is waiting its 120ms gap, then VIP refresh arrives!
+  await new Promise((r) => setTimeout(r, 15));
+  const r1 = pacer2.acquire('hathi', { priority: 'refresh' }).then((ok) => { order.push(`refresh1:${ok}`); });
+
+  await Promise.all([c1, c2, r1]);
+  assert.deepEqual(order, ['claim1:true', 'refresh1:true', 'claim2:true']);
+});
+
+test('18. _safeClickButton soft timeout prevents 10s hangs on slow OTP bot callbacks and records congestion', async () => {
+  const pacer = new BotClickPacer({
+    claimGapMs: 350,
+    busyClaimGapMs: 750,
+    congestedClaimGapMs: 950,
+    refreshGapMs: 120,
+    congestionWindowMs: 10_000,
+  });
+  const client = new TelegramSlotClient({
+    slotId: 1,
+    slotNo: 1,
+    label: 'SlowClick',
+    session: 'dummy',
+    apiId: 123,
+    apiHash: 'abc',
+    otpBotProfile: 'hathi',
+    botPacer: pacer,
+  });
+
+  // Simulate a hung Telegram callback that rejects 5 seconds later
+  const hungEntry = {
+    button: {
+      click() {
+        return new Promise((_, reject) => {
+          const t = setTimeout(() => reject(new Error('BOT_RESPONSE_TIMEOUT')), 5_000);
+          if (typeof t.unref === 'function') t.unref();
+        });
+      },
+    },
+  };
+
+  const t0 = Date.now();
+  const res = await client._safeClickButton(hungEntry, { timeoutMs: 1_500 });
+  const elapsed = Date.now() - t0;
+
+  assert.equal(res.clicked, true);
+  assert.equal(res.softTimeout, true);
+  assert.ok(elapsed < 2_500, `Expected soft timeout around 1.5s, got ${elapsed}ms`);
+  // Must have flagged the bot as congested on the shared pacer
+  assert.equal(pacer.getClaimGapMs('hathi'), 950);
+});
+
