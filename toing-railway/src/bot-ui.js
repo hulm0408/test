@@ -75,12 +75,13 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
       `⚡ <b>Throughput:</b> <code>${t.rate1m}/min</code> (1m) · <code>${t.rate5m}/min</code> (5m) · <code>${t.rate15m}/min</code> (15m)`,
       `🎯 <b>Goal:</b> <code>${cfg.targetAccountsPerMin}+ acc/min</code> · <b>Hit Rate (5m):</b> <code>${t.hitRate5m}%</code> · <b>Avg:</b> <code>${t.avgSignupSec}s</code>`,
       `📦 <b>Total Created:</b> <code>${t.totalSessions}</code> (1h: <code>${t.last1h}</code>) · <b>Cooldown Pool:</b> <code>${t.usedActive}</code>`,
+      `🔍 <b>5m Skips/Drops:</b> 🚫 Reg <code>${t.alreadyRegistered5m || 0}</code> · 🔁 Used/Dup <code>${t.duplicateSkips5m || 0}</code> · ⏱ OTP Timeout <code>${t.timeouts5m || 0}</code> · ❌ Fail <code>${(t.sendFails5m || 0) + (t.verifyFails5m || 0) + (t.checkFails5m || 0)}</code>`,
       ``,
       `👥 <b>Slots:</b> <code>${snap.totalSlots}/${cfg.maxSlots}</code>  (🟢 ${snap.readyCount} live · ⏳ ${snap.cooldownCount} cool · ⛔ ${snap.deadCount} dead · ⚪ ${snap.disabledCount} off)`,
       stageLine ? `🔄 <b>Stages:</b> <code>${esc(stageLine)}</code>` : '',
       `📤 <b>Delivery Queue:</b> <code>${d.pending}</code> pending · <code>${d.sent}</code> sent · <code>${d.failed}</code> failed`,
       `🔑 <b>Toing Keys:</b> <code>${snap.toing.keysCount}</code> · <b>HTTP Gate:</b> <code>${snap.toing.semaphore.active}/${snap.toing.semaphore.limit}</code> (429: ${snap.toing.rateLimited429})`,
-      `🤖 <b>Default OTP Bot:</b> <code>${esc(cfg.defaultOtpBot)}</code> · <b>OTP Timeout:</b> <code>${Math.round(cfg.otpTimeoutMs / 1000)}s</code>`,
+      `🤖 <b>OTP Bot:</b> <code>${esc(cfg.defaultOtpBot)}</code> · <b>OTP Timeout:</b> <code>${Math.round(cfg.otpTimeoutMs / 1000)}s</code> · <b>Skip Registered:</b> <code>${cfg.skipRegistered !== false ? 'ON ✅' : 'OFF'}</code>`,
     ].filter(Boolean);
 
     const rows = [
@@ -103,6 +104,7 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
         Markup.button.callback('📦 Export Last 50', 'act_export_50'),
       ],
       [
+        Markup.button.callback('📜 Number Log', 'act_logs'),
         Markup.button.callback('♻️ Reset Health', 'act_reset_health'),
       ],
     ];
@@ -233,6 +235,60 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     };
   }
 
+  // ── Number Log View (Exact Reason For Every Number) ───────────────────────
+  function buildNumberLogView(limit = 22) {
+    const summary = db.getNumberEventSummary(5 * 60_000);
+    const events = db.getRecentNumberEvents(limit);
+    const r = summary.byReason || {};
+
+    const lines = [
+      `📜 <b>NUMBER LOG — HAR NUMBER KA EXACT REASON</b>`,
+      ``,
+      `📊 <b>Last 5 Min Breakdown (${summary.total} events):</b>`,
+      `• ✅ Created New: <code>${r.created_new || 0}</code>` + (r.created_existing ? ` · Existing: <code>${r.created_existing}</code>` : ''),
+      `• 🚫 Already Registered (OTP nahi bheja): <code>${r.already_registered || 0}</code>`,
+      `• 🔁 Used / Cooldown / Seed Skip: <code>${r.used_cooldown || 0}</code>`,
+      `• 🔒 In-Flight Duplicate (doosra slot): <code>${r.in_flight || 0}</code> · Bot Dup: <code>${r.bot_duplicate || 0}</code>`,
+      `• ⏱ OTP Timeout: <code>${r.otp_timeout || 0}</code> · ❌ Send/Verify Fail: <code>${(r.send_otp_failed || 0) + (r.verify_failed || 0) + (r.check_mobile_failed || 0)}</code>`,
+      ``,
+      `🧾 <b>Latest ${events.length} Numbers:</b>`,
+    ];
+
+    if (!events.length) {
+      lines.push('<i>Abhi tak koi number event record nahi hua hai.</i>');
+    } else {
+      const iconFor = (ev) => {
+        if (ev.outcome === 'ok') return '✅';
+        if (ev.reason === 'already_registered') return '🚫';
+        if (ev.reason === 'used_cooldown' || ev.reason === 'in_flight' || ev.reason === 'bot_duplicate') return '🔁';
+        if (ev.reason === 'otp_timeout') return '⏱';
+        if (ev.outcome === 'claim_fail') return '⚠️';
+        return '❌';
+      };
+      const now = Date.now();
+      for (const ev of events) {
+        const ageSec = Math.max(0, Math.round((now - Number(ev.created_at || now)) / 1000));
+        const ageTxt = fmtDuration(ageSec);
+        const phoneTxt = ev.phone ? `<code>${esc(ev.phone)}</code>` : '<i>no-phone</i>';
+        const reasonTxt = esc(ev.reason || ev.outcome);
+        const detailTxt = ev.detail ? ` — ${esc(ev.detail.slice(0, 68))}` : '';
+        lines.push(`${iconFor(ev)} <b>#${ev.slot_no}</b> ${phoneTxt} [<code>${reasonTxt}</code>]${detailTxt} <i>(${ageTxt} ago)</i>`);
+      }
+    }
+
+    const rows = [
+      [
+        Markup.button.callback('🔄 Refresh Log', 'act_logs'),
+        Markup.button.callback('🏠 Dashboard', 'act_dash'),
+      ],
+    ];
+
+    return {
+      text: lines.join('\n').slice(0, 3950),
+      extra: { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) },
+    };
+  }
+
   // ── Settings View ──────────────────────────────────────────────────────────
   function buildSettingsView() {
     const cfg = getRuntimeConfig();
@@ -240,6 +296,7 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     const lines = [
       `⚙️ <b>TOING CLUSTER SETTINGS</b>`,
       ``,
+      `🆕 Skip Already Registered: <b>${cfg.skipRegistered !== false ? 'ON ✅ (Only Fresh Numbers)' : 'OFF (Existing Allowed)'}</b>`,
       `🤖 Default OTP Bot: <code>${esc(cfg.defaultOtpBot)}</code>`,
       `🔁 Auto-Failover Bots: <b>${cfg.autoFailoverBots ? 'ON' : 'OFF'}</b>`,
       `⏱ OTP Fast-Fail Timeout: <code>${Math.round(cfg.otpTimeoutMs / 1000)}s</code>`,
@@ -249,6 +306,7 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
       `🔄 Auto-Resume on Restart: <b>${cfg.autoResume ? 'ON' : 'OFF'}</b>`,
       ``,
       `<i>Commands:</i>`,
+      `• <code>/logs</code> — Har number ka skip/drop/success exact reason dekho`,
       `• <code>/setkey KEY1,KEY2</code> — Update Toing keys live`,
       `• <code>/setchat -100123...</code> — Set delivery chat (or <code>/setchat here</code>)`,
       `• <code>/session 9876543210</code> — Fetch saved .json by phone`,
@@ -256,6 +314,12 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     ];
 
     const rows = [
+      [
+        Markup.button.callback(
+          `🆕 Skip Registered: ${cfg.skipRegistered !== false ? 'ON ✅' : 'OFF'}`,
+          'cfg_toggle_skip_reg'
+        ),
+      ],
       [
         Markup.button.callback('🐘 All → Hathi', 'cfg_allbot_hathi'),
         Markup.button.callback('📨 All → Hermes', 'cfg_allbot_hermes'),
@@ -302,6 +366,12 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
 
   bot.command(['status', 'stats'], async (ctx) => {
     const { text, extra } = buildDashboard();
+    await ctx.reply(text, extra);
+  });
+
+  bot.command(['logs', 'log', 'reasons'], async (ctx) => {
+    const limit = Math.min(40, Math.max(5, Number((ctx.message.text || '').split(/\s+/)[1]) || 22));
+    const { text, extra } = buildNumberLogView(limit);
     await ctx.reply(text, extra);
   });
 
@@ -750,6 +820,12 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     }
   });
 
+  bot.action('act_logs', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const { text, extra } = buildNumberLogView(22);
+    await editOrReply(ctx, text, extra);
+  });
+
   bot.action('act_settings', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     const { text, extra } = buildSettingsView();
@@ -851,6 +927,14 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     db.setSetting('toingHttpConcurrency', limit);
     toingClient.setConcurrency(limit);
     await ctx.answerCbQuery(`🚦 HTTP concurrency -> ${limit}`).catch(() => {});
+    const { text, extra } = buildSettingsView();
+    await editOrReply(ctx, text, extra);
+  });
+
+  bot.action('cfg_toggle_skip_reg', async (ctx) => {
+    const next = !(getRuntimeConfig().skipRegistered !== false);
+    db.setSetting('skipRegistered', next);
+    await ctx.answerCbQuery(`🆕 Skip Registered: ${next ? 'ON' : 'OFF'}`).catch(() => {});
     const { text, extra } = buildSettingsView();
     await editOrReply(ctx, text, extra);
   });

@@ -72,6 +72,8 @@ export function loadConfig(env = process.env) {
     otpRefreshMs: envInt(env, 'OTP_REFRESH_MS', 1_800, 800, 10_000),
     claimTimeoutMs: envInt(env, 'CLAIM_TIMEOUT_MS', 16_000, 4_000, 60_000),
     autoFailoverBots: envBool(env, 'AUTO_FAILOVER_BOTS', false),
+    skipRegistered: envBool(env, 'SKIP_REGISTERED', true),
+    otpTimeoutCooldownMin: envInt(env, 'OTP_TIMEOUT_COOLDOWN_MIN', 10, 0, 1440),
 
     maxSlots: envInt(env, 'MAX_SLOTS', DEFAULT_MAX_SLOTS, 1, 100),
     bootBatchSize: envInt(env, 'BOOT_BATCH_SIZE', 5, 1, 25),

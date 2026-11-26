@@ -128,6 +128,20 @@ export class ToingDb {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_metrics_events_created ON metrics_events(created_at);
+
+      CREATE TABLE IF NOT EXISTS number_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        slot_id INTEGER NOT NULL DEFAULT 0,
+        slot_no INTEGER NOT NULL DEFAULT 0,
+        phone TEXT NOT NULL DEFAULT '',
+        otp_bot TEXT NOT NULL DEFAULT '',
+        outcome TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        detail TEXT NOT NULL DEFAULT '',
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_number_events_created ON number_events(created_at DESC);
     `);
   }
 
@@ -538,6 +552,48 @@ export class ToingDb {
     return false;
   }
 
+  // Persist a blocked/skipped phone (e.g. already_registered for 30d or otp_timeout_cool for 10m)
+  // so none of the other 49 slots waste time or OTPs on it!
+  markNumberUsed(rawPhone, {
+    status = 'already_registered',
+    slotId = 0,
+    cooldownDays = 30,
+    cooldownMs = 0,
+    source = 'toing_check',
+    accountKey = '',
+    now = Date.now(),
+  } = {}) {
+    const phone = normalizePhone10(rawPhone);
+    if (!phone) return { ok: false, reason: 'invalid_phone' };
+    const effectiveCooldownMs = cooldownMs > 0
+      ? Number(cooldownMs)
+      : Math.max(1, Number(cooldownDays) || 30) * 24 * 60 * 60 * 1000;
+    const cooldownUntil = now + effectiveCooldownMs;
+
+    this.withTransaction(() => {
+      this.db.prepare(`
+        INSERT INTO used_numbers (phone, status, account_key, slot_id, extracted_at, cooldown_until, source)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(phone) DO UPDATE SET
+          status = CASE
+            WHEN used_numbers.status = 'extracted' AND used_numbers.cooldown_until > excluded.cooldown_until THEN used_numbers.status
+            ELSE excluded.status
+          END,
+          slot_id = excluded.slot_id,
+          extracted_at = excluded.extracted_at,
+          cooldown_until = MAX(used_numbers.cooldown_until, excluded.cooldown_until),
+          source = CASE
+            WHEN used_numbers.status = 'extracted' AND used_numbers.cooldown_until > excluded.cooldown_until THEN used_numbers.source
+            ELSE excluded.source
+          END
+      `).run(phone, String(status), String(accountKey || ''), Number(slotId) || 0, now, cooldownUntil, String(source));
+
+      this.db.prepare('DELETE FROM active_claims WHERE phone = ?').run(phone);
+    });
+
+    return { ok: true, phone, status, cooldownUntil };
+  }
+
   // ── Atomic Signup Commit (session + cooldown + delivery_queue + metrics) ───
   commitCompletedSignup({
     phone,
@@ -662,9 +718,70 @@ export class ToingDb {
     `).run(Number(slotId) || 0, String(kind || 'unknown'), Math.max(0, Number(durationMs) || 0), now);
   }
 
+  recordNumberEvent({
+    slotId = 0,
+    slotNo = 0,
+    phone = '',
+    otpBot = '',
+    outcome = 'skip',
+    reason = 'unknown',
+    detail = '',
+    durationMs = 0,
+    now = Date.now(),
+  } = {}) {
+    this.db.prepare(`
+      INSERT INTO number_events (slot_id, slot_no, phone, otp_bot, outcome, reason, detail, duration_ms, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      Number(slotId) || 0,
+      Number(slotNo) || 0,
+      String(phone || '').slice(0, 20),
+      String(otpBot || '').slice(0, 24),
+      String(outcome || 'skip').slice(0, 24),
+      String(reason || 'unknown').slice(0, 64),
+      String(detail || '').slice(0, 220),
+      Math.max(0, Number(durationMs) || 0),
+      now
+    );
+  }
+
+  getRecentNumberEvents(limit = 30) {
+    return this.db.prepare(`
+      SELECT id, slot_id, slot_no, phone, otp_bot, outcome, reason, detail, duration_ms, created_at
+      FROM number_events
+      ORDER BY id DESC
+      LIMIT ?
+    `).all(Math.max(1, Math.min(200, Number(limit) || 30))).map((r) => ({ ...r }));
+  }
+
+  getNumberEventSummary(windowMs = 5 * 60_000, now = Date.now()) {
+    const since = now - Math.max(1_000, Number(windowMs) || 5 * 60_000);
+    const rows = this.db.prepare(`
+      SELECT outcome, reason, COUNT(*) AS c
+      FROM number_events
+      WHERE created_at >= ?
+      GROUP BY outcome, reason
+      ORDER BY c DESC
+    `).all(since);
+    const byReason = {};
+    let total = 0;
+    for (const r of rows) {
+      const c = Number(r.c || 0);
+      total += c;
+      byReason[String(r.reason)] = (byReason[String(r.reason)] || 0) + c;
+    }
+    return { total, windowSec: Math.round(windowMs / 1000), byReason, rows: rows.map((r) => ({ ...r })) };
+  }
+
   pruneOldMetrics(maxAgeMs = 24 * 60 * 60_000) {
     const cutoff = Date.now() - maxAgeMs;
     this.db.prepare('DELETE FROM metrics_events WHERE created_at < ?').run(cutoff);
+    this.db.prepare('DELETE FROM number_events WHERE created_at < ?').run(cutoff);
+    // Keep number_events bounded to latest 5,000 rows even under heavy throughput
+    this.db.prepare(`
+      DELETE FROM number_events
+      WHERE id NOT IN (SELECT id FROM number_events ORDER BY id DESC LIMIT 5000)
+    `).run();
   }
 
   // ── Delivery Queue ─────────────────────────────────────────────────────────
@@ -772,6 +889,9 @@ export class ToingDb {
     const timeouts5m = countSince(m5, 'otp_timeout');
     const sendFails5m = countSince(m5, 'send_otp_fail');
     const verifyFails5m = countSince(m5, 'verify_fail');
+    const alreadyRegistered5m = countSince(m5, 'already_registered_skip');
+    const duplicateSkips5m = countSince(m5, 'duplicate_skip');
+    const checkFails5m = countSince(m5, 'check_mobile_fail');
     const totalAttempts5m = last5m + timeouts5m + sendFails5m + verifyFails5m;
 
     const avgRow = this.db.prepare(`
@@ -794,6 +914,9 @@ export class ToingDb {
       timeouts5m,
       sendFails5m,
       verifyFails5m,
+      alreadyRegistered5m,
+      duplicateSkips5m,
+      checkFails5m,
       avgSignupSec: avgRow?.avg_ms ? Number((Number(avgRow.avg_ms) / 1000).toFixed(1)) : 0,
       totalSessions,
       usedActive,

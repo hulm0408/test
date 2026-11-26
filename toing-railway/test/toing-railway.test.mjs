@@ -13,8 +13,9 @@ import {
   selectLatestFreshNumberCard,
 } from '../src/otp-parser.js';
 import { selectOtpBotScreenAction, otpBotButtonRole } from '../src/otp-profiles.js';
-import { classifyTelegramError } from '../src/telegram-health.js';
+import { classifyTelegramError, isConnectionError } from '../src/telegram-health.js';
 import { ToingClient } from '../src/toing-client.js';
+import { SlotWorker } from '../src/slot-worker.js';
 import { SlotManager } from '../src/slot-manager.js';
 import { DeliveryWorker } from '../src/delivery-worker.js';
 import { startHealthServer } from '../src/health-server.js';
@@ -629,4 +630,207 @@ test('Login delivery formatter distinguishes App vs SMS & QR token encodes clean
   assert.ok(Buffer.isBuffer(png) && png.length > 200);
   assert.equal(png[0], 0x89); // PNG magic byte
   assert.equal(png[1], 0x50); // 'P'
+});
+
+// ---------------------------------------------------------------------------
+// 9. Already-Registered Immediate Skip (Zero OTP Sent) + Per-Number Reason Log
+// ---------------------------------------------------------------------------
+test('Already-registered numbers are skipped BEFORE send_otp, persisted in cooldown & every number logs exact reason', async () => {
+  const dir = makeTmpDir();
+  try {
+    const db = new ToingDb({
+      dbPath: path.join(dir, 'toing.db'),
+      dataDir: dir,
+      encryptionKey: 'skip-reg-key',
+      sessionsDir: path.join(dir, 'sessions'),
+    });
+
+    // Pre-seed one used number to verify used_cooldown reason logging
+    db.markNumberUsed('9111111111', { status: 'seed', cooldownDays: 30, source: 'seed' });
+
+    const added = db.addAccount({
+      session: '1BVtsMOCK_SKIP_REGISTERED_TEST_SESSION_00001',
+      label: 'SkipTest-1',
+      otpBotProfile: 'hathi',
+    });
+    assert.equal(added.ok, true);
+    const acc = db.getAccountById(added.id, { includeSession: true });
+
+    // Queue of numbers returned by the mock OTP bot:
+    //   1) 9111111111 -> already in seed used_numbers (must skip: used_cooldown, 0 check_mobile, 0 send_otp)
+    //   2) 9222222222 -> check_mobile returns { registered: true } (must skip: already_registered, 0 send_otp!)
+    //   3) 9333333333 -> check_mobile returns HTTP 409 "Already Registered! This mobile number is already registered." (must skip: already_registered, 0 send_otp!)
+    //   4) 9444444444 -> check_mobile fails with 502 (must safe-skip: check_mobile_failed, 0 send_otp!)
+    //   5) 9555555555 -> FRESH (registered: false) -> send_otp -> OTP timeout (must drop: otp_timeout + short cooldown)
+    //   6) 9666666666 -> FRESH (registered: false) -> send_otp -> verify -> export -> created_new!
+    const phoneQueue = [
+      '9111111111',
+      '9222222222',
+      '9333333333',
+      '9444444444',
+      '9555555555',
+      '9666666666',
+    ];
+    const sendOtpCalls = [];
+    const watermarkCalls = [];
+    const forceNewArgs = [];
+
+    const mockFetch = async (url, opts) => {
+      const body = opts?.body ? JSON.parse(opts.body) : {};
+      if (url.endsWith('/api/auth/check_mobile')) {
+        if (body.mobile === '9222222222') {
+          return new Response(JSON.stringify({ registered: true, message: 'Already Registered! This mobile number is already registered.' }), { status: 200 });
+        }
+        if (body.mobile === '9333333333') {
+          return new Response(JSON.stringify({ error: 'Already Registered! This mobile number is already registered.' }), { status: 409 });
+        }
+        if (body.mobile === '9444444444') {
+          return new Response(JSON.stringify({ error: 'upstream 502' }), { status: 502 });
+        }
+        return new Response(JSON.stringify({ registered: false }), { status: 200 });
+      }
+      if (url.endsWith('/api/auth/send_otp')) {
+        sendOtpCalls.push(body.mobile);
+        return new Response(JSON.stringify({ success: true, sid: `sid_${body.mobile}`, tid: `tid_${body.mobile}`, device_id: 'dev1' }), { status: 200 });
+      }
+      if (url.endsWith('/api/auth/verify_otp')) {
+        return new Response(JSON.stringify({ success: body.otp === '777888' }), { status: 200 });
+      }
+      if (url.includes('/export')) {
+        return new Response(JSON.stringify({
+          success: true,
+          export: { mobile: '9666666666', name: 'FreshUser', token: 'tok_fresh', sid: 'sid_9666666666', tid: 'tid_9666666666', deviceId: 'dev1', customerId: 'c_fresh' },
+        }), { status: 200 });
+      }
+      return new Response('{}', { status: 404 });
+    };
+
+    const toingClient = new ToingClient({
+      getBaseUrl: () => 'https://storelex.store/toing_web',
+      getAccessKeys: () => ['TEST-KEY'],
+      concurrency: 10,
+      fetchImpl: mockFetch,
+    });
+
+    let clientCreateCount = 0;
+    const worker = new SlotWorker({
+      account: acc,
+      db,
+      toingClient,
+      getRuntimeConfig: () => ({
+        telegramApiId: 12345,
+        telegramApiHash: 'hash',
+        claimTimeoutMs: 2_000,
+        claimLockTtlMs: 60_000,
+        otpTimeoutMs: 500,
+        otpRefreshMs: 100,
+        usedCooldownDays: 30,
+        deliveryChatId: '6484999726',
+        skipRegistered: true,
+        otpTimeoutCooldownMin: 10,
+        slotJitterMinMs: 0,
+        slotJitterMaxMs: 0,
+        claimFailBackoffMs: 10,
+      }),
+      clientFactory: () => {
+        clientCreateCount += 1;
+        return {
+          connected: false,
+          async connect() { this.connected = true; return { ok: true, me: 'SkipTest' }; },
+          async disconnect() { this.connected = false; },
+          setBotProfile() {},
+          async claimFreshNumber({ forceNew }) {
+            forceNewArgs.push(forceNew);
+            const next = phoneQueue.shift();
+            if (!next) return { ok: false, reason: 'queue_empty' };
+            return { ok: true, phone: next, card: { phone: next }, reusedOnScreen: !forceNew };
+          },
+          async captureOtpWatermark(phone) {
+            watermarkCalls.push(phone);
+            return { ids: [], codes: [], ts: Date.now(), afterMs: Date.now(), messageId: 1 };
+          },
+          async waitForOtp(phone) {
+            if (phone === '9555555555') {
+              return { ok: false, code: '', timeout: true, attempts: 3, elapsedMs: 500 };
+            }
+            return { ok: true, code: '777888', sender: 'SWIGGY', elapsedMs: 120 };
+          },
+        };
+      },
+    });
+
+    // Run 5 cycles covering all 6 numbers (cycle 1 fast-skips 9111111111 then checks 9222222222)
+    for (let i = 0; i < 5; i++) {
+      await worker._runSingleCycle();
+    }
+
+    // CRITICAL ASSERTION 1: send_otp was NEVER called on registered or failed-check numbers!
+    assert.deepEqual(sendOtpCalls, ['9555555555', '9666666666']);
+    assert.deepEqual(watermarkCalls, ['9555555555', '9666666666'], 'Watermark TG RPC must not be wasted on registered numbers');
+
+    // CRITICAL ASSERTION 2: First claim uses forceNew=false (reuses untouched card on screen!)
+    assert.equal(forceNewArgs[0], false);
+    assert.equal(forceNewArgs[1], true);
+
+    // CRITICAL ASSERTION 3: Client was created ONCE and reused across all 5 cycles (zero churn!)
+    assert.equal(clientCreateCount, 1);
+
+    // CRITICAL ASSERTION 4: Already-registered & otp_timeout numbers are persisted in used_numbers!
+    assert.equal(db.isPhoneBlocked('9222222222'), true, 'registered=true must be persisted in used_numbers');
+    assert.equal(db.isPhoneBlocked('9333333333'), true, '409 Already Registered must be persisted in used_numbers');
+    assert.equal(db.isPhoneBlocked('9444444444'), false, 'transient check_mobile 502 must NOT 30d-ban phone');
+    assert.equal(db.isPhoneBlocked('9555555555'), true, 'otp_timeout must put dead SIM in short cooldown');
+    assert.equal(db.isPhoneBlocked('9666666666'), true, 'created account must be in 30d cooldown');
+
+    // CRITICAL ASSERTION 5: Every single number has an explicit persisted reason in number_events!
+    const events = db.getRecentNumberEvents(20);
+    const byPhone = new Map(events.map((e) => [e.phone, e]));
+    assert.equal(byPhone.get('9111111111')?.reason, 'used_cooldown');
+    assert.equal(byPhone.get('9222222222')?.reason, 'already_registered');
+    assert.equal(byPhone.get('9333333333')?.reason, 'already_registered');
+    assert.equal(byPhone.get('9444444444')?.reason, 'check_mobile_failed');
+    assert.equal(byPhone.get('9555555555')?.reason, 'otp_timeout');
+    assert.equal(byPhone.get('9666666666')?.reason, 'created_new');
+
+    const summary = db.getNumberEventSummary(60_000);
+    assert.equal(summary.byReason.already_registered, 2);
+    assert.equal(summary.byReason.used_cooldown, 1);
+    assert.equal(summary.byReason.check_mobile_failed, 1);
+    assert.equal(summary.byReason.otp_timeout, 1);
+    assert.equal(summary.byReason.created_new, 1);
+
+    const stats = db.getThroughputStats();
+    assert.equal(stats.alreadyRegistered5m, 2);
+    assert.equal(stats.totalSessions, 1);
+
+    await worker.stop();
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 10. BOT_RESPONSE_TIMEOUT & FLOOD_WAIT Do NOT Destroy Healthy MTProto Clients
+// ---------------------------------------------------------------------------
+test('BOT_RESPONSE_TIMEOUT is non-fatal bot-ui (never a connection error) & FLOOD_WAIT preserves client', () => {
+  const botTimeoutErr = new Error('400: BOT_RESPONSE_TIMEOUT');
+  const classified = classifyTelegramError(botTimeoutErr);
+  assert.equal(classified.code, 'BOT_RESPONSE_TIMEOUT');
+  assert.equal(classified.kind, 'bot-ui');
+  assert.equal(classified.cooldownMs, 0);
+  assert.equal(isConnectionError(botTimeoutErr), false, 'BOT_RESPONSE_TIMEOUT must NOT disconnect TelegramClient!');
+
+  const queryErr = new Error('400: QUERY_ID_INVALID');
+  assert.equal(classifyTelegramError(queryErr).kind, 'bot-ui');
+  assert.equal(isConnectionError(queryErr), false);
+
+  const notModErr = new Error('400: MESSAGE_NOT_MODIFIED');
+  assert.equal(classifyTelegramError(notModErr).kind, 'bot-ui');
+  assert.equal(isConnectionError(notModErr), false);
+
+  // Real socket errors still trigger reconnect
+  assert.equal(isConnectionError(new Error('ECONNRESET: socket hang up')), true);
+  assert.equal(isConnectionError(new Error('TIMEOUT: MTProto connect timed out (20s)')), true);
+  assert.equal(isConnectionError(new Error('FLOOD_WAIT_30')), false, 'FLOOD_WAIT is rate-limit, NOT a dead TCP socket');
 });

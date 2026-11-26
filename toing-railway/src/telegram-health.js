@@ -1,12 +1,13 @@
 // Pure MTProto error classifier — decides per-slot health & cooldown.
 
+const BOT_UI_RE = /\b(BOT_RESPONSE_TIMEOUT|QUERY_ID_INVALID|MESSAGE_NOT_MODIFIED|MESSAGE_ID_INVALID|BUTTON_INVALID|BUTTON_NOT_FOUND|DATA_INVALID)\b/i;
 const NETWORK_RE = /(ECONNRESET|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EPIPE|socket|not connected|Connection closed|disconnected|timed?\s*out|timeout|network|fetch failed)/i;
 
 export function telegramErrorCode(error) {
   const msg = String(error?.message ?? error ?? '');
   const explicit = String(error?.errorMessage || error?.code || '').trim();
   const pool = `${explicit} ${msg}`;
-  const direct = pool.match(/\b(PEER_FLOOD|FLOOD_WAIT(?:_\d+)?|AUTH_KEY_UNREGISTERED|AUTH_KEY_DUPLICATED|AUTH_KEY_INVALID|SESSION_REVOKED|SESSION_EXPIRED|USER_DEACTIVATED_BAN|USER_DEACTIVATED|CHAT_WRITE_FORBIDDEN|CHAT_ADMIN_REQUIRED|USER_BANNED_IN_CHANNEL|PHONE_NUMBER_BANNED|PHONE_CODE_EXPIRED|PHONE_CODE_INVALID|BOT_METHOD_INVALID|MESSAGE_ID_INVALID|BUTTON_INVALID|BUTTON_NOT_FOUND|DATA_INVALID|RPC_CALL_FAIL|TIMEOUT|CONNECTION_NOT_INITED)\b/i);
+  const direct = pool.match(/\b(PEER_FLOOD|FLOOD_WAIT(?:_\d+)?|AUTH_KEY_UNREGISTERED|AUTH_KEY_DUPLICATED|AUTH_KEY_INVALID|SESSION_REVOKED|SESSION_EXPIRED|USER_DEACTIVATED_BAN|USER_DEACTIVATED|CHAT_WRITE_FORBIDDEN|CHAT_ADMIN_REQUIRED|USER_BANNED_IN_CHANNEL|PHONE_NUMBER_BANNED|PHONE_CODE_EXPIRED|PHONE_CODE_INVALID|BOT_RESPONSE_TIMEOUT|QUERY_ID_INVALID|MESSAGE_NOT_MODIFIED|BOT_METHOD_INVALID|MESSAGE_ID_INVALID|BUTTON_INVALID|BUTTON_NOT_FOUND|DATA_INVALID|RPC_CALL_FAIL|TIMEOUT|CONNECTION_NOT_INITED)\b/i);
   if (direct) return direct[1].toUpperCase();
   if (/not a valid string|invalid string session|invalid session|bad session|session string/i.test(msg)) {
     return 'SESSION_INVALID';
@@ -28,6 +29,16 @@ export function classifyTelegramError(error) {
   const raw = String(error?.message ?? error ?? '').slice(0, 200);
   const base = { code, raw, seconds: 0 };
 
+  if (BOT_UI_RE.test(code)) {
+    return {
+      ...base,
+      kind: 'bot-ui',
+      healthStatus: 'ready',
+      fatal: false,
+      cooldownMs: 0,
+      label: `${code} (non-fatal bot UI)`,
+    };
+  }
   if (code === 'PEER_FLOOD') {
     return {
       ...base,
@@ -80,14 +91,14 @@ export function classifyTelegramError(error) {
       label: `${code} (OTP bot blocked this slot)`,
     };
   }
-  if (code === 'NETWORK') {
+  if (code === 'NETWORK' || code === 'TIMEOUT' || code === 'CONNECTION_NOT_INITED') {
     return {
       ...base,
       kind: 'network',
       healthStatus: 'cooldown',
       fatal: false,
       cooldownMs: 12_000,
-      label: 'Network timeout (auto-retry 12s)',
+      label: `${code} (auto-retry 12s)`,
     };
   }
   return {
@@ -101,6 +112,8 @@ export function classifyTelegramError(error) {
 }
 
 export function isConnectionError(error) {
-  const msg = String(error?.message || error || '');
-  return /(AUTH_KEY|SESSION_REVOKED|USER_DEACTIVATED|not connected|disconnected|Connection closed|ECONNRESET|EPIPE|socket|timed?\s*out|timeout|network)/i.test(msg);
+  const pool = `${error?.errorMessage || ''} ${error?.code || ''} ${error?.message || error || ''}`;
+  // Bot callback timeouts & stale button IDs are NOT broken MTProto TCP connections!
+  if (BOT_UI_RE.test(pool)) return false;
+  return /(AUTH_KEY|SESSION_REVOKED|USER_DEACTIVATED|CONNECTION_NOT_INITED|not connected|disconnected|Connection closed|ECONNRESET|EPIPE|socket|timed?\s*out|timeout|network)/i.test(pool);
 }

@@ -175,13 +175,51 @@ export class ToingClient {
   async checkMobile(mobile, { shouldAbort = null } = {}) {
     const res = await this._postJson('/api/auth/check_mobile', { mobile }, {
       timeoutMs: this.timeouts.checkMobileMs,
-      retries: 0,
+      retries: 1,
       shouldAbort,
     });
-    if (res.ok && res.data && typeof res.data.registered === 'boolean') {
-      return { ok: true, isNew: !res.data.registered, key: res.key };
+    if (res.aborted) return { ok: false, aborted: true, registered: null, isNew: false, key: '' };
+
+    const d = res.data && typeof res.data === 'object' ? res.data : {};
+    const msgText = String(d.message || d.error || d.detail || d.status || d.raw || '').trim();
+    const alreadyRe = /(already\s*registered|mobile\s+number\s+is\s+already\s+registered|user\s+already\s+exists)/i;
+
+    if (res.ok) {
+      let registered = null;
+      if (typeof d.registered === 'boolean') registered = d.registered;
+      else if (typeof d.is_registered === 'boolean') registered = d.is_registered;
+      else if (typeof d.already_registered === 'boolean') registered = d.already_registered;
+      else if (typeof d.exists === 'boolean') registered = d.exists;
+      else if (typeof d.is_new === 'boolean') registered = !d.is_new;
+      else if (alreadyRe.test(msgText)) registered = true;
+
+      if (typeof registered === 'boolean') {
+        return {
+          ok: true,
+          registered,
+          isNew: !registered,
+          key: res.key || '',
+          message: msgText.slice(0, 160),
+        };
+      }
+    } else if (alreadyRe.test(msgText) || res.status === 409) {
+      return {
+        ok: true,
+        registered: true,
+        isNew: false,
+        key: res.key || '',
+        message: msgText.slice(0, 160) || `HTTP ${res.status} already registered`,
+      };
     }
-    return { ok: false, isNew: false, key: res.key || '', error: res.error || '' };
+
+    return {
+      ok: false,
+      registered: null,
+      isNew: false,
+      status: res.status || 0,
+      key: res.key || '',
+      error: (msgText || res.error || `HTTP ${res.status || 0} invalid check_mobile response`).slice(0, 180),
+    };
   }
 
   async sendOtp(mobile, { shouldAbort = null, preferredKey = '' } = {}) {
@@ -203,10 +241,13 @@ export class ToingClient {
         mobile,
       };
     }
+    const reason = String(d.error || d.detail || d.message || res.error || 'Toing send_otp failed').slice(0, 180);
+    const alreadyRegistered = /(already\s*registered|mobile\s+number\s+is\s+already\s+registered)/i.test(reason);
     return {
       ok: false,
       status: res.status,
-      reason: String(d.error || d.detail || d.message || res.error || 'Toing send_otp failed').slice(0, 180),
+      alreadyRegistered,
+      reason,
     };
   }
 
