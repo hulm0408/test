@@ -1,0 +1,19 @@
+{
+  "name": "toing-railway-50slot",
+  "version": "1.0.0",
+  "description": "Standalone high-throughput Toing Pro signup engine with up to 50 parallel independent Telegram OTP slots, SQLite WAL persistence, and guaranteed .json delivery",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "start": "node --no-warnings=ExperimentalWarning src/index.js",
+    "test": "node --no-warnings=ExperimentalWarning --test test/toing-railway.test.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "telegraf": "^4.16.3",
+    "teleproto": "^1.232.1"
+  }
+}
