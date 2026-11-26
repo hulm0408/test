@@ -139,6 +139,9 @@ export class TelegramSlotClient {
     if (this.inputEntity && !msg._inputChat) {
       try { msg._inputChat = this.inputEntity; } catch {}
     }
+    if (this.inputEntity && !msg._inputSender) {
+      try { msg._inputSender = this.inputEntity; } catch {}
+    }
     if (this.client && !msg._client) {
       try { msg._client = this.client; } catch {}
     }
@@ -841,13 +844,13 @@ export class TelegramSlotClient {
 
   async waitForOtp(phone, {
     baseline = null,
-    timeoutMs = 26_000,
+    timeoutMs = 30_000,
     refreshMs = 2_200,
     shouldAbort = null,
   } = {}) {
     return this._withSlotLock(async () => {
       const cleanPhone = normalizePhone10(phone);
-      const totalMs = Math.max(4_000, Number(timeoutMs) || 26_000);
+      const totalMs = Math.max(4_000, Number(timeoutMs) || 30_000);
       const baseRefreshMs = Math.max(900, Number(refreshMs) || 2_200);
       const acceptAnyAfterMs = Math.min(10_000, Math.floor(totalMs * 0.55));
       const startedAt = Date.now();
@@ -868,7 +871,7 @@ export class TelegramSlotClient {
       let lastEpoch = this._pushEpoch;
       let attempts = 0;
       let lastError = null;
-      const fallbackFetchGapMs = this._pushActive ? 4_500 : 700;
+      const fallbackFetchGapMs = this._pushActive ? 6_000 : 700;
 
       while (Date.now() < deadline) {
         if (shouldAbort?.()) return { ok: false, aborted: true, code: '' };

@@ -491,22 +491,26 @@ export class ToingDb {
 
   // ── Atomic Phone Claim Guard (cross-slot deduplication) ────────────────────
   // Guarantees TWO slots out of 50 can NEVER process the same mobile number
-  // simultaneously, and no number inside its 30-day cooldown is ever reused.
-  tryClaimPhone(rawPhone, slotId, { ttlMs = 120_000, now = Date.now() } = {}) {
+  // simultaneously, and no number inside its cooldown is ever reused.
+  tryClaimPhone(rawPhone, slotId, { ttlMs = 120_000, now = Date.now(), ignoreAlreadyRegistered = false } = {}) {
     const phone = normalizePhone10(rawPhone);
     if (!phone) return { ok: false, reason: 'invalid_phone' };
 
     return this.withTransaction(() => {
-      // 1. Check 30-day used_numbers cooldown
+      // 1. Check used_numbers cooldown
       const used = this.db.prepare('SELECT cooldown_until, status FROM used_numbers WHERE phone = ?').get(phone);
       if (used && Number(used.cooldown_until) > now) {
-        return {
-          ok: false,
-          reason: 'cooldown',
-          phone,
-          untilMs: Number(used.cooldown_until),
-          status: used.status,
-        };
+        const allowBypass = Boolean(ignoreAlreadyRegistered) && used.status === 'already_registered';
+        if (!allowBypass) {
+          return {
+            ok: false,
+            reason: 'cooldown',
+            phone,
+            untilMs: Number(used.cooldown_until),
+            remainingMs: Math.max(0, Number(used.cooldown_until) - now),
+            status: used.status,
+          };
+        }
       }
 
       // 2. Clean expired claim for this phone if any
@@ -630,6 +634,50 @@ export class ToingDb {
     });
 
     return { ok: true, phone, status, cooldownUntil };
+  }
+
+  getCooldownBreakdown(now = Date.now()) {
+    const rows = this.db.prepare(`
+      SELECT status, COUNT(*) AS cnt
+      FROM used_numbers
+      WHERE cooldown_until > ?
+      GROUP BY status
+    `).all(now);
+
+    const out = {
+      extracted: 0,
+      already_registered: 0,
+      seed: 0,
+      otp_timeout_cool: 0,
+      send_otp_blocked: 0,
+      other: 0,
+      total: 0,
+    };
+    for (const r of rows) {
+      const k = String(r.status || 'other');
+      const n = Number(r.cnt || 0);
+      out.total += n;
+      if (Object.prototype.hasOwnProperty.call(out, k)) {
+        out[k] += n;
+      } else {
+        out.other += n;
+      }
+    }
+    return out;
+  }
+
+  clearCooldownsByStatus(statuses = []) {
+    if (statuses === 'all' || (Array.isArray(statuses) && statuses.includes('all'))) {
+      const res = this.db.prepare('DELETE FROM used_numbers').run();
+      return Number(res.changes || 0);
+    }
+    const list = (Array.isArray(statuses) ? statuses : [statuses])
+      .map((s) => String(s || '').trim())
+      .filter(Boolean);
+    if (!list.length) return 0;
+    const placeholders = list.map(() => '?').join(', ');
+    const res = this.db.prepare(`DELETE FROM used_numbers WHERE status IN (${placeholders})`).run(...list);
+    return Number(res.changes || 0);
   }
 
   // ── Atomic Signup Commit (session + cooldown + delivery_queue + metrics) ───

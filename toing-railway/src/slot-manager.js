@@ -206,6 +206,18 @@ export class SlotManager {
     return res;
   }
 
+  clearAllLocalExcludes() {
+    for (const worker of this.workers.values()) {
+      worker.clearLocalExcludes?.();
+    }
+  }
+
+  wakeCooldownSlots() {
+    for (const worker of this.workers.values()) {
+      worker.wakeFromCooldown?.();
+    }
+  }
+
   async removeSlot(accountId) {
     await this.stopSlot(accountId, { disable: false });
     return this.db.deleteAccount(accountId);
