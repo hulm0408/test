@@ -68,10 +68,11 @@ export function loadConfig(env = process.env) {
     toingHttpConcurrency: envInt(env, 'TOING_HTTP_CONCURRENCY', 20, 1, 100),
 
     defaultOtpBot: String(env.DEFAULT_OTP_BOT || 'hathi').trim().toLowerCase(),
-    otpTimeoutMs: envInt(env, 'OTP_TIMEOUT_MS', 20_000, 5_000, 120_000),
-    otpRefreshMs: envInt(env, 'OTP_REFRESH_MS', 1_800, 800, 10_000),
+    otpTimeoutMs: envInt(env, 'OTP_TIMEOUT_MS', 26_000, 5_000, 120_000),
+    otpRefreshMs: envInt(env, 'OTP_REFRESH_MS', 2_200, 800, 10_000),
     claimTimeoutMs: envInt(env, 'CLAIM_TIMEOUT_MS', 16_000, 4_000, 60_000),
     autoFailoverBots: envBool(env, 'AUTO_FAILOVER_BOTS', false),
+    poolRotateThreshold: envInt(env, 'POOL_ROTATE_THRESHOLD', 12, 3, 100),
     skipRegistered: envBool(env, 'SKIP_REGISTERED', true),
     otpTimeoutCooldownMin: envInt(env, 'OTP_TIMEOUT_COOLDOWN_MIN', 10, 0, 1440),
 

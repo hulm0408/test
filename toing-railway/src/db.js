@@ -435,6 +435,28 @@ export class ToingDb {
     return { profile: clean, updated: Number(res.changes || 0) };
   }
 
+  spreadAccountsAcrossBots(profileIds = ['hathi', 'hermes', 'chauhan']) {
+    const bots = (Array.isArray(profileIds) && profileIds.length ? profileIds : ['hathi', 'hermes', 'chauhan'])
+      .map((p) => normalizeOtpBotProfileId(p));
+    const uniqueBots = [...new Set(bots)];
+    const rows = this.db.prepare('SELECT id, slot_no FROM tg_accounts ORDER BY slot_no ASC, id ASC').all();
+    const now = Date.now();
+    const distribution = {};
+    const assignments = [];
+    for (const b of uniqueBots) distribution[b] = 0;
+
+    this.withTransaction(() => {
+      const upd = this.db.prepare('UPDATE tg_accounts SET otp_bot_profile = ?, updated_at = ? WHERE id = ?');
+      rows.forEach((row, idx) => {
+        const bot = uniqueBots[idx % uniqueBots.length];
+        upd.run(bot, now, Number(row.id));
+        distribution[bot] = (distribution[bot] || 0) + 1;
+        assignments.push({ id: Number(row.id), slotNo: Number(row.slot_no), profile: bot });
+      });
+    });
+    return { updated: assignments.length, distribution, assignments };
+  }
+
   resetAllAccountHealth() {
     const res = this.db.prepare(`
       UPDATE tg_accounts
@@ -540,6 +562,22 @@ export class ToingDb {
   clearAllActiveClaims() {
     const res = this.db.prepare('DELETE FROM active_claims').run();
     return Number(res.changes || 0);
+  }
+
+  getUsedNumber(rawPhone) {
+    const phone = normalizePhone10(rawPhone);
+    if (!phone) return null;
+    const row = this.db.prepare('SELECT phone, status, account_key, slot_id, extracted_at, cooldown_until, source FROM used_numbers WHERE phone = ?').get(phone);
+    if (!row) return null;
+    return {
+      phone: row.phone,
+      status: row.status || '',
+      accountKey: row.account_key || '',
+      slotId: Number(row.slot_id || 0),
+      extractedAt: Number(row.extracted_at || 0),
+      cooldownUntil: Number(row.cooldown_until || 0),
+      source: row.source || '',
+    };
   }
 
   isPhoneBlocked(rawPhone, now = Date.now()) {

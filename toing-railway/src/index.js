@@ -54,6 +54,7 @@ async function main() {
       otpTimeoutMs: Number(s.otpTimeoutMs) || baseConfig.otpTimeoutMs,
       otpRefreshMs: Number(s.otpRefreshMs) || baseConfig.otpRefreshMs,
       autoFailoverBots: s.autoFailoverBots !== undefined ? Boolean(s.autoFailoverBots) : baseConfig.autoFailoverBots,
+      poolRotateThreshold: Number(s.poolRotateThreshold) || baseConfig.poolRotateThreshold,
       skipRegistered: s.skipRegistered !== undefined ? Boolean(s.skipRegistered) : baseConfig.skipRegistered,
       otpTimeoutCooldownMin: s.otpTimeoutCooldownMin !== undefined ? Number(s.otpTimeoutCooldownMin) : baseConfig.otpTimeoutCooldownMin,
       deliveryChatId: String(s.deliveryChatId || baseConfig.deliveryChatId || baseConfig.primaryOwnerId || ''),

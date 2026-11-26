@@ -14,12 +14,12 @@ import {
 } from '../src/otp-parser.js';
 import { selectOtpBotScreenAction, otpBotButtonRole } from '../src/otp-profiles.js';
 import { classifyTelegramError, isConnectionError } from '../src/telegram-health.js';
-import { ToingClient } from '../src/toing-client.js';
+import { ToingClient, sanitizeErrorText, parseSendOtpCooldownMs } from '../src/toing-client.js';
 import { SlotWorker } from '../src/slot-worker.js';
 import { SlotManager } from '../src/slot-manager.js';
 import { DeliveryWorker } from '../src/delivery-worker.js';
 import { startHealthServer } from '../src/health-server.js';
-import { formatCodeDeliverySummary, qrLoginUrlFromToken } from '../src/telegram-slot-client.js';
+import { TelegramSlotClient, formatCodeDeliverySummary, qrLoginUrlFromToken } from '../src/telegram-slot-client.js';
 import QRCode from 'qrcode';
 
 function makeTmpDir(prefix = 'toing-rail-test-') {
@@ -833,4 +833,369 @@ test('BOT_RESPONSE_TIMEOUT is non-fatal bot-ui (never a connection error) & FLOO
   assert.equal(isConnectionError(new Error('ECONNRESET: socket hang up')), true);
   assert.equal(isConnectionError(new Error('TIMEOUT: MTProto connect timed out (20s)')), true);
   assert.equal(isConnectionError(new Error('FLOOD_WAIT_30')), false, 'FLOOD_WAIT is rate-limit, NOT a dead TCP socket');
+});
+
+// ---------------------------------------------------------------------------
+// 11. Short FLOOD_WAIT Proportional Cooldown, HTML Error Sanitizer & check_mobile Retry
+// ---------------------------------------------------------------------------
+test('Short FLOOD_WAIT scales proportionally, HTML 502 is sanitized & transient check_mobile retries once', async () => {
+  // Proportional FLOOD_WAIT cooldowns (NO artificial 30s penalty on FLOOD_WAIT_3!)
+  const fw3 = classifyTelegramError(new Error('420: FLOOD_WAIT_3 (caused by messages.GetHistory)'));
+  assert.equal(fw3.kind, 'flood');
+  assert.equal(fw3.seconds, 3);
+  assert.equal(fw3.cooldownMs, 5_000);
+
+  const fw10 = classifyTelegramError(new Error('420: FLOOD_WAIT_10'));
+  assert.equal(fw10.cooldownMs, 12_000);
+
+  const fw45 = classifyTelegramError(new Error('420: FLOOD_WAIT_45'));
+  assert.equal(fw45.cooldownMs, 47_000);
+
+  // HTML error sanitization (nginx 502 page -> clean 1-line title)
+  const html502 = `<html>\n<head><title>502 Bad Gateway</title></head>\n<body><center><h1>502 Bad Gateway</h1></center><hr><center>nginx</center></body>\n</html>`;
+  assert.equal(sanitizeErrorText(html502), '502 Bad Gateway');
+
+  // Swiggy send_otp block duration parser
+  assert.equal(parseSendOtpCooldownMs('Number of login attempts exceeded. Please retry after 2 hours.'), 2 * 60 * 60_000);
+  assert.equal(parseSendOtpCooldownMs('Swiggy is blocking OTPs for this number right now. Try again in 5 min.'), 10 * 60_000);
+  assert.equal(parseSendOtpCooldownMs('Swiggy is blocking OTPs for this number right now. Try again in 25 min.'), 25 * 60_000);
+  assert.equal(parseSendOtpCooldownMs('Too many attempts, temporarily blocked'), 30 * 60_000);
+  assert.equal(parseSendOtpCooldownMs('Network connection reset'), 0);
+
+  // checkMobile automatically retries once on HTTP 200 upstream "Expecting value: line 1 column 1"
+  let checkCalls = 0;
+  const toing = new ToingClient({
+    getBaseUrl: () => 'https://storelex.store/toing_web',
+    getAccessKeys: () => ['K1'],
+    fetchImpl: async () => {
+      checkCalls += 1;
+      if (checkCalls === 1) {
+        return new Response(JSON.stringify({ error: 'Expecting value: line 1 column 1 (char 0)' }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ registered: false }), { status: 200 });
+    },
+  });
+  const res = await toing.checkMobile('9876543210');
+  assert.equal(res.ok, true);
+  assert.equal(res.registered, false);
+  assert.equal(res.isNew, true);
+  assert.equal(checkCalls, 2);
+});
+
+// ---------------------------------------------------------------------------
+// 12. Swiggy send_otp_blocked Persists Cooldown So Other Slots Never Retry It
+// ---------------------------------------------------------------------------
+test('Swiggy send_otp_blocked saves cooldown to used_numbers so a second slot skips immediately', async () => {
+  const dir = makeTmpDir();
+  try {
+    const db = new ToingDb({
+      dbPath: path.join(dir, 'toing.db'),
+      dataDir: dir,
+      encryptionKey: 'swiggy-block-key',
+      sessionsDir: path.join(dir, 'sessions'),
+    });
+
+    const a1 = db.addAccount({ session: '1BVtsBLOCK_TEST_SLOT_1_AAAAAAAAAAAAAAAAAAAA', label: 'S1', otpBotProfile: 'hathi' });
+    const a2 = db.addAccount({ session: '1BVtsBLOCK_TEST_SLOT_2_BBBBBBBBBBBBBBBBBBBB', label: 'S2', otpBotProfile: 'hathi' });
+    const acc1 = db.getAccountById(a1.id, { includeSession: true });
+    const acc2 = db.getAccountById(a2.id, { includeSession: true });
+
+    const sendOtpLog = [];
+    const toingClient = new ToingClient({
+      getBaseUrl: () => 'https://storelex.store/toing_web',
+      getAccessKeys: () => ['KEY1'],
+      fetchImpl: async (url, opts) => {
+        const body = opts?.body ? JSON.parse(opts.body) : {};
+        if (url.endsWith('/api/auth/check_mobile')) {
+          return new Response(JSON.stringify({ registered: false }), { status: 200 });
+        }
+        if (url.endsWith('/api/auth/send_otp')) {
+          sendOtpLog.push(body.mobile);
+          return new Response(JSON.stringify({
+            error: 'Number of login attempts exceeded. Please retry after 2 hours.',
+          }), { status: 400 });
+        }
+        return new Response('{}', { status: 404 });
+      },
+    });
+
+    const runtimeCfg = () => ({
+      telegramApiId: 123,
+      telegramApiHash: 'abc',
+      claimTimeoutMs: 5_000,
+      claimLockTtlMs: 30_000,
+      otpTimeoutMs: 5_000,
+      otpRefreshMs: 1_000,
+      skipRegistered: true,
+      usedCooldownDays: 30,
+      autoFailoverBots: false,
+      deliveryChatId: '1',
+      primaryOwnerId: '1',
+    });
+
+    const makeMockClient = (phones) => {
+      let i = 0;
+      return {
+        connected: true,
+        async connect() { return { ok: true, me: 'mock' }; },
+        async disconnect() {},
+        setBotProfile() {},
+        async claimFreshNumber() {
+          const p = phones[i++];
+          return p ? { ok: true, phone: p, card: { phone: p } } : { ok: false, reason: 'empty' };
+        },
+        async captureOtpWatermark() { return { ids: [], codes: [], ts: Date.now() }; },
+        async waitForOtp() { return { ok: false, timeout: true }; },
+      };
+    };
+
+    const w1 = new SlotWorker({
+      account: acc1,
+      db,
+      toingClient,
+      getRuntimeConfig: runtimeCfg,
+      clientFactory: () => makeMockClient(['9411551427']),
+    });
+    await w1._runSingleCycle();
+
+    assert.deepEqual(sendOtpLog, ['9411551427']);
+    assert.equal(db.isPhoneBlocked('9411551427'), true, 'Swiggy-blocked phone must enter cooldown in used_numbers');
+    const usedRow = db.getUsedNumber('9411551427');
+    assert.equal(usedRow?.status, 'send_otp_blocked');
+    assert.ok(usedRow.cooldownUntil - Date.now() > 110 * 60_000, 'Cooldown must reflect ~2 hour retry window');
+
+    // Slot #2 gets the exact same phone -> must skip via used_cooldown with ZERO send_otp calls!
+    const w2 = new SlotWorker({
+      account: acc2,
+      db,
+      toingClient,
+      getRuntimeConfig: runtimeCfg,
+      clientFactory: () => makeMockClient(['9411551427']),
+    });
+    await w2._runSingleCycle();
+
+    assert.deepEqual(sendOtpLog, ['9411551427'], 'Slot #2 must NEVER retry a Swiggy-blocked phone!');
+    const events = db.getRecentNumberEvents(10);
+    assert.ok(events.some((e) => e.phone === '9411551427' && e.reason === 'send_otp_blocked'));
+    assert.ok(events.some((e) => e.phone === '9411551427' && e.reason === 'used_cooldown' && Number(e.slot_no) === 2));
+
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 13. Pool-Exhaustion Auto-Rotation & Spread Across All 3 OTP Bots
+// ---------------------------------------------------------------------------
+test('Pool-exhaustion auto-rotation switches bots after threshold & spreadSlotsAcrossBots balances all 3 bots', async () => {
+  const dir = makeTmpDir();
+  try {
+    const db = new ToingDb({
+      dbPath: path.join(dir, 'toing.db'),
+      dataDir: dir,
+      encryptionKey: 'spread-rotate-key',
+      sessionsDir: path.join(dir, 'sessions'),
+    });
+
+    for (let i = 1; i <= 6; i++) {
+      db.addAccount({
+        session: `1BVtsSPREAD_TEST_SESSION_00000000000000000_${i}`,
+        label: `Slot-${i}`,
+        otpBotProfile: 'hathi',
+      });
+    }
+
+    const toingClient = new ToingClient({
+      getBaseUrl: () => 'https://storelex.store/toing_web',
+      getAccessKeys: () => ['K1'],
+      fetchImpl: async () => new Response(JSON.stringify({ registered: true }), { status: 200 }),
+    });
+
+    const mgr = new SlotManager({
+      db,
+      toingClient,
+      getRuntimeConfig: () => ({ maxSlots: 50 }),
+    });
+
+    const spread = mgr.spreadSlotsAcrossBots();
+    assert.equal(spread.updated, 6);
+    assert.deepEqual(spread.distribution, { hathi: 2, hermes: 2, chauhan: 2 });
+
+    // Now test pool-exhaustion auto-rotation on Slot #1 (starts on hathi -> rotates to hermes after 3 consecutive skips)
+    db.markNumberUsed('9000000001', { status: 'seed', cooldownDays: 30 });
+    db.markNumberUsed('9000000002', { status: 'seed', cooldownDays: 30 });
+    db.markNumberUsed('9000000003', { status: 'seed', cooldownDays: 30 });
+
+    const acc1 = db.getAccountBySlotNo(1, { includeSession: true });
+    assert.equal(acc1.otpBotProfile, 'hathi');
+
+    const switchedProfiles = [];
+    const queue = ['9000000001', '9000000002', '9000000003'];
+    let idx = 0;
+
+    const worker = new SlotWorker({
+      account: acc1,
+      db,
+      toingClient,
+      getRuntimeConfig: () => ({
+        telegramApiId: 123,
+        telegramApiHash: 'abc',
+        claimTimeoutMs: 5_000,
+        claimLockTtlMs: 30_000,
+        autoFailoverBots: true,
+        poolRotateThreshold: 3,
+        skipRegistered: true,
+        usedCooldownDays: 30,
+      }),
+      clientFactory: () => ({
+        connected: true,
+        async connect() { return { ok: true, me: 'mock' }; },
+        async disconnect() {},
+        setBotProfile(pid) { switchedProfiles.push(pid); },
+        async claimFreshNumber() {
+          const p = queue[idx++];
+          return p ? { ok: true, phone: p, card: { phone: p } } : { ok: false, reason: 'empty' };
+        },
+        async captureOtpWatermark() { return { ids: [], codes: [], ts: Date.now() }; },
+        async waitForOtp() { return { ok: false, timeout: true }; },
+      }),
+    });
+
+    await worker._runSingleCycle();
+    assert.equal(worker.otpBotProfile, 'hermes', 'Worker must rotate from hathi -> hermes after 3 consecutive pool skips');
+    assert.deepEqual(switchedProfiles, ['hermes']);
+    assert.equal(db.getAccountBySlotNo(1).otpBotProfile, 'hermes');
+
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 14. Push-Driven TelegramSlotClient Eliminates Polling messages.GetHistory RPCs
+// ---------------------------------------------------------------------------
+test('Push-driven TelegramSlotClient claims fresh cards and catches OTP edits with zero polling GetHistory calls', async () => {
+  const slotClient = new TelegramSlotClient({
+    slotId: 1,
+    slotNo: 1,
+    label: 'PushSlot',
+    session: '1BVtsMOCK_PUSH_SESSION_12345678901234567890',
+    apiId: 12345,
+    apiHash: 'hash123',
+    otpBotProfile: 'hathi',
+  });
+
+  const botId = '777000111';
+  const handlers = [];
+  let getMessagesCalls = 0;
+  let newNumberClicks = 0;
+  let refreshClicks = 0;
+
+  const makeCardMessage = ({ id, phone, editDate = 0, otpText = '' }) => ({
+    id,
+    out: false,
+    date: Math.floor(Date.now() / 1000),
+    editDate,
+    peerId: { userId: botId },
+    chatId: botId,
+    message: otpText
+      ? `📱 Number: +91 ${phone}\n\n💬 SMS from SWIGGY: Your Toing OTP is ${otpText}`
+      : `📱 Number: +91 ${phone}\n🇮🇳 India — Waiting for SMS...`,
+    buttons: [[
+      {
+        text: '🔄 REFRESH',
+        async click() {
+          refreshClicks += 1;
+          return { message: 'Refreshed' };
+        },
+      },
+      {
+        text: '📞 NEW NUMBER',
+        async click() {
+          newNumberClicks += 1;
+          // Simulate real @Hathi_otp_bot editing the card 40ms later via Telegram MTProto push!
+          setTimeout(() => {
+            const edited = makeCardMessage({
+              id: 101,
+              phone: '9888777666',
+              editDate: Math.floor(Date.now() / 1000) + 1,
+            });
+            for (const h of handlers) h({ message: edited });
+          }, 40);
+          return { message: 'New number assigned' };
+        },
+      },
+    ]],
+  });
+
+  const mockMtClient = {
+    connected: true,
+    disconnected: false,
+    _destroyed: false,
+    addEventHandler(fn) {
+      handlers.push(fn);
+    },
+    async getEntity() {
+      return { id: botId, username: 'Hathi_otp_bot' };
+    },
+    async getInputEntity(e) {
+      return e;
+    },
+    async getMessages() {
+      getMessagesCalls += 1;
+      return [makeCardMessage({ id: 101, phone: '9111222333', editDate: Math.floor(Date.now() / 1000) - 5 })];
+    },
+    async sendMessage() {},
+    async disconnect() {},
+  };
+
+  // Wire mock client directly & enable push handlers
+  slotClient.client = mockMtClient;
+  slotClient.connected = true;
+  slotClient.entity = { id: botId, username: 'Hathi_otp_bot' };
+  slotClient.inputEntity = slotClient.entity;
+  slotClient.entityUsername = 'Hathi_otp_bot';
+  slotClient._attachPushHandlers(mockMtClient, {
+    NewMessage: class MockNewMessage {},
+    EditedMessage: class MockEditedMessage {},
+  });
+  assert.equal(slotClient._pushActive, true);
+
+  // 1. Seed initial cache with 1 fetch, then claim a NEW number (forceNew=true) -> must catch push with 0 extra GetHistory!
+  const claim = await slotClient.claimFreshNumber({
+    forceNew: true,
+    excludePhones: new Set(['9111222333']),
+    timeoutMs: 5_000,
+  });
+  assert.equal(claim.ok, true);
+  assert.equal(claim.phone, '9888777666');
+  assert.equal(newNumberClicks, 1);
+  assert.equal(getMessagesCalls, 1, 'Initial bootstrap fetch ONLY — zero GetHistory polling after clicking NEW NUMBER!');
+
+  // 2. Capture watermark from warm push cache -> 0 GetHistory RPCs!
+  const wm = await slotClient.captureOtpWatermark('9888777666');
+  assert.equal(getMessagesCalls, 1, 'captureOtpWatermark must read warm push cache with 0 GetHistory RPCs!');
+
+  // 3. Wait for OTP -> bot pushes edited card with OTP 60ms later -> caught instantly with 0 GetHistory RPCs!
+  setTimeout(() => {
+    const otpEdit = makeCardMessage({
+      id: 101,
+      phone: '9888777666',
+      editDate: Math.floor(Date.now() / 1000) + 5,
+      otpText: '482913',
+    });
+    for (const h of handlers) h({ message: otpEdit });
+  }, 60);
+
+  const otpRes = await slotClient.waitForOtp('9888777666', {
+    baseline: wm,
+    timeoutMs: 5_000,
+    refreshMs: 2_000,
+  });
+  assert.equal(otpRes.ok, true);
+  assert.equal(otpRes.code, '482913');
+  assert.equal(getMessagesCalls, 1, 'waitForOtp must catch pushed OTP with ZERO polling GetHistory RPCs!');
+  assert.ok(otpRes.elapsedMs < 1_000, `Expected instant push delivery (<1s), got ${otpRes.elapsedMs}ms`);
 });

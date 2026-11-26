@@ -197,6 +197,15 @@ export class SlotManager {
     return res;
   }
 
+  spreadSlotsAcrossBots(profileIds = ['hathi', 'hermes', 'chauhan']) {
+    const res = this.db.spreadAccountsAcrossBots(profileIds);
+    for (const item of res.assignments) {
+      const worker = this.workers.get(item.id);
+      if (worker) worker.setOtpBotProfile(item.profile);
+    }
+    return res;
+  }
+
   async removeSlot(accountId) {
     await this.stopSlot(accountId, { disable: false });
     return this.db.deleteAccount(accountId);
