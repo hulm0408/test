@@ -8,7 +8,7 @@
 //   PREMIUM_BATCH_TARGET            — kitne fresh sessions (default 100)
 //   PREMIUM_BATCH_CONCURRENCY       — ek saath kitne numbers/IP lanes (default 10, max 10)
 //   PREMIUM_BATCH_MAX_MINUTES       — max run time (default 120)
-//   PREMIUM_BATCH_GAP_MS            — do numbers ke beech gap (default 6000)
+//   PREMIUM_BATCH_GAP_MS            — do numbers ke beech gap (default 0)
 //   PREMIUM_RATE_LIMIT_BACKOFF_MS   — Swiggy rate-limit par ruk (default 15 min)
 //   PREMIUM_ALLOW_OFFLINE_DEVICES   — '1' = offline devices bhi try karo
 //   PREMIUM_OTP_WAIT_MS             — poll shuru karne se pehle wait (default 3000)
@@ -1268,7 +1268,7 @@ export async function startAutopilot(opts = {}) {
   const maxMinutes = Number(opts.maxMinutes || s('maxMinutes', envInt('PREMIUM_BATCH_MAX_MINUTES', 120)));
   const gapMs = Number.isFinite(Number(opts.gapMs)) && Number(opts.gapMs) >= 0
     ? Number(opts.gapMs)
-    : s('gapMs', envInt('PREMIUM_BATCH_GAP_MS', 6_000));
+    : s('gapMs', envInt('PREMIUM_BATCH_GAP_MS', 0));
   const backoffMs = s('backoffMs', envInt('PREMIUM_RATE_LIMIT_BACKOFF_MS', 15 * 60_000));
   // 🔁 Never-stop: default ON. Owner ka rule — batch sirf target/manual STOP
   // par rukta hai; baaki har rukawat auto-recovery checkpoint hai.
@@ -1347,7 +1347,7 @@ export async function startAutopilot(opts = {}) {
   // clients me ONLINE device process hoga. 0 = purana unbounded scan.
   const deviceScanBudgetMs = envInt('PREMIUM_DEVICE_SCAN_BUDGET_MS', 12_000);
   const otpCfg = {
-    waitMs: s('otpWaitMs', envInt('PREMIUM_OTP_WAIT_MS', 3_000)),
+    waitMs: s('otpWaitMs', envInt('PREMIUM_OTP_WAIT_MS', 10_000)),
     timeoutMs: s('otpTimeoutMs', envInt('PREMIUM_OTP_TIMEOUT_MS', 90_000)),
     pollMs: 1_500,
     acceptAnyAfterMs: 15_000,

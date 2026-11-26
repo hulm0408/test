@@ -35,6 +35,7 @@ process.env.FIREBASE_DB_URL ||= 'https://vuvhbjbi-default-rtdb.firebaseio.com/';
 const { Telegraf } = await import('telegraf');
 const {
   isBoss,
+  addBoss,
   hydrateAccountsFromCloudVault,
   hydrateFromLinkedDb,
   getDbLinkStatus,
@@ -250,12 +251,12 @@ function isOwner(userId) {
 }
 
 // ---------------------------------------------------------------------------
-// ✅ Approved users — owner ka rule (2026-11-17):
-//   "Mera dusra account se bot start karu to wo bhi feature access kar paye."
+// ✅ Approved users — owner ka rule: approve hone par user OWNER ban jata hai.
 //   Naya user /start dabayega → "Ask admin for approval" card → owner ke paas
-//   Approve ✅ / Deny ❌ buttons → approve hone par user ID vault me save hoti
-//   hai aur wo poora bot (Zepto Pro samet, wahi fixed key ke saath) use kar
-//   sakta hai. Owner kabhi bhi list se hata sakta hai.
+//   Approve ✅ / Deny ❌ buttons → approve hone par user ID bossIds me save hoti
+//   hai → user pura owner ban jata hai (koi filter nahi, sab features accessible,
+//   dusre users ke liye bhi approve/deny kar sakta hai). Owner kabhi bhi list se
+//   hata sakta hai.
 // ---------------------------------------------------------------------------
 function approvedUserIds() {
   const db = getDb();
@@ -267,6 +268,10 @@ function isApprovedUser(userId) {
 }
 function grantApprovedUser(userId) {
   const uid = String(userId);
+  // Approve → user OWNER ban jaye — bossIds me daal do taaki pura access ho
+  // (koi filter nahi, dusre users approve bhi kar sakta hai).
+  try { addBoss(Number(uid)); } catch {}
+  // Purani approvedUserIds list me bhi rakh do (backward compat / revoke ke liye)
   const list = approvedUserIds();
   if (!list.map(String).includes(uid)) {
     list.push(uid);
@@ -279,6 +284,13 @@ function grantApprovedUser(userId) {
 function revokeApprovedUser(userId) {
   const db = getDb();
   const uid = String(userId);
+  // Owner status wapas le — bossIds se hatao
+  if (Array.isArray(db.config.bossIds)) {
+    const numId = Number(uid);
+    const bidx = db.config.bossIds.map(Number).indexOf(numId);
+    if (bidx >= 0) db.config.bossIds.splice(bidx, 1);
+  }
+  // Purani approvedUserIds list se bhi hatao
   const list = approvedUserIds();
   const idx = list.map(String).indexOf(uid);
   if (idx >= 0) {
@@ -2912,7 +2924,20 @@ async function runTelegramLoginFlow(flow) {
       phoneNumber: async () => {
         // 👤 Owner ka rule: pre-selected spare number hamesha ready rahe;
         // "Change Number" dabane par hi apna number poochha jayega.
-        const defPhone = String(telegramOtp.DEFAULT_TELEGRAM_LOGIN_PHONE || '').trim();
+        // START se jo number chal raha hai usi number se bhi login ho sake.
+        let defPhone = String(telegramOtp.DEFAULT_TELEGRAM_LOGIN_PHONE || '').trim();
+        if (!defPhone) {
+          // START batch chal raha hai to uska current number pre-select karo —
+          // same number se Telegram spare account login turant ho sake.
+          try {
+            const snap = getAutopilotSnapshot();
+            const activePhone = snap?.activeNumbers?.[0]?.phone
+              || snap?.current?.phone
+              || snap?.telegramCurrentPhone
+              || '';
+            if (activePhone) defPhone = String(activePhone).trim();
+          } catch {}
+        }
         if (defPhone) {
           const choice = await waitForTelegramLoginInput(flow, 'phone_choice', section('📱 Telegram Login Number', [
             field('Pre-selected', maskTelegramLoginPhone(defPhone)),
