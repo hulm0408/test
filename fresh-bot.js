@@ -242,9 +242,12 @@ function ownerIds() {
 }
 
 function isOwner(userId) {
-  const ids = ownerIds();
   const uid = String(userId);
-  if (ids) return ids.has(uid);
+  // Env OWNER_IDS set ho to usme bhi check karo
+  const ids = ownerIds();
+  if (ids && ids.has(uid)) return true;
+  // DB bossIds me bhi check karo — approve karke bossIds me daala jata hai,
+  // env set hone par bhi owner banne ke liye dono path chalna chahiye.
   try { if (isBoss(Number(userId))) return true; } catch {}
   try { if (isBoss(uid)) return true; } catch {}
   return uid === '5393396812';
@@ -334,7 +337,7 @@ async function askAdminForApproval(ctx) {
     `🆔 ID: <code>${esc(uid)}</code>`,
     `🔗 Username: ${esc(uname)}`,
     '',
-    sub('Approve karne par ye user bot ke saare features (Zepto Pro signup samet) use kar payega. Access kabhi bhi wapas li ja sakti hai.'),
+    sub('Approve karne par ye user FULL OWNER ban jayega — sab features, dusre users approve/deny sab kar sakega. Access kabhi bhi wapas li ja sakti hai.'),
   ].join('\n'));
   const rows = [[
     { text: '✅ Approve', callback_data: `ap_appr_ok_${uid}`, style: 'success' },
@@ -1288,7 +1291,7 @@ bot.action(/^ap_appr_ok_(\d+)$/, async (ctx) => {
   approvalRequests.delete(uid);
   await ctx.answerCbQuery('✅ Approved!').catch(() => {});
   await ctx.editMessageText(section('🛂 ACCESS REQUEST — ✅ APPROVED', [
-    `User <code>${esc(uid)}</code> ab bot ke saare features use kar sakta hai.`,
+    `User <code>${esc(uid)}</code> ab FULL OWNER ban gaya hai — sab features + dusre users approve/deny.`,
     '',
     sub('Access wapas lene ho to /revoke ' + uid + ' bhejein.'),
   ].join('\n'))).catch(() => {});
@@ -1300,8 +1303,10 @@ bot.action(/^ap_appr_ok_(\d+)$/, async (ctx) => {
     [{ text: '▶️ START — 🍔 Swiggy / 🛒 Zepto Pro', callback_data: 'ap_start', style: 'success' }],
     [{ text: '📊 Status', callback_data: 'ap_status' }, { text: '⚙️ Settings', callback_data: 'ap_settings' }],
   ];
-  await bot.telegram.sendMessage(uid, section('✅ ACCESS APPROVED 🎉', [
-    'Admin ne aapki request approve kar di!',
+  await bot.telegram.sendMessage(uid, section('✅ OWNER ACCESS 🎉', [
+    'Admin ne aapko FULL OWNER bana diya hai!',
+    'Ab aap bot ke sab features use kar sakte ho — koi restriction nahi.',
+    'Aap dusre users ke access requests bhi approve/deny kar sakte ho.',
     '',
     tgReady
       ? '1️⃣ Neeche <b>▶️ START</b> dabao → 🍔 Swiggy ya 🛒 Zepto chuno'
