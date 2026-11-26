@@ -73,7 +73,7 @@ export function loadConfig(env = process.env) {
     claimTimeoutMs: envInt(env, 'CLAIM_TIMEOUT_MS', 25_000, 4_000, 120_000),
     autoFailoverBots: envBool(env, 'AUTO_FAILOVER_BOTS', false),
     poolRotateThreshold: envInt(env, 'POOL_ROTATE_THRESHOLD', 12, 3, 100),
-    skipRegistered: envBool(env, 'SKIP_REGISTERED', true),
+    skipRegistered: envBool(env, 'SKIP_REGISTERED', false),
     otpTimeoutCooldownMin: envInt(env, 'OTP_TIMEOUT_COOLDOWN_MIN', 10, 0, 1440),
 
     maxSlots: envInt(env, 'MAX_SLOTS', DEFAULT_MAX_SLOTS, 1, 100),

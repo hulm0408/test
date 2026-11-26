@@ -26,6 +26,15 @@ async function main() {
 
   // Clean any orphaned in-flight claims left over from a prior crash/redeploy
   const clearedClaims = db.clearAllActiveClaims();
+
+  // One-time migration: disable registered-number filter & unlock all previously skipped already_registered numbers
+  if (!db.getSetting('migratedRemoveRegisteredFilterV1', false)) {
+    db.setSetting('skipRegistered', false);
+    const freedRegistered = db.clearCooldownsByStatus(['already_registered']);
+    db.setSetting('migratedRemoveRegisteredFilterV1', true);
+    console.log(`[Boot] Filter removed: skipRegistered=false | unlocked ${freedRegistered} already_registered numbers`);
+  }
+
   const skipSeedOnBoot = Boolean(db.getSetting('skipSeedOnBoot', false));
   const seedRes = skipSeedOnBoot
     ? { present: false, added: 0, kept: 0, expired: 0, purged: db.clearCooldownsByStatus(['seed']), skippedByUser: true }
