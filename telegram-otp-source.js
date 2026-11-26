@@ -1011,9 +1011,11 @@ async function ensureClientUnlocked(ctx) {
   if (ps.loginInProgress) {
     throw new Error('Telegram account login chal raha hai — pehle Add Telegram Account complete ya cancel karo.');
   }
-  const ctxObj = ctx || globalContext;
-  const config = ctxObj.config || getTelegramOtpConfig();
-  ctxObj.config = config;
+  // ctx null hai to global singletons use ho — koi globalContext object ki
+  // zaroorat nahi, helpers (getClientRef, getEntityRef etc.) khud fallback
+  // karte hain ctx=null ke liye.
+  const config = (ctx?.config) || getTelegramOtpConfig();
+  if (ctx) ctx.config = config;
   if (!config.configured) {
     throw new Error(`Telegram Hermes setup missing hai: ${config.missing.join(', ')}`);
   }
