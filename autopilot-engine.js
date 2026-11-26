@@ -49,9 +49,6 @@ import {
   getTelegramOtpConfig,
   getTelegramOtpStatus,
   getNextTelegramNumber,
-  getParallelSlots,
-  claimNumbersParallel,
-  waitForOtpCodesParallel,
   verifyTelegramOtpConnection,
   telegramOtpSetupHintLines,
   setActiveOtpBotProfile,
@@ -1342,8 +1339,6 @@ export async function startAutopilot(opts = {}) {
     ? Math.max(800, telegramRefreshNumber)
     : 2_500;
   const telegramMode = sourceMode === 'telegram';
-  // ⚡ 5 ID parallel — configure kiye gaye spare account slots ko detect karo.
-  const telegramParallelSlots = telegramMode ? getParallelSlots(5) : [];
   if (telegramMode && telegramStatus.loginInProgress) {
     return { ok: false, reason: 'telegram-login-in-progress' };
   }
@@ -2787,73 +2782,14 @@ export async function startAutopilot(opts = {}) {
 
         let entry;
         try {
-          // ⚡ 5 ID parallel — jab multiple spare accounts configured hain, to
-          // claimNumbersParallel se ek saath N slots par number claim karo.
-          // Har slot apne client/lock se independent claim karta hai.
-          const parallelSlots = telegramParallelSlots;
-          if (parallelSlots.length > 1) {
-            const parallelClaim = await claimNumbersParallel(parallelSlots, {
-              forceNew: true,
-              excludePhones: [...excluded],
-              maxAttempts: 8,
-              timeoutMs: telegramOtpTimeoutMs,
-              acceptEntry: acceptTelegramEntry,
-              shouldAbort: () => state.stopRequested,
-            });
-            if (parallelClaim.claimed.length > 0) {
-              // Sab claimed entries ko process karo — sab ko activeNumbers me dalo
-              for (const claimed of parallelClaim.claimed) {
-                const cEntry = claimed.entry;
-                const cPhone = String(cEntry?.phone || '').replace(/\D/g, '').slice(-10);
-                if (!cPhone) continue;
-                telegramClaimRetryStreak = 0;
-                telegramClaimedThisRun.add(cPhone);
-                state.telegramClaimed = telegramClaimedThisRun.size;
-                state.telegramCurrentPhone = cPhone;
-                state.telegramLastCheckedAt = Date.now();
-                state.lastError = '';
-                const pickedEntry = {
-                  ...cEntry,
-                  phone: cPhone,
-                  source: 'telegram',
-                  otpProvider: 'telegram',
-                  sourceMode: 'telegram',
-                  telegramBotUsername: cEntry.telegramBotUsername || state.telegramBotUsername || telegramCfg?.botUsername || '',
-                  noPatch: true,
-                  slot: claimed.slot,
-                };
-                if (claimPickedEntry(pickedEntry)) {
-                  const picked = {
-                    entry: pickedEntry,
-                    lastActivityMs: Date.now(),
-                    windowMs: telegramOtpTimeoutMs,
-                    checkedAt: Date.now(),
-                    onlineFallback: true,
-                    telegram: true,
-                  };
-                  if (state.fresh + activePhones.size >= target) return { status: 'waiting', waitMs: 500 };
-                  return { status: 'picked', picked };
-                }
-              }
-            }
-            // Sab claims fail ho to aage ka flow
-            if (parallelClaim.claimed.length === 0 && parallelClaim.errors.length > 0) {
-              const firstError = parallelClaim.errors[0];
-              throw new Error(String(firstError.error?.message || firstError.error || 'Telegram parallel claim fail'));
-            }
-          } else {
-            entry = await getNextTelegramNumber({
-              forceNew: true,
-              excludePhones: [...excluded],
-              maxAttempts: 8,
-              timeoutMs: telegramOtpTimeoutMs,
-              acceptEntry: acceptTelegramEntry,
-              shouldAbort: () => state.stopRequested,
-            });
-          }
-          if (!entry && !parallelSlots.length) {
-            throw new Error('Telegram se number claim nahi ho paya');
-          }
+          entry = await getNextTelegramNumber({
+            forceNew: true,
+            excludePhones: [...excluded],
+            maxAttempts: 8,
+            timeoutMs: telegramOtpTimeoutMs,
+            acceptEntry: acceptTelegramEntry,
+            shouldAbort: () => state.stopRequested,
+          });
         } catch (e) {
           const message = String(e?.message || e || 'Telegram Hermes se usable number nahi mila');
           state.lastError = message.slice(0, 240);
