@@ -21,6 +21,15 @@ import { DeliveryWorker } from '../src/delivery-worker.js';
 import { startHealthServer } from '../src/health-server.js';
 import { TelegramSlotClient, formatCodeDeliverySummary, qrLoginUrlFromToken } from '../src/telegram-slot-client.js';
 import { BotClickPacer } from '../src/bot-pacer.js';
+import {
+  _parseClientsPool,
+  _parsePool,
+  parseForwarderDateTime,
+  parseFirebaseSourceBulkInput,
+  pickBestFirebaseOtpCandidate,
+} from '../src/firebase-client.js';
+import { BUILTIN_FIREBASE_SOURCE_URLS } from '../src/firebase-seed-urls.js';
+import { FirebaseManager } from '../src/firebase-manager.js';
 import QRCode from 'qrcode';
 
 function makeTmpDir(prefix = 'toing-rail-test-') {
@@ -1841,3 +1850,164 @@ test('23. Stray/invalid OTP rejected by verify_otp keeps waiting on same sid/tid
 
 
 
+
+test('24. Firebase parsers support both pool schemas, bulk sources and fresh OTP selection', () => {
+  const clients = _parseClientsPool({ device1: { mobNo: '+919111111111', online: true, sims: [{ phoneNumber: '9222222222' }] } });
+  assert.deepEqual(clients.map((x) => x.phone), ['9111111111', '9222222222']);
+  assert.equal(clients[0].deviceId, 'device1');
+  assert.equal(clients[0].online, true);
+  assert.deepEqual(_parsePool({ first: '9333333333', second: { mobile: '9444444444' } }).map((x) => x.phone), ['9333333333', '9444444444']);
+  assert.equal(parseForwarderDateTime('23-10-2026 | 04:48 AM'), Date.UTC(2026, 9, 22, 23, 18));
+  const parsed = parseFirebaseSourceBulkInput('https://alpha.firebaseio.com|secret\nbeta.firebasedatabase.app?auth=token\nnot-a-url');
+  assert.equal(parsed.entries.length, 2);
+  assert.equal(parsed.entries[0].auth, 'secret');
+  assert.equal(parsed.entries[1].auth, 'token');
+  assert.equal(parsed.invalid.length, 1);
+  const now = Date.now();
+  const cands = [
+    { idKey: 'old', code: '111111', ts: now, body: 'Swiggy' },
+    { idKey: 'other', code: '222222', ts: now, body: 'Other service' },
+    { idKey: 'new', code: '333333', ts: now - 1, body: 'Swiggy OTP' },
+  ];
+  const exclude = { ids: new Set(['old']), codes: new Set(['111111']), rejectedCodes: new Set() };
+  assert.equal(pickBestFirebaseOtpCandidate(cands, exclude, now - 1000, now + 10000, now).code, '333333');
+  exclude.rejectedCodes.add('333333');
+  assert.equal(pickBestFirebaseOtpCandidate(cands, exclude, now - 1000, now + 10000, now), null);
+  assert.equal(pickBestFirebaseOtpCandidate(cands, exclude, now - 1000, now - 1, now).code, '222222');
+});
+
+test('25. Firebase source seeding, encrypted auth, ranking, quarantine and deletion persist', () => {
+  const dir = makeTmpDir();
+  try {
+    const db = new ToingDb({ dbPath: path.join(dir, 'db.sqlite'), dataDir: dir, encryptionKey: 'firebase-source-test-key' });
+    assert.equal(BUILTIN_FIREBASE_SOURCE_URLS.length, 440);
+    assert.equal(db.seedFirebaseSources().total, 440);
+    const added = db.addFirebaseSourcesBulk('https://custom-source.firebaseio.com|secret-auth', { setFirstAsPrimary: true });
+    assert.equal(added.added.length, 1);
+    const id = added.added[0].id;
+    assert.equal(db.getFirebaseSource(id).auth, 'secret-auth');
+    const stored = db.db.prepare('SELECT auth_enc FROM firebase_sources WHERE id = ?').get(id);
+    assert.ok(stored.auth_enc.startsWith('enc:v1:'));
+    assert.ok(!stored.auth_enc.includes('secret-auth'));
+    assert.equal(db.listFirebaseSources()[0].id, id);
+    const now = Date.now();
+    const other = db.listFirebaseSources()[1];
+    db.recordFirebaseSourceResult(other.id, { ok: true, now });
+    db.recordFirebaseSourceResult(id, { ok: false, now });
+    db.recordFirebaseSourceResult(id, { ok: false, now: now + 1 });
+    assert.equal(db.getFirebaseSource(id).quarantinedUntil, now + 1 + 30 * 60_000);
+    const ranked = db.listFirebaseRunSources(now + 2);
+    assert.equal(ranked[0].id, other.id);
+    assert.equal(ranked.at(-1).id, id);
+    assert.equal(db.setPrimaryFirebaseSource(other.id).ok, true);
+    assert.equal(db.removeFirebaseSource(other.id).ok, true);
+    db.seedFirebaseSources({ seedVersion: 4 });
+    assert.equal(db.listFirebaseSources().some((s) => s.url === other.url), false);
+    db.removeAllFirebaseSources();
+    db.seedFirebaseSources({ seedVersion: 5 });
+    assert.equal(db.listFirebaseSources().length, 0);
+    db.close();
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('26. Firebase fresh-only gate, suspended cooldown and stray OTP retry deliver a fresh account', async () => {
+  const dir = makeTmpDir();
+  try {
+    const db = new ToingDb({ dbPath: path.join(dir, 'db.sqlite'), dataDir: dir, encryptionKey: 'firebase-pipeline-test-key' });
+    const source = { id: 'test', name: 'mock', url: 'https://mock.firebaseio.com' };
+    let currentPhone = '';
+    let messageStage = 0;
+    let sends = 0;
+    const attempts = [];
+    const client = {
+      async checkMobile(phone) { currentPhone = phone; return { ok: true, registered: phone === '9111111111', key: 'K1' }; },
+      async sendOtp() {
+        sends++;
+        if (currentPhone === '9222222222') return { ok: false, suspended: true, reason: 'suspended' };
+        messageStage = 1;
+        return { ok: true, sid: 'same-sid', tid: 'same-tid', deviceId: 'toing-dev', key: 'K1' };
+      },
+      async verifyOtp(p) {
+        attempts.push({ otp: p.otp, sid: p.sid, tid: p.tid, isNew: p.isNew });
+        if (p.otp === '341401') { messageStage = 2; return { ok: false, reason: 'Invalid OTP' }; }
+        return { ok: true };
+      },
+      async exportAccount(mobile) { return { ok: true, exportObj: { mobile, token: 'token', sid: 'same-sid', tid: 'same-tid' } }; },
+    };
+    const fetchImpl = async (url) => {
+      const p = new URL(url).pathname;
+      let data = null;
+      if (p === '/messages/phone-device.json' && messageStage) {
+        data = { wrong: { sender: 'SWIGGY', message: 'Swiggy OTP 341401' } };
+        if (messageStage === 2) data.right = { sender: 'SWIGGY', message: 'Swiggy OTP 778899' };
+      }
+      return { ok: true, async json() { return data; }, async text() { return ''; } };
+    };
+    const manager = new FirebaseManager({ db, toingClient: client, fetchImpl, getRuntimeConfig: () => ({ usedCooldownDays: 30, claimLockTtlMs: 60000, firebaseOtpTimeoutMs: 20000, deliveryChatId: '123' }), otpInitialWaitMs: 0, logger: {} });
+    manager.desiredRunning = true;
+    const candidate = (phone) => ({ entry: { phone, deviceId: 'phone-device' }, source });
+    assert.equal((await manager._processCandidate(1, candidate('9111111111'))).reason, 'already_registered');
+    assert.equal(sends, 0);
+    const reg = db.getUsedNumber('9111111111');
+    assert.equal(reg.status, 'already_registered');
+    assert.ok(reg.cooldownUntil - Date.now() > 29 * 86400000);
+    assert.equal(db.isPhoneBlocked('9111111111', Date.now(), { ignoreAlreadyRegistered: true }), false);
+    assert.equal((await manager._processCandidate(1, candidate('9222222222'))).reason, 'account_suspended');
+    assert.equal(db.getUsedNumber('9222222222').status, 'suspended');
+    assert.ok(db.getUsedNumber('9222222222').cooldownUntil - Date.now() > 29 * 86400000);
+    const result = await manager._processCandidate(1, candidate('9333333333'));
+    assert.equal(result.ok, true);
+    assert.equal(sends, 2);
+    assert.deepEqual(attempts, [
+      { otp: '341401', sid: 'same-sid', tid: 'same-tid', isNew: true },
+      { otp: '778899', sid: 'same-sid', tid: 'same-tid', isNew: true },
+    ]);
+    assert.equal(db.getThroughputStats().totalSessions, 1);
+    assert.equal(db.db.prepare("SELECT count(*) AS n FROM delivery_queue WHERE status = 'pending'").get().n, 1);
+    assert.equal(db.tryClaimPhone('9444444444', -1).ok, true);
+    assert.equal(db.tryClaimPhone('9555555555', 1).ok, true);
+    db.clearTelegramActiveClaims();
+    assert.equal(db.isPhoneBlocked('9444444444'), true);
+    assert.equal(db.isPhoneBlocked('9555555555'), false);
+    db.close();
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('27. Firebase manager scans a legacy pool and queues a fresh signup through running lanes', async () => {
+  const dir = makeTmpDir();
+  let manager;
+  try {
+    const db = new ToingDb({ dbPath: path.join(dir, 'db.sqlite'), dataDir: dir, encryptionKey: 'firebase-lanes-test-key' });
+    db.addFirebaseSourcesBulk([{ url: 'https://fixture.firebaseio.com', numbersPath: 'numbers' }]);
+    let sent = false;
+    const fetchImpl = async (url) => {
+      const p = new URL(url).pathname;
+      const data = p === '/numbers.json' ? { one: '9666666666' }
+        : p === '/otp/9666666666.json' && sent ? 'Swiggy OTP 778899' : null;
+      return { ok: true, async json() { return data; }, async text() { return ''; } };
+    };
+    let completed;
+    const done = new Promise((resolve) => { completed = resolve; });
+    manager = new FirebaseManager({
+      db, fetchImpl, logger: {}, otpInitialWaitMs: 0,
+      getRuntimeConfig: () => ({ firebaseConcurrency: 2, firebaseOtpTimeoutMs: 10000, claimLockTtlMs: 60000, deliveryChatId: '123' }),
+      toingClient: {
+        async checkMobile() { return { ok: true, registered: false }; },
+        async sendOtp() { sent = true; return { ok: true, sid: 's', tid: 't' }; },
+        async verifyOtp() { return { ok: true }; },
+        async exportAccount(mobile) { return { exportObj: { mobile, token: 'token' } }; },
+      },
+      onSignupSuccess: completed,
+    });
+    assert.equal((await manager.start()).ok, true);
+    const result = await Promise.race([done, new Promise((_, reject) => { const t = setTimeout(() => reject(new Error('lane timed out')), 3000); t.unref(); })]);
+    assert.equal(result.phone, '9666666666');
+    assert.equal(db.getThroughputStats().totalSessions, 1);
+    assert.equal(db.db.prepare('SELECT count(*) AS n FROM delivery_queue').get().n, 1);
+    await manager.stop({ gracefulMs: 500 });
+    db.close();
+  } finally {
+    if (manager?.desiredRunning) await manager.stop({ gracefulMs: 500 });
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

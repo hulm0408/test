@@ -8,6 +8,7 @@ import {
   loginInteractiveSession,
   loginQrSession,
 } from './telegram-slot-client.js';
+import { verifyFirebaseSource } from './firebase-client.js';
 import { parseCsvList } from './config.js';
 
 function esc(s = '') {
@@ -24,9 +25,40 @@ function fmtDuration(sec = 0) {
   return `${s}s`;
 }
 
-export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeConfig }) {
-  // Per-chat interactive state (import prompt / phone login flow / setkey prompt)
-  const chatModes = new Map(); // chatId -> { type: 'import'|'setkey'|'login', ... }
+export function registerBotUi({ bot, db, slotManager, firebaseManager = null, toingClient, getRuntimeConfig }) {
+  // Per-chat interactive state (import prompt / phone login flow / setkey prompt / fb_add prompt)
+  const chatModes = new Map(); // chatId -> { type: 'import'|'setkey'|'login'|'fb_add', ... }
+
+  async function switchFirebaseMode(enable) {
+    const next = Boolean(enable);
+    const wasRunning = Boolean(slotManager.desiredRunning || firebaseManager?.desiredRunning || db.getSetting('running', false));
+    db.setSetting('firebaseMode', next);
+
+    if (next) {
+      // Turning Firebase Fresh-Only Mode ON -> cleanly stop TG slots if active, then start Firebase if running
+      if (slotManager.desiredRunning || slotManager.getDashboardSnapshot().runningCount > 0) {
+        await slotManager.stopAll({ gracefulMs: 10_000, persistStopped: false });
+      }
+      if (wasRunning && firebaseManager) {
+        const res = await firebaseManager.start();
+        return { enabled: true, started: Boolean(res?.ok), reason: res?.reason || '' };
+      }
+      return { enabled: true, started: false, reason: '' };
+    }
+
+    // Turning Firebase Mode OFF -> stop Firebase cleanly, restore TG slots if running
+    if (firebaseManager && (firebaseManager.desiredRunning || firebaseManager.running)) {
+      await firebaseManager.stop({ gracefulMs: 10_000, persistStopped: false });
+    }
+    if (wasRunning) {
+      const enabledSlots = db.listAccounts({ onlyEnabled: true }).length;
+      if (enabledSlots > 0) {
+        await slotManager.startAll();
+        return { enabled: false, started: true, reason: '' };
+      }
+    }
+    return { enabled: false, started: false, reason: '' };
+  }
 
   const isOwner = (userId) => {
     const cfg = getRuntimeConfig();
@@ -51,45 +83,99 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
   function buildDashboard() {
     const cfg = getRuntimeConfig();
     const snap = slotManager.getDashboardSnapshot();
+    const fbSnap = firebaseManager ? firebaseManager.getSnapshot() : {
+      desiredRunning: false,
+      running: false,
+      activeLanes: 0,
+      stages: {},
+      currentSource: null,
+      sourceIndex: 0,
+      runSourcesTotal: 0,
+      hotQueueSize: 0,
+      currentPoolSize: 0,
+      currentUnseenSize: 0,
+      createdInRun: 0,
+      skippedRegisteredInRun: 0,
+      otpTimeoutsInRun: 0,
+      lastError: '',
+      health: db.getFirebaseHealthSummary(),
+    };
+    const fbMode = Boolean(cfg.firebaseMode);
     const t = snap.throughput;
     const d = snap.delivery;
 
-    const rateStatus = !snap.desiredRunning
+    const isEngineRunning = fbMode ? fbSnap.desiredRunning : snap.desiredRunning;
+    const rateStatus = !isEngineRunning
       ? '⏸ STOPPED'
       : t.rate1m >= cfg.targetAccountsPerMin
         ? '🟢 ON TARGET'
         : t.rate5m >= cfg.targetAccountsPerMin
           ? '🟢 STEADY'
-          : snap.runningCount > 0
+          : (fbMode ? fbSnap.activeLanes > 0 : snap.runningCount > 0)
             ? '🟡 RUNNING'
-            : '🔴 NO ACTIVE SLOTS';
+            : '🔴 IDLE';
 
-    const stageLine = Object.entries(snap.stages)
+    const fbStageLine = Object.entries(fbSnap.stages || {})
       .filter(([, c]) => c > 0)
       .map(([k, c]) => `${k}:${c}`)
       .join(' · ');
 
-    const lines = [
-      `🌐 <b>TOING PRO — 50-SLOT CLUSTER</b>  [${rateStatus}]`,
-      ``,
-      `⚡ <b>Throughput:</b> <code>${t.rate1m}/min</code> (1m) · <code>${t.rate5m}/min</code> (5m) · <code>${t.rate15m}/min</code> (15m)`,
-      `🎯 <b>Goal:</b> <code>${cfg.targetAccountsPerMin}+ acc/min</code> · <b>Hit Rate (5m):</b> <code>${t.hitRate5m}%</code> · <b>Avg:</b> <code>${t.avgSignupSec}s</code>`,
-      `📦 <b>Total Created:</b> <code>${t.totalSessions}</code> (1h: <code>${t.last1h}</code>) · <b>Cooldown Pool:</b> <code>${t.usedActive}</code>`,
-      `🔍 <b>5m Skips/Drops:</b> 🚫 Reg <code>${t.alreadyRegistered5m || 0}</code> · 🔁 Used/Dup <code>${t.duplicateSkips5m || 0}</code> · ⏱ OTP Timeout <code>${t.timeouts5m || 0}</code> · ❌ Fail <code>${(t.sendFails5m || 0) + (t.verifyFails5m || 0) + (t.checkFails5m || 0)}</code>`,
-      ``,
-      `👥 <b>Slots:</b> <code>${snap.totalSlots}/${cfg.maxSlots}</code>  (🟢 ${snap.readyCount} live · ⏳ ${snap.cooldownCount} cool · ⛔ ${snap.deadCount} dead · ⚪ ${snap.disabledCount} off)`,
-      stageLine ? `🔄 <b>Stages:</b> <code>${esc(stageLine)}</code>` : '',
-      `📤 <b>Delivery Queue:</b> <code>${d.pending}</code> pending · <code>${d.sent}</code> sent · <code>${d.failed}</code> failed`,
-      `🔑 <b>Toing Keys:</b> <code>${snap.toing.keysCount}</code> · <b>HTTP Gate:</b> <code>${snap.toing.semaphore.active}/${snap.toing.semaphore.limit}</code> (429: ${snap.toing.rateLimited429})`,
-      `🤖 <b>OTP Bot:</b> <code>${esc(cfg.defaultOtpBot)}</code> · <b>OTP Timeout:</b> <code>${Math.round(cfg.otpTimeoutMs / 1000)}s</code> · <b>Filter:</b> <code>${cfg.skipRegistered === true ? 'Fresh Only' : 'All Numbers ✅'}</code>`,
-    ].filter(Boolean);
+    const tgStageLine = Object.entries(snap.stages)
+      .filter(([, c]) => c > 0)
+      .map(([k, c]) => `${k}:${c}`)
+      .join(' · ');
+
+    const lines = fbMode
+      ? [
+        `🔥 <b>TOING PRO — FIREBASE FRESH-ONLY</b>  [${rateStatus}]`,
+        ``,
+        `⚡ <b>Throughput:</b> <code>${t.rate1m}/min</code> (1m) · <code>${t.rate5m}/min</code> (5m) · <code>${t.rate15m}/min</code> (15m)`,
+        `📦 <b>Total Created:</b> <code>${t.totalSessions}</code> (1h: <code>${t.last1h}</code> · run: <code>${fbSnap.createdInRun}</code>) · <b>Cooldown:</b> <code>${t.usedActive}</code>`,
+        `🚫 <b>Already-Registered Auto-Skip:</b> <b>ON ✅</b> (run skipped: <code>${fbSnap.skippedRegisteredInRun}</code> · 5m: <code>${t.alreadyRegistered5m || 0}</code>)`,
+        `🔍 <b>5m Drops:</b> ⏱ OTP Timeout <code>${t.timeouts5m || 0}</code> · ❌ Fail <code>${(t.sendFails5m || 0) + (t.verifyFails5m || 0) + (t.checkFails5m || 0)}</code>`,
+        ``,
+        `🔥 <b>Firebase Sources:</b> <code>${fbSnap.health.total}</code> total (🟢 ${fbSnap.health.live} live · ⏳ ${fbSnap.health.quarantined} quar · ⚪ ${fbSnap.health.neverTried} new)`,
+        fbSnap.currentSource
+          ? `📡 <b>Active DB:</b> <code>${esc(fbSnap.currentSource.name)}</code> (${fbSnap.sourceIndex}/${fbSnap.runSourcesTotal}) · Pool: <code>${fbSnap.currentUnseenSize}/${fbSnap.currentPoolSize}</code> · HotQ: <code>${fbSnap.hotQueueSize}</code>`
+          : `📡 <b>Active DB:</b> <i>${fbSnap.desiredRunning ? 'Loading / scanning...' : 'Stopped'}</i>`,
+        `⚡ <b>FB Lanes:</b> <code>${fbSnap.activeLanes}/${cfg.firebaseConcurrency}</code> · <b>FB OTP Timeout:</b> <code>${Math.round(cfg.firebaseOtpTimeoutMs / 1000)}s</code>`,
+        fbStageLine ? `🔄 <b>Stages:</b> <code>${esc(fbStageLine)}</code>` : '',
+        `📤 <b>Delivery Queue:</b> <code>${d.pending}</code> pending · <code>${d.sent}</code> sent · <code>${d.failed}</code> failed`,
+        `🔑 <b>Toing Keys:</b> <code>${snap.toing.keysCount}</code> · <b>HTTP Gate:</b> <code>${snap.toing.semaphore.active}/${snap.toing.semaphore.limit}</code> (429: ${snap.toing.rateLimited429})`,
+      ].filter(Boolean)
+      : [
+        `🌐 <b>TOING PRO — 50-SLOT CLUSTER</b>  [${rateStatus}]`,
+        ``,
+        `⚡ <b>Throughput:</b> <code>${t.rate1m}/min</code> (1m) · <code>${t.rate5m}/min</code> (5m) · <code>${t.rate15m}/min</code> (15m)`,
+        `🎯 <b>Goal:</b> <code>${cfg.targetAccountsPerMin}+ acc/min</code> · <b>Hit Rate (5m):</b> <code>${t.hitRate5m}%</code> · <b>Avg:</b> <code>${t.avgSignupSec}s</code>`,
+        `📦 <b>Total Created:</b> <code>${t.totalSessions}</code> (1h: <code>${t.last1h}</code>) · <b>Cooldown Pool:</b> <code>${t.usedActive}</code>`,
+        `🔍 <b>5m Skips/Drops:</b> 🚫 Reg <code>${t.alreadyRegistered5m || 0}</code> · 🔁 Used/Dup <code>${t.duplicateSkips5m || 0}</code> · ⏱ OTP Timeout <code>${t.timeouts5m || 0}</code> · ❌ Fail <code>${(t.sendFails5m || 0) + (t.verifyFails5m || 0) + (t.checkFails5m || 0)}</code>`,
+        ``,
+        `👥 <b>Slots:</b> <code>${snap.totalSlots}/${cfg.maxSlots}</code>  (🟢 ${snap.readyCount} live · ⏳ ${snap.cooldownCount} cool · ⛔ ${snap.deadCount} dead · ⚪ ${snap.disabledCount} off)`,
+        tgStageLine ? `🔄 <b>Stages:</b> <code>${esc(tgStageLine)}</code>` : '',
+        `📤 <b>Delivery Queue:</b> <code>${d.pending}</code> pending · <code>${d.sent}</code> sent · <code>${d.failed}</code> failed`,
+        `🔑 <b>Toing Keys:</b> <code>${snap.toing.keysCount}</code> · <b>HTTP Gate:</b> <code>${snap.toing.semaphore.active}/${snap.toing.semaphore.limit}</code> (429: ${snap.toing.rateLimited429})`,
+        `🤖 <b>OTP Bot:</b> <code>${esc(cfg.defaultOtpBot)}</code> · <b>OTP Timeout:</b> <code>${Math.round(cfg.otpTimeoutMs / 1000)}s</code> · <b>Filter:</b> <code>${cfg.skipRegistered === true ? 'Fresh Only' : 'All Numbers ✅'}</code>`,
+        `🔥 <b>Firebase Fresh-Only Mode:</b> <code>OFF</code> (${fbSnap.health.total} DBs ready — tap below to ON)`,
+      ].filter(Boolean);
 
     const rows = [
       [
-        snap.desiredRunning
-          ? Markup.button.callback('🛑 STOP ALL', 'act_stop_all')
-          : Markup.button.callback('🚀 START ALL', 'act_start_all'),
+        fbMode
+          ? (fbSnap.desiredRunning
+            ? Markup.button.callback('🛑 STOP FIREBASE', 'act_fb_stop')
+            : Markup.button.callback('🚀 START FIREBASE', 'act_fb_start'))
+          : (snap.desiredRunning
+            ? Markup.button.callback('🛑 STOP ALL', 'act_stop_all')
+            : Markup.button.callback('🚀 START ALL', 'act_start_all')),
         Markup.button.callback('🔄 Refresh', 'act_dash'),
+      ],
+      [
+        Markup.button.callback(
+          fbMode ? '🔥 Firebase Mode: ON ✅' : '🔥 Firebase Mode: OFF',
+          'act_toggle_fb_mode'
+        ),
+        Markup.button.callback(`🔥 FB Panel (${fbSnap.health.total})`, 'act_fb_panel'),
       ],
       [
         Markup.button.callback(`👥 Slots (${snap.totalSlots}/${cfg.maxSlots})`, 'slots_page_1'),
@@ -348,10 +434,192 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     };
   }
 
+  // ── 🔥 Firebase Fresh-Only Control Panel & Sources UI ─────────────────────
+  function buildFirebasePanelView({ confirmDeleteAll = false } = {}) {
+    const cfg = getRuntimeConfig();
+    const fbSnap = firebaseManager ? firebaseManager.getSnapshot() : {
+      desiredRunning: false,
+      running: false,
+      activeLanes: 0,
+      stages: {},
+      currentSource: null,
+      sourceIndex: 0,
+      runSourcesTotal: 0,
+      hotQueueSize: 0,
+      currentPoolSize: 0,
+      currentUnseenSize: 0,
+      createdInRun: 0,
+      skippedRegisteredInRun: 0,
+      otpTimeoutsInRun: 0,
+      lastError: '',
+      health: db.getFirebaseHealthSummary(),
+    };
+    const fbMode = Boolean(cfg.firebaseMode);
+    const h = fbSnap.health;
+    const primary = db.listFirebaseSources().find((s) => s.primary) || null;
+    const stageStr = Object.entries(fbSnap.stages || {})
+      .filter(([, c]) => c > 0)
+      .map(([k, c]) => `${k}:${c}`)
+      .join(' · ');
+
+    const lines = [
+      `🔥 <b>FIREBASE FRESH-ONLY REGISTRATION</b>`,
+      ``,
+      `🔘 <b>Firebase Mode:</b> <b>${fbMode ? 'ON ✅ (Active)' : 'OFF (Telegram OTP Bots Active)'}</b>`,
+      `🚫 <b>Already-Registered Rule:</b> <b>Hamesha SKIP ✅</b> (sirf FRESH <code>is_new=true</code> par OTP &amp; signup)`,
+      `⚡ <b>Engine:</b> <b>${fbSnap.desiredRunning ? `RUNNING (${fbSnap.activeLanes}/${cfg.firebaseConcurrency} lanes)` : 'STOPPED'}</b> · <b>FB OTP Timeout:</b> <code>${Math.round(cfg.firebaseOtpTimeoutMs / 1000)}s</code>`,
+      stageStr ? `🔄 <b>Stages:</b> <code>${esc(stageStr)}</code>` : '',
+      `📊 <b>This Run:</b> ✅ Fresh Created <code>${fbSnap.createdInRun}</code> · 🚫 Reg Skipped <code>${fbSnap.skippedRegisteredInRun}</code> · ⏱ Timeout <code>${fbSnap.otpTimeoutsInRun}</code>`,
+      ``,
+      `🗂 <b>Firebase Sources:</b> <code>${h.total}</code> total (🟢 ${h.live} live · ⏳ ${h.quarantined} quar · ❌ ${h.failed} fail · ⚪ ${h.neverTried} new)`,
+      primary ? `⭐ <b>First-Try Source:</b> <code>${esc(primary.name)}</code>` : `⚠️ <i>Koi Firebase source added nahi — Add Firebase (Bulk) se daalo.</i>`,
+      fbSnap.currentSource
+        ? `📡 <b>Now Scanning:</b> <code>${esc(fbSnap.currentSource.name)}</code> (${fbSnap.sourceIndex}/${fbSnap.runSourcesTotal}) · Unseen <code>${fbSnap.currentUnseenSize}/${fbSnap.currentPoolSize}</code> · HotQ <code>${fbSnap.hotQueueSize}</code>`
+        : '',
+      fbSnap.lastError ? `⚠️ <b>Last Error:</b> <code>${esc(fbSnap.lastError)}</code>` : '',
+    ].filter(Boolean);
+
+    const rows = [
+      [
+        Markup.button.callback(
+          fbMode ? '🔥 Firebase Mode: ON ✅ (Tap OFF)' : '🔥 Firebase Mode: OFF (Tap ON)',
+          'act_toggle_fb_mode'
+        ),
+      ],
+      [
+        fbSnap.desiredRunning
+          ? Markup.button.callback('🛑 STOP FIREBASE', 'act_fb_stop')
+          : Markup.button.callback('🚀 START FIREBASE', 'act_fb_start'),
+        Markup.button.callback('🔄 Refresh', 'act_fb_panel'),
+      ],
+      [
+        Markup.button.callback(`⚡ 5`, 'fb_lanes_5'),
+        Markup.button.callback(`⚡ 12`, 'fb_lanes_12'),
+        Markup.button.callback(`⚡ 20`, 'fb_lanes_20'),
+        Markup.button.callback(`⚡ 30`, 'fb_lanes_30'),
+      ],
+      [
+        Markup.button.callback(`⏱ 30s`, 'fb_otp_30000'),
+        Markup.button.callback(`⏱ 45s`, 'fb_otp_45000'),
+        Markup.button.callback(`⏱ 60s`, 'fb_otp_60000'),
+        Markup.button.callback(`⏱ 90s`, 'fb_otp_90000'),
+      ],
+      [
+        Markup.button.callback(`📋 Sources (${h.total})`, 'fb_sources_page_1'),
+        Markup.button.callback('➕ Add Firebase (Bulk)', 'fb_src_add'),
+      ],
+      [
+        Markup.button.callback('♻️ Reset FB Health', 'fb_src_reset_health'),
+        confirmDeleteAll
+          ? Markup.button.callback('⚠️ YES, DELETE ALL FB', 'fb_src_del_all_yes')
+          : Markup.button.callback('🗑 Delete All FB', 'fb_src_del_all_ask'),
+      ],
+      [
+        Markup.button.callback('🏠 Dashboard', 'act_dash'),
+      ],
+    ];
+
+    return {
+      text: lines.join('\n'),
+      extra: { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) },
+    };
+  }
+
+  function buildFirebaseSourcesPage(page = 1) {
+    const list = db.listFirebaseRunSources();
+    const perPage = 10;
+    const totalPages = Math.max(1, Math.ceil(list.length / perPage));
+    const cur = Math.min(totalPages, Math.max(1, Number(page) || 1));
+    const slice = list.slice((cur - 1) * perPage, cur * perPage);
+    const now = Date.now();
+
+    const lines = [
+      `📋 <b>FIREBASE SOURCES</b> — Page ${cur}/${totalPages} (${list.length} total)`,
+      `<i>Proven live DBs pehle try hote hain; fail/empty DBs 30m quarantine me jate hain.</i>`,
+      '',
+    ];
+    if (!slice.length) {
+      lines.push('<i>Koi Firebase source nahi hai — ➕ Add Firebase (Bulk) se add karo.</i>');
+    } else {
+      for (const s of slice) {
+        const isQuar = Number(s.quarantinedUntil) > now;
+        const icon = isQuar ? '⏳' : s.lastOkAt > 0 ? '🟢' : s.failCount > 0 ? '❌' : '⚪';
+        const star = s.primary ? '⭐ ' : '';
+        const meta = isQuar
+          ? `quar ${fmtDuration((s.quarantinedUntil - now) / 1000)}`
+          : s.latencyMs
+            ? `${s.latencyMs}ms`
+            : 'untested';
+        lines.push(`${icon} ${star}<b>${esc(s.name)}</b> · <code>${esc(meta)}</code>${s.hasAuth ? ' 🔐' : ''}`);
+      }
+    }
+
+    const rows = [];
+    for (let i = 0; i < slice.length; i += 2) {
+      const pair = slice.slice(i, i + 2).map((s) =>
+        Markup.button.callback(`${s.primary ? '⭐ ' : ''}${s.name.slice(0, 14)}`, `fb_src_view_${s.id}_${cur}`)
+      );
+      rows.push(pair);
+    }
+
+    const nav = [];
+    if (cur > 1) nav.push(Markup.button.callback('⬅️ Prev', `fb_sources_page_${cur - 1}`));
+    nav.push(Markup.button.callback('🔄', `fb_sources_page_${cur}`));
+    if (cur < totalPages) nav.push(Markup.button.callback('Next ➡️', `fb_sources_page_${cur + 1}`));
+    rows.push(nav);
+    rows.push([
+      Markup.button.callback('➕ Add Bulk', 'fb_src_add'),
+      Markup.button.callback('🔥 FB Panel', 'act_fb_panel'),
+    ]);
+
+    return {
+      text: lines.join('\n'),
+      extra: { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) },
+    };
+  }
+
+  function buildFirebaseSourceDetail(id, backPage = 1, verifyNote = '') {
+    const s = db.getFirebaseSource(id);
+    if (!s) {
+      return {
+        text: '❌ Firebase source nahi mila.',
+        extra: { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', `fb_sources_page_${backPage}`)]]) },
+      };
+    }
+    const now = Date.now();
+    const isQuar = Number(s.quarantinedUntil) > now;
+    const lines = [
+      `🔥 <b>FIREBASE SOURCE — ${esc(s.name)}</b>`,
+      `🔗 <code>${esc(s.url)}</code>`,
+      `⭐ Primary: <b>${s.primary ? 'YES' : 'NO'}</b> · 🔐 Auth: <b>${s.hasAuth ? 'SET' : 'Open/None'}</b>`,
+      `🩺 Health: <b>${isQuar ? `Quarantined (${fmtDuration((s.quarantinedUntil - now) / 1000)} left)` : s.lastOkAt > 0 ? 'LIVE ✅' : 'Untested'}</b>`,
+      `📊 OK: <code>${s.okCount}</code> · Fail: <code>${s.failCount}</code> · Latency: <code>${s.latencyMs || 0}ms</code>`,
+      s.lastError ? `⚠️ Last error: <code>${esc(s.lastError)}</code>` : '',
+      verifyNote ? `\n${verifyNote}` : '',
+    ].filter(Boolean);
+
+    const rows = [
+      [
+        Markup.button.callback('⭐ Set First-Try', `fb_src_primary_${s.id}_${backPage}`),
+        Markup.button.callback('🧪 Verify Now', `fb_src_verify_${s.id}_${backPage}`),
+      ],
+      [
+        Markup.button.callback('🗑 Delete Source', `fb_src_del_${s.id}_${backPage}`),
+        Markup.button.callback('⬅️ Back', `fb_sources_page_${backPage}`),
+      ],
+    ];
+
+    return {
+      text: lines.join('\n'),
+      extra: { parse_mode: 'HTML', ...Markup.inlineKeyboard(rows) },
+    };
+  }
+
   // ── Settings View ──────────────────────────────────────────────────────────
   function buildSettingsView() {
     const cfg = getRuntimeConfig();
     const accounts = db.listAccounts({ includeSession: false });
+    const fbHealth = db.getFirebaseHealthSummary();
     const botDist = { hathi: 0, hermes: 0, chauhan: 0 };
     for (const acc of accounts) {
       const pid = normalizeOtpBotProfileId(acc.otpBotProfile);
@@ -361,16 +629,18 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     const lines = [
       `⚙️ <b>TOING CLUSTER SETTINGS</b>`,
       ``,
-      `🆕 Skip Already Registered: <b>${cfg.skipRegistered === true ? 'ON (Fresh Only)' : 'OFF ✅ (New + Registered Sab Par OTP)'}</b>`,
+      `🔥 Firebase Fresh-Only Mode: <b>${cfg.firebaseMode ? `ON ✅ (${fbHealth.total} DBs, Already-Reg AUTO SKIP)` : `OFF (${fbHealth.total} DBs ready)`}</b>`,
+      `🆕 TG Bot Skip Registered: <b>${cfg.skipRegistered === true ? 'ON (Fresh Only)' : 'OFF ✅ (New + Registered Sab Par OTP)'}</b>`,
       `🤖 Default OTP Bot: <code>${esc(cfg.defaultOtpBot)}</code> (🐘 ${botDist.hathi} | 📨 ${botDist.hermes} | 🔐 ${botDist.chauhan})`,
       `🔁 Auto-Failover & Pool Rotate: <b>${cfg.autoFailoverBots ? `ON (every ${cfg.poolRotateThreshold || 12} skips)` : 'OFF'}</b>`,
-      `⏱ OTP Fast-Fail Timeout: <code>${Math.round(cfg.otpTimeoutMs / 1000)}s</code>`,
+      `⏱ OTP Fast-Fail Timeout: <code>${Math.round(cfg.otpTimeoutMs / 1000)}s</code> (FB: <code>${Math.round(cfg.firebaseOtpTimeoutMs / 1000)}s</code>)`,
       `🚦 Toing HTTP Concurrency: <code>${cfg.toingHttpConcurrency}</code>`,
       `🔑 Toing Access Keys (${cfg.toingAccessKeys.length}): <code>${esc(maskedKeys)}</code>`,
       `📤 Delivery Chat: <code>${esc(cfg.deliveryChatId || cfg.primaryOwnerId || 'owner DM')}</code>`,
       `🔄 Auto-Resume on Restart: <b>${cfg.autoResume ? 'ON' : 'OFF'}</b>`,
       ``,
       `<i>Commands:</i>`,
+      `• <code>/firebase</code> — 🔥 Firebase Fresh-Only mode &amp; 400+ DB sources control`,
       `• <code>/cooldowns</code> — Cooldown pool breakdown &amp; clear controls`,
       `• <code>/logs</code> — Har number ka skip/drop/success exact reason dekho`,
       `• <code>/spreadbots</code> — Saare slots ko 3 OTP bots me equally spread karo`,
@@ -381,6 +651,13 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     ];
 
     const rows = [
+      [
+        Markup.button.callback(
+          cfg.firebaseMode ? '🔥 Firebase Mode: ON ✅' : '🔥 Firebase Mode: OFF',
+          'act_toggle_fb_mode'
+        ),
+        Markup.button.callback(`🔥 FB Sources (${fbHealth.total})`, 'act_fb_panel'),
+      ],
       [
         Markup.button.callback(
           `🆕 Skip Registered: ${cfg.skipRegistered === true ? 'ON' : 'OFF ✅'}`,
@@ -437,6 +714,11 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     await ctx.reply(text, extra);
   });
 
+  bot.command(['firebase', 'fb'], async (ctx) => {
+    const { text, extra } = buildFirebasePanelView();
+    await ctx.reply(text, extra);
+  });
+
   bot.command(['logs', 'log', 'reasons'], async (ctx) => {
     const limit = Math.min(40, Math.max(5, Number((ctx.message.text || '').split(/\s+/)[1]) || 22));
     const { text, extra } = buildNumberLogView(limit);
@@ -455,15 +737,28 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
   });
 
   bot.command('startall', async (ctx) => {
-    const res = await slotManager.startAll();
-    await ctx.reply(`🚀 Started <b>${res.started}</b> slots (total enabled: ${res.totalEnabled}${res.skippedDead ? `, skipped dead: ${res.skippedDead}` : ''}).`, { parse_mode: 'HTML' });
+    const cfg = getRuntimeConfig();
+    if (cfg.firebaseMode && firebaseManager) {
+      const res = await firebaseManager.start();
+      if (!res.ok) {
+        await ctx.reply('⚠️ Koi Firebase source nahi hai — pehle <code>/firebase</code> se URL add karo.', { parse_mode: 'HTML' });
+      } else {
+        await ctx.reply(`🔥 Started <b>Firebase Fresh-Only Mode</b> (${res.lanes} parallel lanes, ${res.totalSources} sources — Already-Registered AUTO SKIP ✅).`, { parse_mode: 'HTML' });
+      }
+    } else {
+      const res = await slotManager.startAll();
+      await ctx.reply(`🚀 Started <b>${res.started}</b> slots (total enabled: ${res.totalEnabled}${res.skippedDead ? `, skipped dead: ${res.skippedDead}` : ''}).`, { parse_mode: 'HTML' });
+    }
     const { text, extra } = buildDashboard();
     await ctx.reply(text, extra);
   });
 
   bot.command('stopall', async (ctx) => {
-    const res = await slotManager.stopAll({ gracefulMs: 15_000, persistStopped: true });
-    await ctx.reply(`🛑 Stopped <b>${res.stopped}</b> slots cleanly.`, { parse_mode: 'HTML' });
+    const [tgRes] = await Promise.all([
+      slotManager.stopAll({ gracefulMs: 15_000, persistStopped: true }),
+      firebaseManager ? firebaseManager.stop({ gracefulMs: 15_000, persistStopped: true }) : Promise.resolve(),
+    ]);
+    await ctx.reply(`🛑 Stopped cleanly (TG slots stopped: <b>${tgRes.stopped}</b>, Firebase stopped).`, { parse_mode: 'HTML' });
   });
 
   bot.command('resethealth', async (ctx) => {
@@ -849,6 +1144,162 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     await editOrReply(ctx, text, extra);
   });
 
+  // ── 🔥 Firebase Fresh-Only Mode & Source Callbacks ────────────────────────
+  bot.action('act_toggle_fb_mode', async (ctx) => {
+    const next = !getRuntimeConfig().firebaseMode;
+    await ctx.answerCbQuery(
+      next ? '🔥 Firebase Fresh-Only Mode ON (Already-Reg Auto Skip)' : '🤖 Switched back to Telegram OTP Bot Mode'
+    ).catch(() => {});
+    const res = await switchFirebaseMode(next);
+    const { text, extra } = buildDashboard();
+    await editOrReply(ctx, text, extra);
+    if (next && res.reason === 'no_sources') {
+      await ctx.reply('⚠️ Koi Firebase source nahi hai — pehle <b>🔥 FB Panel → ➕ Add Firebase (Bulk)</b> se URL add karo.', { parse_mode: 'HTML' });
+    }
+  });
+
+  bot.action('act_fb_panel', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const { text, extra } = buildFirebasePanelView();
+    await editOrReply(ctx, text, extra);
+  });
+
+  bot.action('act_fb_start', async (ctx) => {
+    if (!firebaseManager) {
+      await ctx.answerCbQuery('❌ Firebase engine unavailable', { show_alert: true }).catch(() => {});
+      return;
+    }
+    await ctx.answerCbQuery('🔥 Starting Firebase Fresh-Only Mode...').catch(() => {});
+    db.setSetting('firebaseMode', true);
+    if (slotManager.desiredRunning || slotManager.getDashboardSnapshot().runningCount > 0) {
+      await slotManager.stopAll({ gracefulMs: 10_000, persistStopped: false });
+    }
+    const res = await firebaseManager.start();
+    const { text, extra } = buildDashboard();
+    await editOrReply(ctx, text, extra);
+    if (!res.ok) {
+      await ctx.reply('⚠️ Koi Firebase source nahi hai — pehle <b>🔥 FB Panel → ➕ Add Firebase (Bulk)</b> se DB URL daalo.', { parse_mode: 'HTML' });
+    }
+  });
+
+  bot.action('act_fb_stop', async (ctx) => {
+    await ctx.answerCbQuery('🛑 Stopping Firebase lanes...').catch(() => {});
+    if (firebaseManager) {
+      await firebaseManager.stop({ gracefulMs: 15_000, persistStopped: true });
+    }
+    const { text, extra } = buildDashboard();
+    await editOrReply(ctx, text, extra);
+  });
+
+  bot.action(/^fb_lanes_(\d+)$/, async (ctx) => {
+    const lanes = Math.max(1, Math.min(30, Number(ctx.match[1]) || 12));
+    db.setSetting('firebaseConcurrency', lanes);
+    await ctx.answerCbQuery(`⚡ Firebase lanes -> ${lanes}`).catch(() => {});
+    if (firebaseManager?.desiredRunning) {
+      await firebaseManager.stop({ gracefulMs: 8_000, persistStopped: false });
+      await firebaseManager.start();
+    }
+    const { text, extra } = buildFirebasePanelView();
+    await editOrReply(ctx, text, extra);
+  });
+
+  bot.action(/^fb_otp_(\d+)$/, async (ctx) => {
+    const ms = Number(ctx.match[1]) || 60_000;
+    db.setSetting('firebaseOtpTimeoutMs', ms);
+    await ctx.answerCbQuery(`⏱ Firebase OTP timeout -> ${ms / 1000}s`).catch(() => {});
+    const { text, extra } = buildFirebasePanelView();
+    await editOrReply(ctx, text, extra);
+  });
+
+  bot.action(/^fb_sources_page_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const { text, extra } = buildFirebaseSourcesPage(Number(ctx.match[1]));
+    await editOrReply(ctx, text, extra);
+  });
+
+  bot.action(/^fb_src_view_([a-zA-Z0-9_-]+)_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const { text, extra } = buildFirebaseSourceDetail(ctx.match[1], Number(ctx.match[2]));
+    await editOrReply(ctx, text, extra);
+  });
+
+  bot.action(/^fb_src_primary_([a-zA-Z0-9_-]+)_(\d+)$/, async (ctx) => {
+    const id = ctx.match[1];
+    const page = Number(ctx.match[2]);
+    const res = db.setPrimaryFirebaseSource(id);
+    if (res.ok) firebaseManager?.resetSourceRotation();
+    await ctx.answerCbQuery(res.ok ? '⭐ Set as First-Try source!' : `❌ ${res.error}`).catch(() => {});
+    const { text, extra } = buildFirebaseSourceDetail(id, page);
+    await editOrReply(ctx, text, extra);
+  });
+
+  bot.action(/^fb_src_verify_([a-zA-Z0-9_-]+)_(\d+)$/, async (ctx) => {
+    const id = ctx.match[1];
+    const page = Number(ctx.match[2]);
+    const src = db.getFirebaseSource(id);
+    if (!src) {
+      await ctx.answerCbQuery('❌ Source nahi mila').catch(() => {});
+      return;
+    }
+    await ctx.answerCbQuery('🧪 Verifying Firebase DB...').catch(() => {});
+    const v = await verifyFirebaseSource(src);
+    db.recordFirebaseSourceResult(id, v.ok ? { ok: true, ms: v.ms } : { ok: false, error: v.error, ms: v.ms });
+    const note = v.ok
+      ? `✅ <b>Reachable</b> (${v.ms}ms) · keys: <code>${esc((v.topKeys || []).join(', ') || 'empty')}</code>`
+      : `❌ <b>Verify Failed:</b> <code>${esc(v.error)}</code>`;
+    const { text, extra } = buildFirebaseSourceDetail(id, page, note);
+    await editOrReply(ctx, text, extra);
+  });
+
+  bot.action(/^fb_src_del_([a-zA-Z0-9_-]+)_(\d+)$/, async (ctx) => {
+    const id = ctx.match[1];
+    const page = Number(ctx.match[2]);
+    db.removeFirebaseSource(id);
+    firebaseManager?.resetSourceRotation();
+    await ctx.answerCbQuery('🗑 Firebase source deleted').catch(() => {});
+    const { text, extra } = buildFirebaseSourcesPage(page);
+    await editOrReply(ctx, text, extra);
+  });
+
+  bot.action('fb_src_add', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    chatModes.set(String(ctx.chat.id), { type: 'fb_add' });
+    await ctx.reply([
+      `➕ <b>ADD FIREBASE SOURCES (Bulk — up to 1000 URLs)</b>`,
+      ``,
+      `1 ya multiple Firebase Realtime DB URLs paste karo (ya <code>.txt</code> file bhejo):`,
+      `• <code>https://xxxx-default-rtdb.firebaseio.com</code>`,
+      `• <code>xxxx-default-rtdb.firebaseio.com</code> (https auto-add)`,
+      `• Auth secret ke sath: <code>https://xxxx.firebaseio.com | YOUR_DB_SECRET</code>`,
+      ``,
+      `<i>Cancel: /cancel</i>`,
+    ].join('\n'), { parse_mode: 'HTML' });
+  });
+
+  bot.action('fb_src_reset_health', async (ctx) => {
+    const count = db.resetFirebaseSourceHealth();
+    firebaseManager?.resetSourceRotation();
+    await ctx.answerCbQuery(`♻️ Reset health on ${count} Firebase source(s)`).catch(() => {});
+    const { text, extra } = buildFirebasePanelView();
+    await editOrReply(ctx, text, extra);
+  });
+
+  bot.action('fb_src_del_all_ask', async (ctx) => {
+    await ctx.answerCbQuery('Tap YES to delete ALL Firebase sources').catch(() => {});
+    const { text, extra } = buildFirebasePanelView({ confirmDeleteAll: true });
+    await editOrReply(ctx, text, extra);
+  });
+
+  bot.action('fb_src_del_all_yes', async (ctx) => {
+    if (firebaseManager?.desiredRunning) {
+      await firebaseManager.stop({ gracefulMs: 10_000, persistStopped: true });
+    }
+    const res = db.removeAllFirebaseSources();
+    await ctx.answerCbQuery(`🗑 Deleted ${res.removed} Firebase source(s)`).catch(() => {});
+    const { text, extra } = buildFirebasePanelView();
+    await editOrReply(ctx, text, extra);
+  });
+
   bot.action('act_import', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     chatModes.set(String(ctx.chat.id), { type: 'import' });
@@ -1131,18 +1582,40 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
     await ctx.reply(dash.text, dash.extra);
   }
 
+  // ── Shared Bulk Firebase URL Import Handler ────────────────────────────────
+  async function handleBulkFirebaseAddPayload(ctx, rawText) {
+    const res = db.addFirebaseSourcesBulk(rawText, { setFirstAsPrimary: false });
+    chatModes.delete(String(ctx.chat.id));
+    if (res.added.length > 0) {
+      firebaseManager?.resetSourceRotation();
+    }
+    const lines = [
+      `🔥 <b>FIREBASE SOURCES IMPORT</b>`,
+      `✅ Added: <b>${res.added.length}</b> · Total Active: <b>${res.total}</b>`,
+      res.duplicates.length ? `♻️ Already present: <b>${res.duplicates.length}</b>` : '',
+      res.invalid.length ? `❌ Invalid entries: <b>${res.invalid.length}</b>` : '',
+    ].filter(Boolean);
+    await ctx.reply(lines.join('\n'), { parse_mode: 'HTML' });
+    const panel = buildFirebasePanelView();
+    await ctx.reply(panel.text, panel.extra);
+  }
+
   // ── Text & Document Input Handler ──────────────────────────────────────────
   bot.on('document', async (ctx) => {
     const chatId = String(ctx.chat.id);
     const mode = chatModes.get(chatId);
-    if (mode?.type !== 'import') return;
+    if (mode?.type !== 'import' && mode?.type !== 'fb_add') return;
     try {
       const link = await ctx.telegram.getFileLink(ctx.message.document.file_id);
       const res = await fetch(String(link));
       const text = await res.text();
-      // Delete uploaded secret file message from chat
+      // Delete uploaded file message from chat (may contain sessions or DB secrets)
       await ctx.deleteMessage().catch(() => {});
-      await handleBulkImportPayload(ctx, text);
+      if (mode.type === 'fb_add') {
+        await handleBulkFirebaseAddPayload(ctx, text);
+      } else {
+        await handleBulkImportPayload(ctx, text);
+      }
     } catch (err) {
       await ctx.reply(`❌ File read error: <code>${esc(err?.message || err)}</code>`, { parse_mode: 'HTML' });
     }
@@ -1167,6 +1640,14 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
       // Immediately delete user's StringSession message from Telegram chat!
       await ctx.deleteMessage().catch(() => {});
       await handleBulkImportPayload(ctx, text);
+      return;
+    }
+
+    if (mode.type === 'fb_add') {
+      if (text.includes('|') || /[?&]auth=/i.test(text)) {
+        await ctx.deleteMessage().catch(() => {});
+      }
+      await handleBulkFirebaseAddPayload(ctx, text);
       return;
     }
 

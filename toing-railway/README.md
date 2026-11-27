@@ -43,6 +43,16 @@ Lightweight standalone Railway deployment built purely for **high-throughput, co
 
 ---
 
+## 🔥 Firebase Fresh-Only mode
+
+Firebase mode is **OFF by default**. Toggle it on from the dashboard or use `/firebase` (`/fb`) to manage sources and start the engine. When running, it checks each number first and skips already-registered numbers without sending an OTP; only confirmed fresh numbers proceed to Firebase inbox polling, verification, export and the usual delivery queue. When switched off, the existing Telegram-slot mode remains in use and sends OTPs to both fresh and registered numbers by default.
+
+The Firebase panel supports source verification, bulk addition (`URL|auth` per line or a `.txt` file), primary selection, health reset, deletion, lane count and OTP timeout. Firebase auth values are encrypted in SQLite with `VAULT_ENCRYPTION_KEY`. Use only Firebase pools and inboxes you are authorized to access. Built-in source URLs are seeded at startup; individual removals and Delete All are remembered across restarts. The service does not need Telegram MTProto spare accounts in Firebase mode, but still needs its Telegram control bot and a delivery chat.
+
+Optional environment defaults are documented in `.env.example`: `FIREBASE_MODE`, `FIREBASE_CONCURRENCY`, `FIREBASE_OTP_TIMEOUT_MS`, `FIREBASE_ACTIVE_WINDOW_MS`, `FIREBASE_DB_URL`, `FIREBASE_DB_AUTH`, and `FIREBASE_DB_URLS`. Settings changed in the Telegram UI persist in SQLite and take precedence over environment defaults.
+
+---
+
 ## 👥 Adding 20–50 Spare Telegram Accounts
 
 Inside your Telegram bot:

@@ -67,9 +67,13 @@ export class DeliveryWorker {
     const buffer = Buffer.from(String(item.raw_json || '{}'), 'utf8');
     const filename = String(item.file_name || `toing-${item.phone}.json`);
     const tag = item.is_new ? '🆕 Fresh' : '♻️ Existing';
+    const isFirebase = String(item.otp_bot || '').toLowerCase().startsWith('firebase');
+    const sourceLine = isFirebase
+      ? `📱 <code>${escHtml(item.phone)}</code> · 🔥 FB-Lane #${Math.abs(Number(item.slot_id || 0)) || '?'} (${escHtml(item.otp_bot)})`
+      : `📱 <code>${escHtml(item.phone)}</code> · Slot #${item.slot_no || item.slot_id || '?'} (${escHtml(item.otp_bot || 'otp')})`;
     const caption = [
       `🌐 <b>TOING PRO</b> · ${tag}`,
-      `📱 <code>${escHtml(item.phone)}</code> · Slot #${item.slot_no || item.slot_id || '?'} (${escHtml(item.otp_bot || 'otp')})`,
+      sourceLine,
       item.name ? `👤 ${escHtml(item.name)}` : '',
     ].filter(Boolean).join('\n');
 
