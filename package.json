@@ -18,7 +18,9 @@
     "telegram:audit": "node scratch/telegram-audit.mjs"
   },
   "dependencies": {
-    "dotenv": "^16.4.7",
+    "axios": "^1.21.1",
+    "better-sqlite3": "^13.2.0",
+    "dotenv": "^16.6.1",
     "input": "^1.0.1",
     "puppeteer-core": "^25.18.1",
     "puppeteer-real-browser": "^1.4.4",
