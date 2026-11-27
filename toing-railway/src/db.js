@@ -1,9 +1,25 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { encryptSecret, decryptSecret, resolveMasterKey, sessionFingerprint } from './crypto.js';
 import { normalizePhone10 } from './otp-parser.js';
 import { normalizeOtpBotProfileId } from './otp-profiles.js';
+import {
+  MAX_BULK_FIREBASE_SOURCES,
+  builtinSourceName,
+  normalizeSourceUrl,
+  parseFirebaseSourceBulkInput,
+  validateFirebaseSourceInput,
+} from './firebase-client.js';
+import {
+  BUILTIN_FIREBASE_SEED_VERSION,
+  BUILTIN_FIREBASE_SOURCE_URLS,
+  DEFAULT_FIREBASE_URL,
+} from './firebase-seed-urls.js';
+
+export const FIREBASE_FAIL_THRESHOLD = 2;
+export const FIREBASE_QUARANTINE_MS = 30 * 60_000;
 
 export class ToingDb {
   constructor({ dbPath, dataDir, encryptionKey = '', sessionsDir = '' } = {}) {
@@ -142,6 +158,35 @@ export class ToingDb {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_number_events_created ON number_events(created_at DESC);
+
+      CREATE TABLE IF NOT EXISTS firebase_sources (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        url TEXT UNIQUE NOT NULL,
+        auth_enc TEXT NOT NULL DEFAULT '',
+        clients_path TEXT NOT NULL DEFAULT 'clients',
+        messages_path TEXT NOT NULL DEFAULT 'messages',
+        numbers_path TEXT NOT NULL DEFAULT '',
+        sms_path TEXT NOT NULL DEFAULT 'sms',
+        otp_path TEXT NOT NULL DEFAULT 'otp',
+        is_primary INTEGER NOT NULL DEFAULT 0,
+        builtin INTEGER NOT NULL DEFAULT 0,
+        ok_count INTEGER NOT NULL DEFAULT 0,
+        fail_count INTEGER NOT NULL DEFAULT 0,
+        fail_streak INTEGER NOT NULL DEFAULT 0,
+        empty_streak INTEGER NOT NULL DEFAULT 0,
+        last_ok_at INTEGER NOT NULL DEFAULT 0,
+        last_fail_at INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT '',
+        latency_ms INTEGER NOT NULL DEFAULT 0,
+        quarantined_until INTEGER NOT NULL DEFAULT 0,
+        added_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS firebase_deleted_urls (
+        url_key TEXT PRIMARY KEY,
+        deleted_at INTEGER NOT NULL
+      );
     `);
   }
 
@@ -568,6 +613,11 @@ export class ToingDb {
     return Number(res.changes || 0);
   }
 
+  clearTelegramActiveClaims() {
+    const res = this.db.prepare('DELETE FROM active_claims WHERE slot_id > 0').run();
+    return Number(res.changes || 0);
+  }
+
   getUsedNumber(rawPhone) {
     const phone = normalizePhone10(rawPhone);
     if (!phone) return null;
@@ -584,11 +634,14 @@ export class ToingDb {
     };
   }
 
-  isPhoneBlocked(rawPhone, now = Date.now()) {
+  isPhoneBlocked(rawPhone, now = Date.now(), { ignoreAlreadyRegistered = false } = {}) {
     const phone = normalizePhone10(rawPhone);
     if (!phone) return true;
-    const used = this.db.prepare('SELECT cooldown_until FROM used_numbers WHERE phone = ?').get(phone);
-    if (used && Number(used.cooldown_until) > now) return true;
+    const used = this.db.prepare('SELECT cooldown_until, status FROM used_numbers WHERE phone = ?').get(phone);
+    if (used && Number(used.cooldown_until) > now) {
+      const allowBypass = Boolean(ignoreAlreadyRegistered) && used.status === 'already_registered';
+      if (!allowBypass) return true;
+    }
     const claim = this.db.prepare('SELECT expires_at FROM active_claims WHERE phone = ?').get(phone);
     if (claim && Number(claim.expires_at) > now) return true;
     return false;
@@ -1009,6 +1062,391 @@ export class ToingDb {
       usedActive,
       activeClaims,
     };
+  }
+
+  // ── Firebase Realtime DB Sources (Multi-Source Pool + Health Quarantine) ──
+  _hydrateFirebaseRow(row) {
+    if (!row) return null;
+    let auth = '';
+    if (row.auth_enc) {
+      try {
+        auth = decryptSecret(row.auth_enc, this.masterKey);
+      } catch {
+        auth = '';
+      }
+    }
+    return {
+      id: String(row.id),
+      name: String(row.name || ''),
+      url: String(row.url || ''),
+      auth,
+      hasAuth: Boolean(auth),
+      clientsPath: String(row.clients_path || 'clients'),
+      messagesPath: String(row.messages_path || 'messages'),
+      numbersPath: String(row.numbers_path || ''),
+      smsPath: String(row.sms_path || 'sms'),
+      otpPath: String(row.otp_path || 'otp'),
+      primary: Boolean(row.is_primary),
+      builtin: Boolean(row.builtin),
+      okCount: Number(row.ok_count || 0),
+      failCount: Number(row.fail_count || 0),
+      failStreak: Number(row.fail_streak || 0),
+      emptyStreak: Number(row.empty_streak || 0),
+      lastOkAt: Number(row.last_ok_at || 0),
+      lastFailAt: Number(row.last_fail_at || 0),
+      lastError: String(row.last_error || ''),
+      latencyMs: Number(row.latency_ms || 0),
+      quarantinedUntil: Number(row.quarantined_until || 0),
+      addedAt: Number(row.added_at || 0),
+    };
+  }
+
+  _newFirebaseSourceId() {
+    for (let i = 0; i < 10; i++) {
+      const id = crypto.randomUUID().slice(0, 8);
+      const exists = this.db.prepare('SELECT 1 FROM firebase_sources WHERE id = ?').get(id);
+      if (!exists) return id;
+    }
+    return crypto.randomUUID().slice(0, 12);
+  }
+
+  seedFirebaseSources({
+    builtinUrls = BUILTIN_FIREBASE_SOURCE_URLS,
+    envUrls = [],
+    defaultUrl = DEFAULT_FIREBASE_URL,
+    defaultAuth = '',
+    seedVersion = BUILTIN_FIREBASE_SEED_VERSION,
+  } = {}) {
+    const cleared = Boolean(this.getSetting('firebaseSourcesCleared', false));
+    const currentSeedVer = Number(this.getSetting('firebaseSeedVersion', 0)) || 0;
+    const shouldSeedBuiltin = !cleared && currentSeedVer < seedVersion;
+
+    const deletedRows = this.db.prepare('SELECT url_key FROM firebase_deleted_urls').all();
+    const deletedSet = new Set(deletedRows.map((r) => String(r.url_key || '')));
+
+    const existingRows = this.db.prepare('SELECT id, url, is_primary FROM firebase_sources').all();
+    const existingKeys = new Set(existingRows.map((r) => normalizeSourceUrl(r.url)));
+    let hasPrimary = existingRows.some((r) => Number(r.is_primary) === 1);
+
+    const candidates = [];
+    if (!cleared && existingRows.length === 0 && defaultUrl) {
+      candidates.push({ url: defaultUrl, auth: defaultAuth, builtin: true, preferredPrimary: true });
+    }
+    if (shouldSeedBuiltin) {
+      for (const u of builtinUrls || []) {
+        candidates.push({ url: u, auth: '', builtin: true, preferredPrimary: false });
+      }
+    }
+    for (const item of envUrls || []) {
+      if (typeof item === 'string') {
+        candidates.push({ url: item, auth: '', builtin: false, preferredPrimary: false });
+      } else if (item && item.url) {
+        candidates.push({ url: item.url, auth: item.auth || '', builtin: false, preferredPrimary: false });
+      }
+    }
+
+    let added = 0;
+    const now = Date.now();
+    this.withTransaction(() => {
+      const ins = this.db.prepare(`
+        INSERT OR IGNORE INTO firebase_sources (
+          id, name, url, auth_enc, clients_path, messages_path, numbers_path, sms_path, otp_path,
+          is_primary, builtin, added_at
+        ) VALUES (?, ?, ?, ?, 'clients', 'messages', '', 'sms', 'otp', ?, ?, ?)
+      `);
+
+      for (const c of candidates) {
+        const v = validateFirebaseSourceInput(c);
+        if (!v.ok) continue;
+        const key = normalizeSourceUrl(v.src.url);
+        if (!key || existingKeys.has(key) || deletedSet.has(key)) continue;
+        const isPrimary = (!hasPrimary && (c.preferredPrimary || added === 0)) ? 1 : 0;
+        if (isPrimary) hasPrimary = true;
+        const authEnc = v.src.auth ? encryptSecret(v.src.auth, this.masterKey) : '';
+        ins.run(
+          this._newFirebaseSourceId(),
+          v.src.name,
+          v.src.url,
+          authEnc,
+          isPrimary,
+          c.builtin ? 1 : 0,
+          now
+        );
+        existingKeys.add(key);
+        added += 1;
+      }
+
+      if (!hasPrimary) {
+        const first = this.db.prepare('SELECT id FROM firebase_sources ORDER BY added_at ASC, rowid ASC LIMIT 1').get();
+        if (first) {
+          this.db.prepare('UPDATE firebase_sources SET is_primary = 1 WHERE id = ?').run(first.id);
+        }
+      }
+    });
+
+    if (shouldSeedBuiltin) {
+      this.setSetting('firebaseSeedVersion', seedVersion);
+    }
+
+    const total = Number(this.db.prepare('SELECT COUNT(*) AS c FROM firebase_sources').get()?.c || 0);
+    return { added, total, skippedByClear: cleared };
+  }
+
+  listFirebaseSources() {
+    const rows = this.db.prepare(`
+      SELECT * FROM firebase_sources
+      ORDER BY is_primary DESC, rowid ASC
+    `).all();
+    return rows.map((r) => this._hydrateFirebaseRow(r));
+  }
+
+  // Health-ranked run order (exact workwr rule):
+  //   tier 0 = proven live (last_ok_at > 0 && not quarantined)
+  //   tier 1 = never tried / untested (not quarantined)
+  //   tier 2 = quarantined (tried last so dead DBs never slow down fresh runs)
+  // Primary source comes first within its tier!
+  listFirebaseRunSources(now = Date.now()) {
+    const all = this.listFirebaseSources();
+    const rankOf = (s) => {
+      if (Number(s.quarantinedUntil) > now) return 2;
+      if (Number(s.lastOkAt) > 0) return 0;
+      return 1;
+    };
+    return all
+      .map((s, idx) => ({ s, idx, rank: rankOf(s) }))
+      .sort((a, b) => (a.rank - b.rank) || ((b.s.primary ? 1 : 0) - (a.s.primary ? 1 : 0)) || (a.idx - b.idx))
+      .map((x) => x.s);
+  }
+
+  getFirebaseSource(id) {
+    const row = this.db.prepare('SELECT * FROM firebase_sources WHERE id = ?').get(String(id || ''));
+    return this._hydrateFirebaseRow(row);
+  }
+
+  getFirebaseHealthSummary(now = Date.now()) {
+    const rows = this.db.prepare(`
+      SELECT ok_count, fail_count, last_ok_at, quarantined_until FROM firebase_sources
+    `).all();
+    let live = 0;
+    let quarantined = 0;
+    let failed = 0;
+    let neverTried = 0;
+    for (const r of rows) {
+      if (Number(r.quarantined_until) > now) quarantined += 1;
+      else if (Number(r.fail_count) > 0 && !Number(r.ok_count)) failed += 1;
+      else if (!Number(r.ok_count) && !Number(r.fail_count)) neverTried += 1;
+      else live += 1;
+    }
+    return { total: rows.length, live, failed, quarantined, neverTried };
+  }
+
+  addFirebaseSourcesBulk(rawInput, { setFirstAsPrimary = false } = {}) {
+    let parsed = { entries: [], invalid: [] };
+    if (typeof rawInput === 'string') {
+      parsed = parseFirebaseSourceBulkInput(rawInput);
+    } else if (Array.isArray(rawInput)) {
+      for (const item of rawInput) {
+        if (typeof item === 'string') {
+          const one = parseFirebaseSourceBulkInput(item);
+          parsed.entries.push(...one.entries);
+          parsed.invalid.push(...one.invalid);
+        } else if (item && typeof item === 'object') {
+          parsed.entries.push(item);
+        }
+      }
+    }
+
+    const requested = parsed.entries.length + parsed.invalid.length;
+    const invalid = [...parsed.invalid];
+    const candidates = parsed.entries.slice(0, MAX_BULK_FIREBASE_SOURCES);
+    for (const extra of parsed.entries.slice(MAX_BULK_FIREBASE_SOURCES)) {
+      invalid.push({
+        input: String(extra?.url || '').slice(0, 100),
+        error: `ek baar me max ${MAX_BULK_FIREBASE_SOURCES} Firebase add ho sakte hain`,
+      });
+    }
+
+    const existingRows = this.db.prepare('SELECT id, url FROM firebase_sources').all();
+    const byUrl = new Map(existingRows.map((r) => [normalizeSourceUrl(r.url), r]));
+    const added = [];
+    const duplicates = [];
+    const now = Date.now();
+
+    this.withTransaction(() => {
+      const ins = this.db.prepare(`
+        INSERT INTO firebase_sources (
+          id, name, url, auth_enc, clients_path, messages_path, numbers_path, sms_path, otp_path,
+          is_primary, builtin, added_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+      `);
+      const delRemoved = this.db.prepare('DELETE FROM firebase_deleted_urls WHERE url_key = ?');
+
+      for (const c of candidates) {
+        const v = validateFirebaseSourceInput(c || {});
+        if (!v.ok) {
+          invalid.push({ input: String(c?.url || '').slice(0, 100), error: v.error });
+          continue;
+        }
+        const key = normalizeSourceUrl(v.src.url);
+        if (byUrl.has(key)) {
+          duplicates.push({ id: byUrl.get(key).id, url: v.src.url });
+          continue;
+        }
+        const id = this._newFirebaseSourceId();
+        const authEnc = v.src.auth ? encryptSecret(v.src.auth, this.masterKey) : '';
+        ins.run(
+          id,
+          v.src.name,
+          v.src.url,
+          authEnc,
+          v.src.clientsPath,
+          v.src.messagesPath,
+          v.src.numbersPath,
+          v.src.smsPath,
+          v.src.otpPath,
+          now
+        );
+        delRemoved.run(key);
+        byUrl.set(key, { id, url: v.src.url });
+        added.push({ id, name: v.src.name, url: v.src.url });
+      }
+
+      if (added.length) {
+        const hasPrimary = this.db.prepare('SELECT 1 FROM firebase_sources WHERE is_primary = 1 LIMIT 1').get();
+        if (setFirstAsPrimary || !hasPrimary) {
+          this.db.prepare('UPDATE firebase_sources SET is_primary = 0').run();
+          this.db.prepare('UPDATE firebase_sources SET is_primary = 1 WHERE id = ?').run(added[0].id);
+        }
+      }
+    });
+
+    if (added.length) {
+      this.setSetting('firebaseSourcesCleared', false);
+    }
+
+    const total = Number(this.db.prepare('SELECT COUNT(*) AS c FROM firebase_sources').get()?.c || 0);
+    return {
+      ok: added.length > 0,
+      added,
+      duplicates,
+      invalid,
+      requested,
+      total,
+    };
+  }
+
+  setPrimaryFirebaseSource(id) {
+    const existing = this.db.prepare('SELECT id FROM firebase_sources WHERE id = ?').get(String(id || ''));
+    if (!existing) return { ok: false, error: 'Source nahi mila.' };
+    this.withTransaction(() => {
+      this.db.prepare('UPDATE firebase_sources SET is_primary = 0').run();
+      this.db.prepare('UPDATE firebase_sources SET is_primary = 1 WHERE id = ?').run(existing.id);
+    });
+    return { ok: true, source: this.getFirebaseSource(existing.id) };
+  }
+
+  removeFirebaseSource(id) {
+    const row = this.db.prepare('SELECT id, url, is_primary FROM firebase_sources WHERE id = ?').get(String(id || ''));
+    if (!row) return { ok: false, error: 'Source nahi mila.' };
+    const now = Date.now();
+    this.withTransaction(() => {
+      this.db.prepare('DELETE FROM firebase_sources WHERE id = ?').run(row.id);
+      const key = normalizeSourceUrl(row.url);
+      if (key) {
+        this.db.prepare('INSERT OR REPLACE INTO firebase_deleted_urls (url_key, deleted_at) VALUES (?, ?)').run(key, now);
+      }
+      if (Number(row.is_primary) === 1) {
+        const next = this.db.prepare('SELECT id FROM firebase_sources ORDER BY added_at ASC, rowid ASC LIMIT 1').get();
+        if (next) this.db.prepare('UPDATE firebase_sources SET is_primary = 1 WHERE id = ?').run(next.id);
+      }
+    });
+    return { ok: true };
+  }
+
+  removeAllFirebaseSources(extraKnownUrls = BUILTIN_FIREBASE_SOURCE_URLS) {
+    const existing = this.db.prepare('SELECT url FROM firebase_sources').all();
+    const now = Date.now();
+    const urls = new Set();
+    for (const r of existing) urls.add(normalizeSourceUrl(r.url));
+    for (const u of extraKnownUrls || []) urls.add(normalizeSourceUrl(u));
+    urls.add(normalizeSourceUrl(DEFAULT_FIREBASE_URL));
+    urls.delete('');
+
+    this.withTransaction(() => {
+      this.db.prepare('DELETE FROM firebase_sources').run();
+      const insDel = this.db.prepare('INSERT OR REPLACE INTO firebase_deleted_urls (url_key, deleted_at) VALUES (?, ?)');
+      for (const key of urls) insDel.run(key, now);
+    });
+    this.setSetting('firebaseSourcesCleared', true);
+    this.setSetting('firebaseSeedVersion', BUILTIN_FIREBASE_SEED_VERSION);
+    return { ok: true, removed: existing.length, remembered: urls.size };
+  }
+
+  recordFirebaseSourceResult(id, { ok = false, error = '', ms = 0, empty = false, now = Date.now() } = {}) {
+    if (!id) return null;
+    const row = this.db.prepare('SELECT * FROM firebase_sources WHERE id = ?').get(String(id));
+    if (!row) return null;
+
+    let okCount = Number(row.ok_count || 0);
+    let failCount = Number(row.fail_count || 0);
+    let failStreak = Number(row.fail_streak || 0);
+    let emptyStreak = Number(row.empty_streak || 0);
+    let lastOkAt = Number(row.last_ok_at || 0);
+    let lastFailAt = Number(row.last_fail_at || 0);
+    let lastError = String(row.last_error || '');
+    let latencyMs = Number(row.latency_ms || 0);
+    let quarantinedUntil = Number(row.quarantined_until || 0);
+
+    if (ok) {
+      okCount += 1;
+      failStreak = 0;
+      emptyStreak = 0;
+      lastOkAt = now;
+      lastError = '';
+      if (Number(ms) > 0) latencyMs = Math.round(Number(ms));
+      quarantinedUntil = 0;
+    } else {
+      failCount += 1;
+      lastFailAt = now;
+      lastError = String(error || (empty ? 'khali pool' : 'fail')).slice(0, 160);
+      if (empty) {
+        emptyStreak += 1;
+        failStreak = 0;
+        if (emptyStreak >= FIREBASE_FAIL_THRESHOLD) quarantinedUntil = now + FIREBASE_QUARANTINE_MS;
+      } else {
+        failStreak += 1;
+        emptyStreak = 0;
+        if (failStreak >= FIREBASE_FAIL_THRESHOLD) quarantinedUntil = now + FIREBASE_QUARANTINE_MS;
+      }
+    }
+
+    this.db.prepare(`
+      UPDATE firebase_sources
+      SET ok_count = ?, fail_count = ?, fail_streak = ?, empty_streak = ?,
+          last_ok_at = ?, last_fail_at = ?, last_error = ?, latency_ms = ?, quarantined_until = ?
+      WHERE id = ?
+    `).run(okCount, failCount, failStreak, emptyStreak, lastOkAt, lastFailAt, lastError, latencyMs, quarantinedUntil, row.id);
+
+    return this.getFirebaseSource(row.id);
+  }
+
+  resetFirebaseSourceHealth(ids = null) {
+    if (!ids) {
+      const res = this.db.prepare(`
+        UPDATE firebase_sources
+        SET fail_streak = 0, empty_streak = 0, fail_count = 0, last_error = '', quarantined_until = 0
+      `).run();
+      return Number(res.changes || 0);
+    }
+    const list = [].concat(ids).map((x) => String(x || '')).filter(Boolean);
+    if (!list.length) return 0;
+    const placeholders = list.map(() => '?').join(', ');
+    const res = this.db.prepare(`
+      UPDATE firebase_sources
+      SET fail_streak = 0, empty_streak = 0, fail_count = 0, last_error = '', quarantined_until = 0
+      WHERE id IN (${placeholders})
+    `).run(...list);
+    return Number(res.changes || 0);
   }
 }
 

@@ -91,6 +91,18 @@ export function loadConfig(env = process.env) {
     autoResume: envBool(env, 'AUTO_RESUME', true),
     targetAccountsPerMin: envInt(env, 'TARGET_ACCOUNTS_PER_MIN', 20, 1, 500),
 
+    // Firebase Fresh-Only Mode (toggleable ON/OFF from Telegram UI / /firebase)
+    firebaseMode: envBool(env, 'FIREBASE_MODE', false),
+    firebaseConcurrency: envInt(env, 'FIREBASE_CONCURRENCY', 12, 1, 30),
+    firebaseOtpTimeoutMs: envInt(env, 'FIREBASE_OTP_TIMEOUT_MS', 60_000, 15_000, 180_000),
+    firebaseActiveWindowMs: envInt(env, 'FIREBASE_ACTIVE_WINDOW_MS', 60_000, 10_000, 600_000),
+    firebaseDbUrl: String(env.FIREBASE_DB_URL || '').trim(),
+    firebaseDbAuth: String(env.FIREBASE_DB_AUTH || '').trim(),
+    firebaseDbUrlsRaw: ['FIREBASE_DB_URLS', 'FIREBASE_URLS', 'FIREBASE_DB_URL_LIST']
+      .map((k) => String(env[k] || '').trim())
+      .filter(Boolean)
+      .join('\n'),
+
     port: envInt(env, 'PORT', 3000, 1, 65535),
   };
 }

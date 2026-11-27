@@ -72,6 +72,7 @@ export class SlotManager {
   }
 
   async startAll() {
+    if (this.getRuntimeConfig().firebaseMode) return { started: 0, totalEnabled: 0, reason: 'firebase_mode' };
     if (this._startingAll) return { started: 0, alreadyStarting: true };
     this._startingAll = true;
     this.desiredRunning = true;
@@ -140,11 +141,13 @@ export class SlotManager {
     }
     await Promise.all(stops);
     this.workers.clear();
-    this.db.clearAllActiveClaims();
+    // Firebase lanes use negative IDs; stopping Telegram must not unlock them.
+    this.db.clearTelegramActiveClaims();
     return { stopped: stops.length };
   }
 
   async startSlot(accountId) {
+    if (this.getRuntimeConfig().firebaseMode) return { ok: false, reason: 'firebase_mode' };
     const acc = this.db.getAccountById(accountId, { includeSession: true });
     if (!acc) return { ok: false, reason: 'not_found' };
     if (!acc.session) return { ok: false, reason: acc.decryptError || 'empty_session' };

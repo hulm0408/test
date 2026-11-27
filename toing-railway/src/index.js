@@ -5,6 +5,8 @@ import { loadConfig } from './config.js';
 import { ToingDb, bootstrapEnvSessions } from './db.js';
 import { ToingClient } from './toing-client.js';
 import { SlotManager } from './slot-manager.js';
+import { FirebaseManager } from './firebase-manager.js';
+import { parseFirebaseSourceBulkInput } from './firebase-client.js';
 import { DeliveryWorker } from './delivery-worker.js';
 import { startHealthServer } from './health-server.js';
 import { registerBotUi } from './bot-ui.js';
@@ -46,8 +48,19 @@ async function main() {
     maxSlots: baseConfig.maxSlots,
   });
 
+  // Seed built-in ROLEX VIP Firebase Realtime DB list + any env FIREBASE_DB_URLS (respects Delete All)
+  const envFbUrls = baseConfig.firebaseDbUrlsRaw
+    ? parseFirebaseSourceBulkInput(baseConfig.firebaseDbUrlsRaw).entries
+    : [];
+  const fbSeedRes = db.seedFirebaseSources({
+    envUrls: envFbUrls,
+    defaultUrl: baseConfig.firebaseDbUrl || undefined,
+    defaultAuth: baseConfig.firebaseDbAuth || '',
+  });
+
   console.log(`[Boot] SQLite WAL ready at ${baseConfig.dbPath} (encryption=${db.keySource})`);
   console.log(`[Boot] Seeded used numbers: ${seedRes.skippedByUser ? `skipped (cleared by owner, purged=${seedRes.purged || 0})` : `added=${seedRes.added}, kept=${seedRes.kept}, expired=${seedRes.expired}`} | cleared stale claims=${clearedClaims}`);
+  console.log(`[Boot] Firebase sources ready: total=${fbSeedRes.total} (added=${fbSeedRes.added}${fbSeedRes.skippedByClear ? ', cleared by owner' : ''})`);
   if (envBoot.added > 0) {
     console.log(`[Boot] Bootstrapped ${envBoot.added} TG spare account(s) from env`);
   }
@@ -71,6 +84,10 @@ async function main() {
       otpTimeoutCooldownMin: s.otpTimeoutCooldownMin !== undefined ? Number(s.otpTimeoutCooldownMin) : baseConfig.otpTimeoutCooldownMin,
       deliveryChatId: String(s.deliveryChatId || baseConfig.deliveryChatId || baseConfig.primaryOwnerId || ''),
       autoResume: s.autoResume !== undefined ? Boolean(s.autoResume) : baseConfig.autoResume,
+      firebaseMode: s.firebaseMode !== undefined ? Boolean(s.firebaseMode) : baseConfig.firebaseMode,
+      firebaseConcurrency: Number(s.firebaseConcurrency) || baseConfig.firebaseConcurrency,
+      firebaseOtpTimeoutMs: Number(s.firebaseOtpTimeoutMs) || baseConfig.firebaseOtpTimeoutMs,
+      firebaseActiveWindowMs: Number(s.firebaseActiveWindowMs) || baseConfig.firebaseActiveWindowMs,
     };
   };
 
@@ -94,7 +111,7 @@ async function main() {
     await bot.telegram.sendMessage(target, html, { parse_mode: 'HTML' }).catch(() => {});
   };
 
-  // 4. 50-Slot Parallel Manager
+  // 4. 50-Slot Parallel Manager (Telegram OTP Bots)
   const slotManager = new SlotManager({
     db,
     toingClient,
@@ -106,6 +123,16 @@ async function main() {
       const icon = severity === 'dead' ? '⛔' : '⏳';
       console.warn(`[SlotAlert] #${slotNo} (${label}) ${code}: ${message}`);
       sendOwnerAlert(`${icon} <b>Slot #${slotNo} (${label})</b> — <code>${code}</code>\n<i>Baaki slots uninterrupted chal rahe hain.</i>`);
+    },
+  });
+
+  // 4b. Parallel Firebase Fresh-Only Manager (Already-Registered Auto-Skip + Firebase OTP)
+  const firebaseManager = new FirebaseManager({
+    db,
+    toingClient,
+    getRuntimeConfig,
+    onSignupSuccess: ({ laneNo, phone, sourceName, durationMs }) => {
+      console.log(`[Toing OK] 🔥 FB-Lane #${laneNo} | ${phone} | NEW | ${(durationMs / 1000).toFixed(1)}s | src=${sourceName}`);
     },
   });
 
@@ -132,12 +159,16 @@ async function main() {
     },
   });
 
-  registerBotUi({ bot, db, slotManager, toingClient, getRuntimeConfig });
+  registerBotUi({ bot, db, slotManager, firebaseManager, toingClient, getRuntimeConfig });
 
   // 6. Start HTTP /health server immediately so Railway marks deployment healthy
   const healthServer = await startHealthServer({
     port: baseConfig.port,
-    getHealthSnapshot: () => slotManager.getDashboardSnapshot(),
+    getHealthSnapshot: () => ({
+      mode: getRuntimeConfig().firebaseMode ? 'firebase' : 'telegram',
+      ...slotManager.getDashboardSnapshot(),
+      firebase: firebaseManager.getSnapshot(),
+    }),
   });
   console.log(`[Health] Listening on http://0.0.0.0:${baseConfig.port}/health`);
 
@@ -151,15 +182,20 @@ async function main() {
       console.error('[Bot] Telegraf launch error:', err?.message || err);
     });
 
-  // 9. Auto-resume slots if cluster was running before Railway restart/redeploy
+  // 9. Auto-resume active mode if cluster was running before Railway restart/redeploy
   const cfgNow = getRuntimeConfig();
   const wasRunning = db.getSetting('running', false);
   const accountCount = db.listAccounts({ onlyEnabled: true }).length;
-  if (cfgNow.autoResume && wasRunning && accountCount > 0) {
-    console.log(`[Boot] Auto-resuming ${accountCount} enabled slot(s)...`);
-    slotManager.startAll().catch((err) => console.warn('[Boot] Auto-resume error:', err?.message || err));
+  if (cfgNow.autoResume && wasRunning) {
+    if (cfgNow.firebaseMode) {
+      console.log(`[Boot] Auto-resuming 🔥 Firebase Fresh-Only Mode (${cfgNow.firebaseConcurrency} lanes)...`);
+      firebaseManager.start().catch((err) => console.warn('[Boot] Firebase auto-resume error:', err?.message || err));
+    } else if (accountCount > 0) {
+      console.log(`[Boot] Auto-resuming ${accountCount} enabled slot(s)...`);
+      slotManager.startAll().catch((err) => console.warn('[Boot] Auto-resume error:', err?.message || err));
+    }
   } else {
-    console.log(`[Boot] Ready with ${accountCount} enabled slot(s). Send /start in Telegram to launch.`);
+    console.log(`[Boot] Ready (mode=${cfgNow.firebaseMode ? 'firebase' : 'telegram'}, slots=${accountCount}, fbSources=${fbSeedRes.total}). Send /start in Telegram to launch.`);
   }
 
   // 10. Graceful shutdown (Railway SIGTERM gives 30s)
@@ -169,7 +205,10 @@ async function main() {
     shuttingDown = true;
     console.log(`[Shutdown] Received ${signal} — draining active verify/exports & deliveries...`);
     try {
-      await slotManager.stopAll({ gracefulMs: 18_000, persistStopped: false });
+      await Promise.allSettled([
+        slotManager.stopAll({ gracefulMs: 18_000, persistStopped: false }),
+        firebaseManager.stop({ gracefulMs: 18_000, persistStopped: false }),
+      ]);
     } catch {}
     try {
       await deliveryWorker.stop({ drainMs: 5_000 });
