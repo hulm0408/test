@@ -9,7 +9,7 @@
   },
   "scripts": {
     "start": "node --no-warnings=ExperimentalWarning src/index.js",
-    "test": "node --no-warnings=ExperimentalWarning --test test/toing-railway.test.mjs"
+    "test": "node --no-warnings=ExperimentalWarning --test test/*.test.mjs"
   },
   "dependencies": {
     "dotenv": "^16.4.7",

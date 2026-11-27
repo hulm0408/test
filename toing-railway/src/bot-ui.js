@@ -9,6 +9,8 @@ import {
   loginQrSession,
 } from './telegram-slot-client.js';
 import { verifyFirebaseSource } from './firebase-client.js';
+import { REPORT_FILE, REPORT_KEY, formatPresenceReport, parsePresenceReport } from './firebase-presence-report.js';
+import { readTextDocument } from './telegram-text-document.js';
 import { parseCsvList } from './config.js';
 
 function esc(s = '') {
@@ -25,7 +27,7 @@ function fmtDuration(sec = 0) {
   return `${s}s`;
 }
 
-export function registerBotUi({ bot, db, slotManager, firebaseManager = null, toingClient, getRuntimeConfig }) {
+export function registerBotUi({ bot, db, slotManager, firebaseManager = null, toingClient, getRuntimeConfig, fetchImpl = fetch }) {
   // Per-chat interactive state (import prompt / phone login flow / setkey prompt / fb_add prompt)
   const chatModes = new Map(); // chatId -> { type: 'import'|'setkey'|'login'|'fb_add', ... }
 
@@ -101,6 +103,7 @@ export function registerBotUi({ bot, db, slotManager, firebaseManager = null, to
       health: db.getFirebaseHealthSummary(),
     };
     const fbMode = Boolean(cfg.firebaseMode);
+    const presenceLine = formatPresenceReport(db.getSetting(REPORT_KEY));
     const t = snap.throughput;
     const d = snap.delivery;
 
@@ -134,7 +137,8 @@ export function registerBotUi({ bot, db, slotManager, firebaseManager = null, to
         `🚫 <b>Already-Registered Auto-Skip:</b> <b>ON ✅</b> (run skipped: <code>${fbSnap.skippedRegisteredInRun}</code> · 5m: <code>${t.alreadyRegistered5m || 0}</code>)`,
         `🔍 <b>5m Drops:</b> ⏱ OTP Timeout <code>${t.timeouts5m || 0}</code> · ❌ Fail <code>${(t.sendFails5m || 0) + (t.verifyFails5m || 0) + (t.checkFails5m || 0)}</code>`,
         ``,
-        `🔥 <b>Firebase Sources:</b> <code>${fbSnap.health.total}</code> total (🟢 ${fbSnap.health.live} live · ⏳ ${fbSnap.health.quarantined} quar · ⚪ ${fbSnap.health.neverTried} new)`,
+        `🔥 <b>Saved Firebase databases:</b> <code>${fbSnap.health.total}</code> (🟢 ${fbSnap.health.live} live · ⏳ ${fbSnap.health.quarantined} quar · ⚪ ${fbSnap.health.neverTried} new)`,
+        presenceLine,
         fbSnap.currentSource
           ? `📡 <b>Active DB:</b> <code>${esc(fbSnap.currentSource.name)}</code> (${fbSnap.sourceIndex}/${fbSnap.runSourcesTotal}) · Pool: <code>${fbSnap.currentUnseenSize}/${fbSnap.currentPoolSize}</code> · HotQ: <code>${fbSnap.hotQueueSize}</code>`
           : `📡 <b>Active DB:</b> <i>${fbSnap.desiredRunning ? 'Loading / scanning...' : 'Stopped'}</i>`,
@@ -156,7 +160,8 @@ export function registerBotUi({ bot, db, slotManager, firebaseManager = null, to
         `📤 <b>Delivery Queue:</b> <code>${d.pending}</code> pending · <code>${d.sent}</code> sent · <code>${d.failed}</code> failed`,
         `🔑 <b>Toing Keys:</b> <code>${snap.toing.keysCount}</code> · <b>HTTP Gate:</b> <code>${snap.toing.semaphore.active}/${snap.toing.semaphore.limit}</code> (429: ${snap.toing.rateLimited429})`,
         `🤖 <b>OTP Bot:</b> <code>${esc(cfg.defaultOtpBot)}</code> · <b>OTP Timeout:</b> <code>${Math.round(cfg.otpTimeoutMs / 1000)}s</code> · <b>Filter:</b> <code>${cfg.skipRegistered === true ? 'Fresh Only' : 'All Numbers ✅'}</code>`,
-        `🔥 <b>Firebase Fresh-Only Mode:</b> <code>OFF</code> (${fbSnap.health.total} DBs ready — tap below to ON)`,
+        `🔥 <b>Firebase Fresh-Only Mode:</b> <code>OFF</code> (${fbSnap.health.total} saved databases)`,
+        presenceLine,
       ].filter(Boolean);
 
     const rows = [
@@ -175,7 +180,7 @@ export function registerBotUi({ bot, db, slotManager, firebaseManager = null, to
           fbMode ? '🔥 Firebase Mode: ON ✅' : '🔥 Firebase Mode: OFF',
           'act_toggle_fb_mode'
         ),
-        Markup.button.callback(`🔥 FB Panel (${fbSnap.health.total})`, 'act_fb_panel'),
+        Markup.button.callback(`🔥 FB Panel (${fbSnap.health.total} DBs)`, 'act_fb_panel'),
       ],
       [
         Markup.button.callback(`👥 Slots (${snap.totalSlots}/${cfg.maxSlots})`, 'slots_page_1'),
@@ -471,7 +476,9 @@ export function registerBotUi({ bot, db, slotManager, firebaseManager = null, to
       stageStr ? `🔄 <b>Stages:</b> <code>${esc(stageStr)}</code>` : '',
       `📊 <b>This Run:</b> ✅ Fresh Created <code>${fbSnap.createdInRun}</code> · 🚫 Reg Skipped <code>${fbSnap.skippedRegisteredInRun}</code> · ⏱ Timeout <code>${fbSnap.otpTimeoutsInRun}</code>`,
       ``,
-      `🗂 <b>Firebase Sources:</b> <code>${h.total}</code> total (🟢 ${h.live} live · ⏳ ${h.quarantined} quar · ❌ ${h.failed} fail · ⚪ ${h.neverTried} new)`,
+      `🗂 <b>Saved Firebase databases:</b> <code>${h.total}</code> (🟢 ${h.live} live · ⏳ ${h.quarantined} quar · ❌ ${h.failed} fail · ⚪ ${h.neverTried} new)`,
+      formatPresenceReport(db.getSetting(REPORT_KEY)),
+      `Count update: owner DM mein <code>${REPORT_FILE}</code> bhejo. Pehli line <code>status</code>, phir har distinct number ke liye sirf <code>active</code>, <code>inactive</code> ya <code>unknown</code>, ek per line. Numbers ya URLs nahi.`,
       primary ? `⭐ <b>First-Try Source:</b> <code>${esc(primary.name)}</code>` : `⚠️ <i>Koi Firebase source added nahi — Add Firebase (Bulk) se daalo.</i>`,
       fbSnap.currentSource
         ? `📡 <b>Now Scanning:</b> <code>${esc(fbSnap.currentSource.name)}</code> (${fbSnap.sourceIndex}/${fbSnap.runSourcesTotal}) · Unseen <code>${fbSnap.currentUnseenSize}/${fbSnap.currentPoolSize}</code> · HotQ <code>${fbSnap.hotQueueSize}</code>`
@@ -1591,7 +1598,8 @@ export function registerBotUi({ bot, db, slotManager, firebaseManager = null, to
     }
     const lines = [
       `🔥 <b>FIREBASE SOURCES IMPORT</b>`,
-      `✅ Added: <b>${res.added.length}</b> · Total Active: <b>${res.total}</b>`,
+      `Added databases: <b>${res.added.length}</b> · Saved databases: <b>${res.total}</b>`,
+      !res.added.length && !res.duplicates.length && !res.invalid.length ? 'ℹ️ Koi source entry nahi mili.' : '',
       res.duplicates.length ? `♻️ Already present: <b>${res.duplicates.length}</b>` : '',
       res.invalid.length ? `❌ Invalid entries: <b>${res.invalid.length}</b>` : '',
     ].filter(Boolean);
@@ -1604,20 +1612,58 @@ export function registerBotUi({ bot, db, slotManager, firebaseManager = null, to
   bot.on('document', async (ctx) => {
     const chatId = String(ctx.chat.id);
     const mode = chatModes.get(chatId);
-    if (mode?.type !== 'import' && mode?.type !== 'fb_add') return;
-    try {
-      const link = await ctx.telegram.getFileLink(ctx.message.document.file_id);
-      const res = await fetch(String(link));
-      const text = await res.text();
-      // Delete uploaded file message from chat (may contain sessions or DB secrets)
-      await ctx.deleteMessage().catch(() => {});
-      if (mode.type === 'fb_add') {
-        await handleBulkFirebaseAddPayload(ctx, text);
-      } else {
-        await handleBulkImportPayload(ctx, text);
+    const doc = ctx.message.document;
+    const name = String(doc.file_name || '').trim().toLowerCase();
+    // This reserved filename is reporting-only, even while another prompt is open.
+    // Never guess that an unsolicited attachment belongs in either worker import.
+    const isReport = name === REPORT_FILE;
+    if (isReport) {
+      if (ctx.chat.type !== 'private' || !getRuntimeConfig().ownerIds.includes(String(ctx.from?.id))) {
+        await ctx.reply('Number report sirf configured owner ki private chat mein accept hoti hai.');
+        return;
       }
-    } catch (err) {
-      await ctx.reply(`❌ File read error: <code>${esc(err?.message || err)}</code>`, { parse_mode: 'HTML' });
+    } else if (mode?.type !== 'import' && mode?.type !== 'fb_add') {
+      if (name.endsWith('.txt') || doc.mime_type === 'text/plain') {
+        await ctx.reply('TXT import nahi hui: is chat mein koi file input pending nahi hai. File download nahi ki. Read-only number report ka format /firebase mein hai.');
+      }
+      return;
+    }
+
+    const file = await readTextDocument(ctx, { maxBytes: isReport ? 128 * 1024 : 1024 * 1024, fetchImpl });
+    // Prompted uploads may contain secrets; don't echo their contents, even on error.
+    await ctx.deleteMessage().catch(() => {});
+    if (file.error) {
+      await ctx.reply(`❌ File import nahi hui: ${file.error}`);
+      return;
+    }
+    if (isReport) {
+      const { counts, error } = parsePresenceReport(file.text);
+      if (error) {
+        await ctx.reply(`❌ Report save nahi hui: ${error}`);
+        return;
+      }
+      const report = { ...counts, uploadedAt: Date.now() };
+      try {
+        db.setSetting(REPORT_KEY, report);
+      } catch {
+        await ctx.reply('❌ Report save nahi hui: storage error.');
+        return;
+      }
+      await ctx.reply(`✅ Number report saved. Koi database add ya request queue nahi hui.\n${formatPresenceReport(report)}`, { parse_mode: 'HTML' });
+      return;
+    }
+    if (chatModes.get(chatId) !== mode) {
+      await ctx.reply('File import nahi hui: file padhte waqt input prompt band ya badal gaya.');
+      return;
+    }
+    try {
+      if (mode.type === 'fb_add') {
+        await handleBulkFirebaseAddPayload(ctx, file.text);
+      } else {
+        await handleBulkImportPayload(ctx, file.text);
+      }
+    } catch {
+      await ctx.reply('File padh li, lekin import result confirm nahi hua.');
     }
   });
 
