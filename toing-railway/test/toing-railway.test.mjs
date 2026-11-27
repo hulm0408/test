@@ -1649,5 +1649,195 @@ test('21. Default config (filter OFF) sends OTP & exports BOTH new and already-r
   }
 });
 
+test('22. Suspended Swiggy account is persisted to used_numbers (30d) so no other slot retries it', async () => {
+  const dir = makeTmpDir();
+  try {
+    const db = new ToingDb({
+      dbPath: path.join(dir, 'toing.db'),
+      dataDir: dir,
+      encryptionKey: 'suspended-acct-key',
+      sessionsDir: path.join(dir, 'sessions'),
+    });
+    const a1 = db.addAccount({ label: 'Susp1', session: '1BVtsMOCK_SUSPENDED_ACCOUNT_SLOT_1_000001', otpBotProfile: 'hathi' });
+    const a2 = db.addAccount({ label: 'Susp2', session: '1BVtsMOCK_SUSPENDED_ACCOUNT_SLOT_2_000002', otpBotProfile: 'hathi' });
+    const acc1 = db.getAccountById(a1.id, { includeSession: true });
+    const acc2 = db.getAccountById(a2.id, { includeSession: true });
+
+    const sendOtpCalls = [];
+    const toingClient = new ToingClient({
+      getBaseUrl: () => 'https://storelex.store/toing_web',
+      getAccessKeys: () => ['K1'],
+      fetchImpl: async (url, opts) => {
+        const body = opts?.body ? JSON.parse(opts.body) : {};
+        if (url.endsWith('/api/auth/check_mobile')) {
+          return new Response(JSON.stringify({ registered: true }), { status: 200 });
+        }
+        if (url.endsWith('/api/auth/send_otp')) {
+          sendOtpCalls.push(body.mobile);
+          return new Response(JSON.stringify({
+            error: 'Your account is suspended. Please contact us through support@swiggy.in for further assistance',
+          }), { status: 200 });
+        }
+        return new Response('{}', { status: 404 });
+      },
+    });
+
+    const runtimeCfg = () => ({
+      telegramApiId: 12345,
+      telegramApiHash: 'hash',
+      claimTimeoutMs: 2_000,
+      claimLockTtlMs: 60_000,
+      otpTimeoutMs: 10_000,
+      otpRefreshMs: 500,
+      cooldownDays: 30,
+      deliveryChatId: '6484999726',
+    });
+
+    const makeWorker = (acc, queue) => new SlotWorker({
+      account: acc,
+      db,
+      toingClient,
+      getRuntimeConfig: runtimeCfg,
+      clientFactory: () => ({
+        connected: true,
+        async connect() { return { ok: true, me: acc.label }; },
+        async disconnect() {},
+        setBotProfile() {},
+        async claimFreshNumber() {
+          const next = queue.shift();
+          return next ? { ok: true, phone: next, card: { phone: next } } : { ok: false, reason: 'queue_empty' };
+        },
+        async captureOtpWatermark() { return { ids: [], codes: [], ts: Date.now(), afterMs: Date.now(), messageId: 1 }; },
+        async waitForOtp() { return { ok: false, timeout: true, attempts: 0 }; },
+      }),
+    });
+
+    const w1 = makeWorker(acc1, ['9905466527']);
+    await w1._runSingleCycle();
+
+    // Must have called send_otp exactly once and persisted suspended cooldown
+    assert.deepEqual(sendOtpCalls, ['9905466527']);
+    const bd = db.getCooldownBreakdown();
+    assert.equal(bd.suspended, 1);
+
+    // Slot #2 seeing the exact same suspended phone MUST skip at claim stage without hitting Toing send_otp again!
+    const claimCheck = db.tryClaimPhone('9905466527', acc2.id, { ignoreAlreadyRegistered: true });
+    assert.equal(claimCheck.ok, false);
+    assert.equal(claimCheck.reason, 'cooldown');
+    assert.equal(claimCheck.status, 'suspended');
+
+    const w2 = makeWorker(acc2, ['9905466527']);
+    await w2._runSingleCycle();
+    assert.deepEqual(sendOtpCalls, ['9905466527'], 'second slot must NOT re-call send_otp on a suspended number');
+
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('23. Stray/invalid OTP rejected by verify_otp keeps waiting on same sid/tid until real Swiggy OTP arrives', async () => {
+  // First verify candidateIsNew ignores explicitly rejected codes even on newer message IDs
+  assert.equal(
+    candidateIsNew(
+      { messageId: 500, idKey: '500|341401', ts: Date.now(), parsed: { code: '341401' } },
+      { messageId: 400, ids: new Set(), codes: new Set(), rejectedCodes: new Set(['341401']) }
+    ),
+    false,
+    'candidateIsNew must reject codes in baseline.rejectedCodes even if messageId > baseline.messageId'
+  );
+  assert.equal(
+    candidateIsNew(
+      { messageId: 501, idKey: '501|778899', ts: Date.now(), parsed: { code: '778899' } },
+      { messageId: 400, ids: new Set(), codes: new Set(), rejectedCodes: new Set(['341401']) }
+    ),
+    true,
+    'candidateIsNew must accept a different fresh Swiggy OTP code'
+  );
+
+  const dir = makeTmpDir();
+  try {
+    const db = new ToingDb({
+      dbPath: path.join(dir, 'toing.db'),
+      dataDir: dir,
+      encryptionKey: 'wrong-otp-retry-key',
+      sessionsDir: path.join(dir, 'sessions'),
+    });
+    const added = db.addAccount({ label: 'RetrySlot', session: '1BVtsMOCK_WRONG_OTP_RETRY_SLOT_000001', otpBotProfile: 'hathi' });
+    const acc = db.getAccountById(added.id, { includeSession: true });
+
+    let sendCount = 0;
+    const verifyAttempts = [];
+    const waitBaselines = [];
+
+    const toingClient = {
+      async checkMobile() { return { ok: true, registered: true, isNew: false, key: 'K1' }; },
+      async sendOtp(mobile) {
+        sendCount += 1;
+        return { ok: true, sid: 'sid-keep-me', tid: 'tid-keep-me', deviceId: 'dev-1', key: 'K1', mobile };
+      },
+      async verifyOtp(payload) {
+        verifyAttempts.push({ otp: payload.otp, sid: payload.sid, tid: payload.tid });
+        if (payload.otp === '341401') {
+          return { ok: false, reason: 'Invalid OTP. Please try again.' };
+        }
+        return { ok: true, key: 'K1', data: { success: true } };
+      },
+      async exportAccount(mobile, { otpState }) {
+        return {
+          ok: true,
+          fallback: false,
+          exportObj: { mobile, token: 'tok-ok', sid: otpState.sid, tid: otpState.tid, deviceId: otpState.deviceId, customerId: '9' },
+        };
+      },
+    };
+
+    const otps = ['341401', '778899'];
+    const worker = new SlotWorker({
+      account: acc,
+      db,
+      toingClient,
+      getRuntimeConfig: () => ({
+        telegramApiId: 12345,
+        telegramApiHash: 'hash',
+        claimTimeoutMs: 2_000,
+        claimLockTtlMs: 60_000,
+        otpTimeoutMs: 20_000,
+        otpRefreshMs: 500,
+        deliveryChatId: '6484999726',
+      }),
+      clientFactory: () => ({
+        connected: true,
+        async connect() { return { ok: true, me: 'RetrySlot' }; },
+        async disconnect() {},
+        setBotProfile() {},
+        async claimFreshNumber() { return { ok: true, phone: '8709730860', card: { phone: '8709730860' } }; },
+        async captureOtpWatermark() { return { ids: [], codes: [], ts: Date.now(), afterMs: Date.now(), messageId: 10 }; },
+        async waitForOtp(_phone, opts) {
+          waitBaselines.push(new Set(opts?.baseline?.rejectedCodes || []));
+          const next = otps.shift();
+          return next ? { ok: true, code: next, sender: next === '778899' ? 'SWIGGY' : '', elapsedMs: 200, attempts: 1 } : { ok: false, timeout: true };
+        },
+      }),
+    });
+
+    await worker._runSingleCycle();
+
+    assert.equal(sendCount, 1, 'must reuse the SAME send_otp session without resending');
+    assert.deepEqual(verifyAttempts, [
+      { otp: '341401', sid: 'sid-keep-me', tid: 'tid-keep-me' },
+      { otp: '778899', sid: 'sid-keep-me', tid: 'tid-keep-me' },
+    ]);
+    assert.equal(waitBaselines[0].has('341401'), false);
+    assert.equal(waitBaselines[1].has('341401'), true, 'second waitForOtp must pass rejected stray code in baseline.rejectedCodes');
+    assert.equal(db.getThroughputStats().totalSessions, 1, 'account must commit cleanly after real Swiggy OTP succeeds');
+
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+
 
 

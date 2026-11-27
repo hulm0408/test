@@ -583,6 +583,32 @@ export class SlotWorker {
           return;
         }
 
+        // Persist permanently suspended Swiggy/Toing accounts for 30 days so NO other slot retries them!
+        if (sendRes.suspended) {
+          const suspendedPhone = lockedPhone;
+          const coolDays = Math.max(1, Number(cfg.cooldownDays || 30));
+          this.consecutivePoolSkips += 1;
+          this.db.markNumberUsed(suspendedPhone, {
+            status: 'suspended',
+            slotId: this.account.id,
+            cooldownMs: coolDays * 24 * 60 * 60 * 1000,
+            source: 'swiggy_suspended',
+          });
+          lockedPhone = ''; // already released inside markNumberUsed TX
+          this.db.recordMetric(this.account.id, 'send_otp_fail', Date.now() - cycleStart);
+          this.lastError = `suspended: ${sendRes.reason || 'Account suspended'}`.slice(0, 180);
+          this._logNumberEvent({
+            phone: suspendedPhone,
+            outcome: 'skip',
+            reason: 'account_suspended',
+            detail: `${sendRes.reason || 'Swiggy account suspended'} (${coolDays}d cooldown set — koi slot retry nahi karega)`,
+            durationMs: Date.now() - cycleStart,
+          });
+          this._rotateBotIfPoolExhausted(cfg, 'account_suspended');
+          this._lastCycleWasFastSkip = true;
+          return;
+        }
+
         // Persist phone-specific Swiggy/Toing OTP blocks so NO other slot retries this number!
         if (Number(sendRes.retryCooldownMs) > 0) {
           const blockedPhone = lockedPhone;
@@ -628,70 +654,128 @@ export class SlotWorker {
       this.consecutiveSendFails = 0;
       this.consecutivePoolSkips = 0;
 
-      // 4. Poll OTP from THIS slot's Telegram OTP bot (fast-fail budget default 20s)
-      this._setStage('waiting_otp', lockedPhone);
-      this.db.updateClaimStage(lockedPhone, this.account.id, 'waiting_otp');
+      // 4 + 5. Wait for OTP and verify on Toing Pro (same x-user-key as send_otp!).
+      // If a stray/wrong 6-digit SMS code (e.g. from another app on a shared SIM) gets rejected
+      // while >= 5s remain in the OTP budget, reject that code and keep waiting for the real Swiggy OTP!
+      const otpBudgetMs = Math.max(4_000, Number(cfg.otpTimeoutMs) || 30_000);
+      const otpStartedAt = Date.now();
+      const otpDeadline = otpStartedAt + otpBudgetMs;
+      const rejectedCodes = new Set();
+      let totalRefreshAttempts = 0;
+      let wrongOtpRetries = 0;
+      const maxWrongOtpRetries = 2;
 
-      const otpRes = await this.client.waitForOtp(lockedPhone, {
-        baseline: watermark,
-        timeoutMs: cfg.otpTimeoutMs,
-        refreshMs: cfg.otpRefreshMs,
-        shouldAbort: () => this._isAborted(),
-      });
-      if (otpRes.aborted || this._isAborted()) return;
-
-      if (!otpRes.ok || !/^\d{6}$/.test(String(otpRes.code || ''))) {
-        const timedOutPhone = lockedPhone;
-        this.db.incrementAccountAttempt(this.account.id, { failed: true });
-        this.db.recordMetric(this.account.id, 'otp_timeout', Date.now() - cycleStart);
-        this.lastError = `OTP timeout on ${timedOutPhone}`;
-        const elapsedSec = ((otpRes.elapsedMs || cfg.otpTimeoutMs) / 1000).toFixed(1);
-        const coolMin = Number(cfg.otpTimeoutCooldownMin ?? 10);
-        if (coolMin > 0) {
-          this.db.markNumberUsed(timedOutPhone, {
-            status: 'otp_timeout_cool',
-            slotId: this.account.id,
-            cooldownMs: coolMin * 60_000,
-            source: 'otp_timeout',
+      while (true) {
+        const remainingMs = otpDeadline - Date.now();
+        if (remainingMs < 1_500) {
+          const timedOutPhone = lockedPhone;
+          this.db.incrementAccountAttempt(this.account.id, { failed: true });
+          this.db.recordMetric(this.account.id, 'otp_timeout', Date.now() - cycleStart);
+          this.lastError = `OTP timeout on ${timedOutPhone}`;
+          const elapsedSec = ((Date.now() - otpStartedAt) / 1000).toFixed(1);
+          const coolMin = Number(cfg.otpTimeoutCooldownMin ?? 10);
+          if (coolMin > 0) {
+            this.db.markNumberUsed(timedOutPhone, {
+              status: 'otp_timeout_cool',
+              slotId: this.account.id,
+              cooldownMs: coolMin * 60_000,
+              source: 'otp_timeout',
+            });
+            lockedPhone = '';
+          }
+          this._logNumberEvent({
+            phone: timedOutPhone,
+            outcome: 'drop',
+            reason: 'otp_timeout',
+            detail: `${elapsedSec}s me koi valid OTP nahi aaya (${totalRefreshAttempts} refreshes, bot=${this.otpBotProfile}${coolMin > 0 ? `, ${coolMin}m cool` : ''})`,
+            durationMs: Date.now() - cycleStart,
           });
-          lockedPhone = '';
+          return;
         }
-        this._logNumberEvent({
-          phone: timedOutPhone,
-          outcome: 'drop',
-          reason: 'otp_timeout',
-          detail: `${elapsedSec}s me koi OTP nahi aaya (${otpRes.attempts || 0} refreshes, bot=${this.otpBotProfile}${coolMin > 0 ? `, ${coolMin}m cool` : ''})`,
-          durationMs: Date.now() - cycleStart,
+
+        this._setStage('waiting_otp', lockedPhone);
+        this.db.updateClaimStage(lockedPhone, this.account.id, 'waiting_otp');
+
+        const waitBaseline = watermark
+          ? { ...watermark, rejectedCodes }
+          : { ids: new Set(), codes: new Set(), rejectedCodes, ts: otpStartedAt, afterMs: otpStartedAt, messageId: 0 };
+
+        const otpRes = await this.client.waitForOtp(lockedPhone, {
+          baseline: waitBaseline,
+          timeoutMs: remainingMs,
+          refreshMs: cfg.otpRefreshMs,
+          shouldAbort: () => this._isAborted(),
         });
-        return;
-      }
+        totalRefreshAttempts += Number(otpRes?.attempts || 0);
+        if (otpRes.aborted || this._isAborted()) return;
 
-      // 5. Verify OTP on Toing Pro (stick to same x-user-key as send_otp!)
-      this._setStage('verifying', lockedPhone);
-      this.db.updateClaimStage(lockedPhone, this.account.id, 'verifying');
+        if (!otpRes.ok || !/^\d{6}$/.test(String(otpRes.code || ''))) {
+          const timedOutPhone = lockedPhone;
+          this.db.incrementAccountAttempt(this.account.id, { failed: true });
+          this.db.recordMetric(this.account.id, 'otp_timeout', Date.now() - cycleStart);
+          this.lastError = `OTP timeout on ${timedOutPhone}`;
+          const elapsedSec = ((Date.now() - otpStartedAt) / 1000).toFixed(1);
+          const coolMin = Number(cfg.otpTimeoutCooldownMin ?? 10);
+          if (coolMin > 0) {
+            this.db.markNumberUsed(timedOutPhone, {
+              status: 'otp_timeout_cool',
+              slotId: this.account.id,
+              cooldownMs: coolMin * 60_000,
+              source: 'otp_timeout',
+            });
+            lockedPhone = '';
+          }
+          this._logNumberEvent({
+            phone: timedOutPhone,
+            outcome: 'drop',
+            reason: 'otp_timeout',
+            detail: `${elapsedSec}s me koi OTP nahi aaya (${totalRefreshAttempts} refreshes, bot=${this.otpBotProfile}${coolMin > 0 ? `, ${coolMin}m cool` : ''})`,
+            durationMs: Date.now() - cycleStart,
+          });
+          return;
+        }
 
-      const verifyRes = await this.toingClient.verifyOtp({
-        mobile: lockedPhone,
-        otp: otpRes.code,
-        sid: sendRes.sid,
-        tid: sendRes.tid,
-        deviceId: sendRes.deviceId,
-        isNew,
-      }, {
-        shouldAbort: () => this._isAborted(),
-        preferredKey: sendRes.key || '',
-      });
-      if (verifyRes.aborted || this._isAborted()) return;
+        // 5. Verify OTP on Toing Pro (stick to same x-user-key as send_otp!)
+        this._setStage('verifying', lockedPhone);
+        this.db.updateClaimStage(lockedPhone, this.account.id, 'verifying');
 
-      if (!verifyRes.ok) {
+        const verifyRes = await this.toingClient.verifyOtp({
+          mobile: lockedPhone,
+          otp: otpRes.code,
+          sid: sendRes.sid,
+          tid: sendRes.tid,
+          deviceId: sendRes.deviceId,
+          isNew,
+        }, {
+          shouldAbort: () => this._isAborted(),
+          preferredKey: sendRes.key || '',
+        });
+        if (verifyRes.aborted || this._isAborted()) return;
+
+        if (verifyRes.ok) {
+          break;
+        }
+
+        const verifyReason = String(verifyRes.reason || 'verify_otp failed');
+        const isWrongOtp = /(invalid|incorrect|wrong|mismatch|enter.*valid.*otp)/i.test(verifyReason);
+        const remAfterVerify = otpDeadline - Date.now();
+        if (isWrongOtp && wrongOtpRetries < maxWrongOtpRetries && remAfterVerify >= 5_000) {
+          wrongOtpRetries += 1;
+          rejectedCodes.add(String(otpRes.code));
+          this.logger?.info?.(
+            `[Slot #${this.slotNo}] 🔁 OTP ${otpRes.code} invalid on ${lockedPhone} (${verifyReason}) — ignoring stray code & waiting ${(remAfterVerify / 1000).toFixed(1)}s more for real Swiggy OTP`
+          );
+          continue;
+        }
+
         this.db.incrementAccountAttempt(this.account.id, { failed: true });
         this.db.recordMetric(this.account.id, 'verify_fail', Date.now() - cycleStart);
-        this.lastError = `verify_otp: ${verifyRes.reason || 'failed'}`.slice(0, 180);
+        this.lastError = `verify_otp: ${verifyReason}`.slice(0, 180);
         this._logNumberEvent({
           phone: lockedPhone,
           outcome: 'drop',
           reason: 'verify_failed',
-          detail: `OTP ${otpRes.code} rejected: ${verifyRes.reason || 'verify_otp failed'}`,
+          detail: `OTP ${otpRes.code} rejected: ${verifyReason}`,
           durationMs: Date.now() - cycleStart,
         });
         return;
