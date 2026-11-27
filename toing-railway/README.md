@@ -51,6 +51,22 @@ The Firebase panel supports source verification, bulk addition (`URL|auth` per l
 
 Optional environment defaults are documented in `.env.example`: `FIREBASE_MODE`, `FIREBASE_CONCURRENCY`, `FIREBASE_OTP_TIMEOUT_MS`, `FIREBASE_ACTIVE_WINDOW_MS`, `FIREBASE_DB_URL`, `FIREBASE_DB_AUTH`, and `FIREBASE_DB_URLS`. Settings changed in the Telegram UI persist in SQLite and take precedence over environment defaults.
 
+### Active-number report (read-only)
+
+`Saved Firebase databases` counts database configurations, **not phones**. The dashboard and `/firebase` show **Active numbers (file report)** separately. This is an uploaded inventory snapshot, not a live scan; it reads `Unknown` until there is a valid report.
+
+A configured owner can send a UTF-8 document named **`firebase-status.txt`** (max 128 KiB) in a private chat with the bot. Use an export from your own inventory with one status per **distinct** number across your projects; remove the identifiers before uploading. For example:
+
+```text
+status
+active
+inactive
+unknown
+active
+```
+
+This reports **2 active / 4 reported**. A `status` header alone explicitly reports an empty inventory. The bot saves only the three counts and the upload time; it cannot deduplicate rows without identifiers. An invalid row rejects the whole update and leaves the previous report intact. This filename is reserved for reporting even when an import prompt is open: it never adds a source, starts a job, reads an inbox or sends an OTP. Other unsolicited TXT files are acknowledged but not downloaded.
+
 ---
 
 ## 👥 Adding 20–50 Spare Telegram Accounts
