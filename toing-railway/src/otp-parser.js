@@ -332,10 +332,14 @@ export function selectLatestFreshNumberCard(messages = [], {
 export function candidateIsNew(candidate = {}, baseline = {}) {
   const ids = baseline?.ids instanceof Set ? baseline.ids : new Set(baseline?.ids || []);
   const codes = baseline?.codes instanceof Set ? baseline.codes : new Set(baseline?.codes || []);
+  const rejectedCodes = baseline?.rejectedCodes instanceof Set
+    ? baseline.rejectedCodes
+    : new Set(baseline?.rejectedCodes || []);
   const maxMsgId = Number(baseline?.messageId) || 0;
   const afterMs = Number(baseline?.afterMs || baseline?.ts) || 0;
 
   if (!candidate?.parsed?.code) return false;
+  if (rejectedCodes.has(String(candidate.parsed.code))) return false;
   if (candidate.idKey && ids.has(candidate.idKey)) return false;
 
   // Brand-new message id posted after watermark -> definitely fresh!

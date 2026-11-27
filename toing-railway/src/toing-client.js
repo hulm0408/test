@@ -299,11 +299,13 @@ export class ToingClient {
     }
     const reason = sanitizeErrorText(d.error || d.detail || d.message || d.raw || res.error || 'Toing send_otp failed', 180);
     const alreadyRegistered = /(already\s*registered|mobile\s+number\s+is\s+already\s+registered)/i.test(reason);
-    const retryCooldownMs = alreadyRegistered ? 0 : parseSendOtpCooldownMs(reason);
+    const suspended = /(account\s+is\s+suspended|account\s+(?:has\s+been\s+)?(?:suspended|banned|disabled|deactivated)|permanently\s+blocked)/i.test(reason);
+    const retryCooldownMs = (alreadyRegistered || suspended) ? 0 : parseSendOtpCooldownMs(reason);
     return {
       ok: false,
       status: res.status,
       alreadyRegistered,
+      suspended,
       retryCooldownMs,
       reason,
     };

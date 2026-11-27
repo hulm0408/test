@@ -11,9 +11,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, Number(ms) ||
 
 export class BotClickPacer {
   constructor({
-    claimGapMs = 350,
-    busyClaimGapMs = 750,
-    congestedClaimGapMs = 950,
+    claimGapMs = 240,
+    busyClaimGapMs = 500,
+    congestedClaimGapMs = 850,
     refreshGapMs = 120,
     congestionWindowMs = 15_000,
   } = {}) {

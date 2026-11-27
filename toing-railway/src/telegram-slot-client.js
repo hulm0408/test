@@ -986,6 +986,7 @@ export class TelegramSlotClient {
     baseline = null,
     timeoutMs = 30_000,
     refreshMs = 2_200,
+    acceptAnyAfterMs: acceptAnyOverrideMs = null,
     shouldAbort = null,
   } = {}) {
     return this._withSlotLock(async () => {
@@ -994,13 +995,18 @@ export class TelegramSlotClient {
         const cleanPhone = normalizePhone10(phone);
         const totalMs = Math.max(4_000, Number(timeoutMs) || 30_000);
         const baseRefreshMs = Math.max(900, Number(refreshMs) || 2_200);
-        const acceptAnyAfterMs = Math.min(10_000, Math.floor(totalMs * 0.55));
+        // Wait up to 18s (65% of budget) before falling back to untagged/non-Swiggy 6-digit SMS codes
+        // so stray OTPs from other apps on shared SIMs don't cause false verify_failed drops.
+        const acceptAnyAfterMs = Number.isFinite(Number(acceptAnyOverrideMs)) && Number(acceptAnyOverrideMs) >= 0
+          ? Number(acceptAnyOverrideMs)
+          : Math.min(18_000, Math.floor(totalMs * 0.65));
         const startedAt = Date.now();
         const deadline = startedAt + totalMs;
 
         const normBaseline = {
           ids: new Set(baseline?.ids || []),
           codes: new Set(baseline?.codes || []),
+          rejectedCodes: new Set(baseline?.rejectedCodes || []),
           ts: Number(baseline?.ts) || startedAt,
           afterMs: Number(baseline?.afterMs || baseline?.ts) || startedAt,
           messageId: Number(baseline?.messageId) || 0,

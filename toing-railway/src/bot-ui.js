@@ -307,6 +307,7 @@ export function registerBotUi({ bot, db, slotManager, toingClient, getRuntimeCon
       `<i>Ye numbers isliye skip hote hain taaki OTP &amp; time waste na ho:</i>`,
       `• ✅ <b>extracted</b> (banaye hue accounts, 30d): <code>${bd.extracted}</code>`,
       `• 🚫 <b>already_registered</b> (Toing par pehle se reg, 30d): <code>${bd.already_registered}</code>`,
+      `• ⛔ <b>suspended</b> (Swiggy account suspended, 30d): <code>${bd.suspended || 0}</code>`,
       `• 📦 <b>seed</b> (purane JSON backups, 30d): <code>${bd.seed}</code>`,
       `• ⏱ <b>otp_timeout_cool</b> (OTP nahi aaya, 10m): <code>${bd.otp_timeout_cool}</code>`,
       `• 🛑 <b>send_otp_blocked</b> (Swiggy limit, 2h): <code>${bd.send_otp_blocked}</code>`,

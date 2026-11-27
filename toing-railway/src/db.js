@@ -647,6 +647,7 @@ export class ToingDb {
     const out = {
       extracted: 0,
       already_registered: 0,
+      suspended: 0,
       seed: 0,
       otp_timeout_cool: 0,
       send_otp_blocked: 0,
