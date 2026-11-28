@@ -599,8 +599,10 @@ export async function processSingleNumber({
       if (precheckStillFresh) {
         lastActivityMs = preTs;
       } else {
-        for (const devId of deviceIds) {
-          const t = await fetchDeviceLastActivityMs(devId).catch(() => null);
+        const timestamps = await Promise.all(
+          deviceIds.map((devId) => fetchDeviceLastActivityMs(devId).catch(() => null))
+        );
+        for (const t of timestamps) {
           if (t && (!lastActivityMs || t > lastActivityMs)) lastActivityMs = t;
         }
       }
