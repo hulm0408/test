@@ -3,7 +3,7 @@
 // Every function accepts an explicit `source` object so multiple parallel lanes and UI
 // verification calls can read different Firebase Realtime DBs concurrently with ZERO races.
 
-import { normalizePhone10 } from './otp-parser.js';
+import { normalizeIndianMobileNumber } from './otp-parser.js';
 
 export const MAX_BULK_FIREBASE_SOURCES = 1000;
 
@@ -31,7 +31,7 @@ export function builtinSourceName(url) {
 }
 
 export function normalizePoolPhone(value) {
-  const norm = normalizePhone10(value);
+  const norm = normalizeIndianMobileNumber(value);
   if (norm) return norm;
   const digits = String(value ?? '').replace(/\D/g, '');
   if (/^0[6-9]\d{9}$/.test(digits)) return digits.slice(1);
@@ -762,12 +762,15 @@ export async function scanFreshDevices(source, entries = [], opts = {}) {
 // ---------------------------------------------------------------------------
 // OTP Inbox Reading & Live Polling (messages/<deviceId> + otp/ + sms/)
 // ---------------------------------------------------------------------------
-export async function fetchOtpCandidates(source, phone, { deviceIds = [], fetchImpl = fetch } = {}) {
+export async function fetchOtpCandidates(source, phone, { deviceIds = [], fetchImpl = fetch, includeLegacy = false, limitToLast = 25 } = {}) {
   const out = [];
   const messagesPath = cleanPath(source?.messagesPath || 'messages');
   const devIds = (Array.isArray(deviceIds) ? deviceIds : []).filter(Boolean);
+  const forcedLegacy = Boolean(String(source?.numbersPath || '').trim());
+  const needLegacy = Boolean(includeLegacy) || forcedLegacy;
 
-  // 1. Primary: device messages/<deviceId> (last 50)
+  // 1. Primary: device messages/<deviceId>
+  let anyDeviceNodeFound = false;
   if (devIds.length) {
     const deviceNodes = await Promise.all(devIds.map(async (deviceId) => {
       try {
@@ -776,8 +779,8 @@ export async function fetchOtpCandidates(source, phone, { deviceIds = [], fetchI
           await fbGet(
             source,
             `${messagesPath}/${seg(deviceId)}`,
-            { orderBy: '"$key"', limitToLast: 50 },
-            { timeoutMs: 12_000, fetchImpl }
+            { orderBy: '"$key"', limitToLast: Math.max(5, Number(limitToLast) || 25) },
+            { timeoutMs: 8_000, fetchImpl }
           ),
         ];
       } catch {
@@ -787,6 +790,7 @@ export async function fetchOtpCandidates(source, phone, { deviceIds = [], fetchI
 
     for (const [deviceId, node] of deviceNodes) {
       if (!node) continue;
+      anyDeviceNodeFound = true;
       const entries = Array.isArray(node)
         ? node.map((m, i) => [i, m])
         : (typeof node === 'object' ? Object.entries(node) : []);
@@ -796,17 +800,36 @@ export async function fetchOtpCandidates(source, phone, { deviceIds = [], fetchI
         if (c) out.push(c);
       }
     }
+    if (anyDeviceNodeFound && !needLegacy) {
+      return out;
+    }
   }
 
-  // 2. Fast path: otp/<phoneVariant>
+  // 2 & 3. Fast path (otp/<variant>) + legacy (sms/<variant>) in parallel
   const otpPath = cleanPath(source?.otpPath || 'otp');
-  const otpNodes = await Promise.all(phoneVariants(phone).map(async (variant) => {
-    try {
-      return [variant, await fbGet(source, `${otpPath}/${seg(variant)}`, {}, { timeoutMs: 8_000, fetchImpl })];
-    } catch {
-      return [variant, null];
-    }
-  }));
+  const smsPath = cleanPath(source?.smsPath || 'sms');
+  const variants = phoneVariants(phone);
+  const shouldCheckSms = needLegacy || !devIds.length;
+
+  const [otpNodes, smsNodes] = await Promise.all([
+    Promise.all(variants.map(async (variant) => {
+      try {
+        return [variant, await fbGet(source, `${otpPath}/${seg(variant)}`, {}, { timeoutMs: 8_000, fetchImpl })];
+      } catch {
+        return [variant, null];
+      }
+    })),
+    shouldCheckSms
+      ? Promise.all(variants.map(async (variant) => {
+        try {
+          return [variant, await fbGet(source, `${smsPath}/${seg(variant)}`, {}, { timeoutMs: 8_000, fetchImpl })];
+        } catch {
+          return [variant, null];
+        }
+      }))
+      : Promise.resolve([]),
+  ]);
+
   for (const [variant, node] of otpNodes) {
     if (node === null || node === undefined) continue;
     if (node && typeof node === 'object' && !Array.isArray(node)) {
@@ -826,38 +849,27 @@ export async function fetchOtpCandidates(source, phone, { deviceIds = [], fetchI
     }
   }
 
-  // 3. Legacy sms/<phoneVariant>
-  {
-    const smsPath = cleanPath(source?.smsPath || 'sms');
-    const smsNodes = await Promise.all(phoneVariants(phone).map(async (variant) => {
-      try {
-        return [variant, await fbGet(source, `${smsPath}/${seg(variant)}`, {}, { timeoutMs: 8_000, fetchImpl })];
-      } catch {
-        return [variant, null];
-      }
-    }));
-    for (const [variant, node] of smsNodes) {
-      if (node === null || node === undefined) continue;
-      if (Array.isArray(node)) {
-        node.forEach((m, i) => {
-          const sender = m && typeof m === 'object' ? String(m.sender || '') : '';
-          const c = candidateFrom(`sms/${variant}/${i}`, m, 'sms', sender);
-          if (c) out.push(c);
-        });
-      } else if (typeof node === 'object') {
-        if (looksLikeMessageNode(node)) {
-          const c = candidateFrom(`sms/${variant}`, node, 'sms', String(node.sender || ''));
-          if (c) out.push(c);
-        } else {
-          for (const [k, v] of Object.entries(node)) {
-            const c = candidateFrom(`sms/${variant}/${k}`, v, 'sms', v && typeof v === 'object' ? String(v.sender || '') : '');
-            if (c) out.push(c);
-          }
-        }
-      } else {
-        const c = candidateFrom(`sms/${variant}`, node, 'sms');
+  for (const [variant, node] of smsNodes) {
+    if (node === null || node === undefined) continue;
+    if (Array.isArray(node)) {
+      node.forEach((m, i) => {
+        const sender = m && typeof m === 'object' ? String(m.sender || '') : '';
+        const c = candidateFrom(`sms/${variant}/${i}`, m, 'sms', sender);
         if (c) out.push(c);
+      });
+    } else if (typeof node === 'object') {
+      if (looksLikeMessageNode(node)) {
+        const c = candidateFrom(`sms/${variant}`, node, 'sms', String(node.sender || ''));
+        if (c) out.push(c);
+      } else {
+        for (const [k, v] of Object.entries(node)) {
+          const c = candidateFrom(`sms/${variant}/${k}`, v, 'sms', v && typeof v === 'object' ? String(v.sender || '') : '');
+          if (c) out.push(c);
+        }
       }
+    } else {
+      const c = candidateFrom(`sms/${variant}`, node, 'sms');
+      if (c) out.push(c);
     }
   }
 
