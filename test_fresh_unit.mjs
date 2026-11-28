@@ -491,16 +491,17 @@ console.log('firebase-sources (db-backed manager):');
       && srcMod.listRunSources().some((s) => s.id === seeded[0].id),
     'purana disabled source load par ACTIVE normalize — sirf Delete se hatega');
   }
-  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.length >= 400,
-    `owner ki poori ROLEX VIP list built-in hai (${srcMod.BUILTIN_FIREBASE_SOURCE_URLS.length} URLs)`);
+  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.length >= 900,
+    `owner ki nayi live-checked ranked list built-in hai (${srcMod.BUILTIN_FIREBASE_SOURCE_URLS.length} URLs)`);
   ok(new Set(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.map((u) => u.toLowerCase())).size === srcMod.BUILTIN_FIREBASE_SOURCE_URLS.length,
     'built-in Firebase URLs me duplicate nahi');
-  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS[0] === 'https://admin143-dab82-default-rtdb.firebaseio.com', 'pehla built-in Firebase URL sahi');
-  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.includes('https://do-admin-v21-default-rtdb.firebaseio.com'), 'purani 55 wali list bhi shamil');
-  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.includes('https://choduu00111-default-rtdb.firebaseio.com'), 'choduu00111 Firebase URL shamil');
-  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.includes('https://myypppp-default-rtdb.asia-southeast1.firebasedatabase.app'), 'asia-southeast1 Firebase URL shamil');
-  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.includes('https://a4jaat-208cb-default-rtdb.firebaseio.com'), 'ROLEX list ka pehla Firebase URL shamil');
-  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.includes('https://painislv-default-rtdb.firebaseio.com'), 'ROLEX list ka aakhri poora Firebase URL shamil');
+  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS[0] === 'https://tata-1d605-default-rtdb.firebaseio.com',
+    'pehla built-in Firebase URL = sabse zyada online devices wala DB');
+  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.includes('https://panelforss-default-rtdb.europe-west1.firebasedatabase.app'), 'europe-west1 Firebase URL shamil');
+  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.includes('https://pawanc-7dbf5-default-rtdb.firebaseio.com'), 'live report ka #2 DB shamil');
+  ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.includes('https://chod-patti-default-rtdb.firebaseio.com'), 'purani list ka alive bacha hua URL bhi shamil');
+  ok(!srcMod.BUILTIN_FIREBASE_SOURCE_URLS.includes('https://admin143-dab82-default-rtdb.firebaseio.com'), 'purani dead list ka URL hata diya gaya');
+  ok(!srcMod.BUILTIN_FIREBASE_SOURCE_URLS.some((u) => ['https://hospital-17-default-rtdb.firebaseio.com', 'https://b.firebaseio.com', 'https://n-ka-land-default-rtdb.firebaseio.com', 'https://8c69-default-rtdb.firebaseio.com'].includes(u.toLowerCase())), 'dead URLs seed list me nahi');
   ok(!srcMod.BUILTIN_FIREBASE_SOURCE_URLS.some((u) => /pari-7907d/i.test(u)), 'adhoora cut hua URL seed list me nahi');
   ok(srcMod.MAX_BULK_FIREBASE_SOURCES >= 1000, 'ek message me 1000 tak Firebase add ho sakte hain');
   {
@@ -508,6 +509,8 @@ console.log('firebase-sources (db-backed manager):');
     ok(srcMod.BUILTIN_FIREBASE_SOURCE_URLS.every((u) => seededUrls.has(u.toLowerCase())), 'saare built-in Firebase sources seed ho gaye');
     ok(seeded.filter((s) => s.builtin).length === srcMod.BUILTIN_FIREBASE_SOURCE_URLS.length,
       'poori built-in list builtin tag ke saath save');
+    ok(srcMod.getActiveSource()?.url === srcMod.BUILTIN_FIREBASE_SOURCE_URLS[0],
+      'ranked list ka #1 DB (sabse zyada online devices) first-try source hai');
     ok(new Set(seeded.map((s) => s.id)).size === seeded.length, 'source IDs unique hain');
     ok(seeded.every((s) => /^[a-f0-9-]{1,10}$/.test(s.id)), 'source IDs Telegram callback-compatible hain');
   }

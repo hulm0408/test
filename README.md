@@ -341,7 +341,7 @@ BOT_TOKEN=<BotFather se mila token>
 OWNER_IDS=<aapka Telegram ID>     # optional — warna default boss allow
 ```
 
-FIREBASE_DB_URL ka default hi sahi hai (`https://vuvhbjbi-default-rtdb.firebaseio.com/`) — set karne ki zaroorat nahi.
+FIREBASE_DB_URL ka default hi sahi hai (`https://tata-1d605-default-rtdb.firebaseio.com/`, ranked #1) — set karne ki zaroorat nahi.
 
 ## Chalao
 

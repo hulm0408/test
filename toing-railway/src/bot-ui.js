@@ -477,6 +477,8 @@ export function registerBotUi({ bot, db, slotManager, firebaseManager = null, to
       `📊 <b>This Run:</b> ✅ Fresh Created <code>${fbSnap.createdInRun}</code> · 🚫 Reg Skipped <code>${fbSnap.skippedRegisteredInRun}</code> · ⏱ Timeout <code>${fbSnap.otpTimeoutsInRun}</code>`,
       ``,
       `🗂 <b>Saved Firebase databases:</b> <code>${h.total}</code> (🟢 ${h.live} live · ⏳ ${h.quarantined} quar · ❌ ${h.failed} fail · ⚪ ${h.neverTried} new)`,
+      `📬 <b>OTP delivery proof:</b> ✅ <code>${h.otpProven || 0}</code> DBs ne asli OTP diya · ⛔ <code>${h.otpDead || 0}</code> DBs OTP hi nahi dete (auto-demote 45m)`,
+      `<i>Sirf "pool load hua" kaafi nahi — asli test OTP aana hai. Jo DB OTP nahi deta wo peeche chala jata hai, aur jo device inbox me SMS nahi bhejta wo 30m skip hota hai.</i>`,
       formatPresenceReport(db.getSetting(REPORT_KEY)),
       `Count update: owner DM mein <code>${REPORT_FILE}</code> bhejo. Pehli line <code>status</code>, phir har distinct number ke liye sirf <code>active</code>, <code>inactive</code> ya <code>unknown</code>, ek per line. Numbers ya URLs nahi.`,
       primary ? `⭐ <b>First-Try Source:</b> <code>${esc(primary.name)}</code>` : `⚠️ <i>Koi Firebase source added nahi — Add Firebase (Bulk) se daalo.</i>`,
@@ -542,7 +544,7 @@ export function registerBotUi({ bot, db, slotManager, firebaseManager = null, to
 
     const lines = [
       `📋 <b>FIREBASE SOURCES</b> — Page ${cur}/${totalPages} (${list.length} total)`,
-      `<i>Proven live DBs pehle try hote hain; fail/empty DBs 30m quarantine me jate hain.</i>`,
+      `<i>✅ = asli OTP de chuka (sabse pehle). ⛔ = pool load hota hai par OTP nahi deta (45m demote). Fail/empty DBs 30m quarantine me.</i>`,
       '',
     ];
     if (!slice.length) {
@@ -550,13 +552,20 @@ export function registerBotUi({ bot, db, slotManager, firebaseManager = null, to
     } else {
       for (const s of slice) {
         const isQuar = Number(s.quarantinedUntil) > now;
-        const icon = isQuar ? '⏳' : s.lastOkAt > 0 ? '🟢' : s.failCount > 0 ? '❌' : '⚪';
+        const otpDead = Number(s.otpQuarantinedUntil) > now;
+        const otpProven = Number(s.otpOkCount) > 0;
+        const killed = isQuar || otpDead;
+        const icon = killed ? '⏳' : otpProven ? '✅' : s.lastOkAt > 0 ? '🟢' : s.failCount > 0 ? '❌' : '⚪';
         const star = s.primary ? '⭐ ' : '';
-        const meta = isQuar
-          ? `quar ${fmtDuration((s.quarantinedUntil - now) / 1000)}`
-          : s.latencyMs
-            ? `${s.latencyMs}ms`
-            : 'untested';
+        const meta = otpDead
+          ? `no OTP ${fmtDuration((s.otpQuarantinedUntil - now) / 1000)}`
+          : isQuar
+            ? `quar ${fmtDuration((s.quarantinedUntil - now) / 1000)}`
+            : otpProven
+              ? `OTP ✓${s.otpOkCount}${s.otpBestLatencyMs ? ` · ${(s.otpBestLatencyMs / 1000).toFixed(1)}s` : ''}`
+              : s.latencyMs
+                ? `pool ${s.latencyMs}ms`
+                : 'untested';
         lines.push(`${icon} ${star}<b>${esc(s.name)}</b> · <code>${esc(meta)}</code>${s.hasAuth ? ' 🔐' : ''}`);
       }
     }

