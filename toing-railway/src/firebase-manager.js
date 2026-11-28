@@ -57,6 +57,11 @@ export class FirebaseManager {
     this._legacyOffset = 0;
     this._sessionQueuedPhones = new Set();
     this._sourceTimeoutStreaks = new Map();
+    // Sources whose numbers all timed out stay eligible for a slower re-sweep
+    // (a panel can be alive but slow / temporarily behind). This is what stops
+    // the run from pinning itself to the same 10 sources forever.
+    this._retrySources = [];
+    this._retryPhoneNotBefore = new Map();
 
     // Live telemetry counters for Dashboard & /firebase
     this.passCount = 0;
@@ -113,6 +118,8 @@ export class FirebaseManager {
     this._legacyOffset = 0;
     this._sessionQueuedPhones = new Set();
     this._sourceTimeoutStreaks = new Map();
+    this._retrySources = [];
+    this._retryPhoneNotBefore = new Map();
     this.currentPoolSize = 0;
     this.currentUnseenSize = 0;
   }
@@ -120,6 +127,16 @@ export class FirebaseManager {
   // OTP delivery is the only real proof a panel works. Persist it per source
   // AND per device so the next pass skips both (this survives restarts —
   // the old in-memory streak was lost on every redeploy).
+  // A source that produced only timeouts is not "dead" — it may be slow, or its
+  // other devices may still deliver. Queue it for the next pass so the rotation
+  // keeps widening instead of looping over the same handful of sources.
+  _queueSourceRetry(source) {
+    if (!source?.id) return;
+    if (!this._retrySources.some((s) => s.id === source.id)) {
+      this._retrySources.push(source);
+    }
+  }
+
   _recordSourceOtpOutcome(source, receivedOtp, { deviceId = '', latencyMs = 0 } = {}) {
     const srcId = source?.id;
     if (!srcId) return;
@@ -245,7 +262,33 @@ export class FirebaseManager {
     return this._refillPromise;
   }
 
+  // A source demoted mid-pass (repeated OTP non-delivery) must stop feeding
+  // numbers IMMEDIATELY. Without this the once-per-pass snapshot kept handing
+  // out dead sources for hours, which is exactly the loop seen in production.
+  _dropQuarantinedSources() {
+    const now = Date.now();
+    let dropped = 0;
+    this._hotQueue = this._hotQueue.filter((c) => {
+      const q = Number(c?.source?.otpQuarantinedUntil || 0);
+      if (q > now) { dropped += 1; return false; }
+      return true;
+    });
+    if (dropped) this.logger?.info?.(`[Firebase] ⛔ ${dropped} candidate(s) dropped — source OTP deliver nahi kar raha`);
+    const deadIds = new Set(
+      this._runSources.filter((s) => Number(s?.otpQuarantinedUntil || 0) > now).map((s) => s.id)
+    );
+    if (deadIds.size) {
+      this._retrySources = (this._retrySources || []).filter((s) => !deadIds.has(s.id));
+      if (this._currentSource && deadIds.has(this._currentSource.id)) {
+        this._currentSource = null;
+        this._currentPool = [];
+      }
+    }
+    return dropped;
+  }
+
   async _pullCandidate() {
+    this._dropQuarantinedSources();
     if (this._hotQueue.length > 0) {
       this._kickRefill(); // keep the pipeline full behind us
       return this._hotQueue.shift();
@@ -285,7 +328,12 @@ export class FirebaseManager {
         if (this._isAborted()) return false;
       }
       this.passCount += 1;
-      this._runSources = freshSources;
+      // Re-sweep sources that only produced timeouts. Appended AFTER the fresh
+      // rotation so healthy panels are still tried first, but the run keeps
+      // moving instead of looping over the same narrow set.
+      const retryPool = (this._retrySources || []).filter((s) => !freshSources.some((f) => f.id === s.id));
+      this._retrySources = [];
+      this._runSources = retryPool.length ? [...freshSources, ...retryPool] : freshSources;
       this._sourceIdx = -1;
     }
 
@@ -418,14 +466,29 @@ export class FirebaseManager {
 
       this.lastScanChecked = scanRes.checked || 0;
       this.lastScanTotalDevices = scanRes.totalDevices || 0;
+      // Do NOT permanently mark every scanned device as "done": a device with
+      // more numbers is re-scanned next pass, so a panel that stayed silent but
+      // later starts forwarding still gets used. Only devices we actually have
+      // no numbers left for are skipped for the rest of this pass.
       for (const devId of scanRes.probedDeviceIds || []) {
         this._probedDevices.add(devId);
       }
 
       if (scanRes.fresh && scanRes.fresh.length > 0) {
+        // Only queue ONE number per device at a time. A panel either forwards
+        // SMS for a device or it doesn't — testing three numbers from the same
+        // silent device just burns three 60s waits. The rest of that device's
+        // numbers stay unused and are re-read later (it is not marked probed
+        // until the device has actually delivered or been quarantined).
+        const queuedDevices = new Set();
+        let queued = 0;
+        let skippedSameDevice = false;
         for (const item of scanRes.fresh) {
           const phone = item?.entry?.phone;
+          const devId = item?.entry?.deviceId || '';
           if (!phone || this._sessionQueuedPhones.has(phone)) continue;
+          if (devId && queuedDevices.has(devId)) { skippedSameDevice = true; continue; }
+          queuedDevices.add(devId);
           this._sessionQueuedPhones.add(phone);
           this._hotQueue.push({
             entry: item.entry,
@@ -433,8 +496,12 @@ export class FirebaseManager {
             lastActivityMs: item.lastActivityMs || null,
             onlineFallback: Boolean(item.onlineFallback),
           });
+          queued += 1;
         }
-        if (this._hotQueue.length > 0) return;
+        if (queued > 0) return;
+        // Everything fresh was from a device we just queued — do NOT burn the
+        // source, other devices still have untested numbers.
+        if (skippedSameDevice) continue;
       }
 
       // If scan produced nothing for remaining unprobed devices on this source, move to next source
@@ -661,16 +728,28 @@ export class FirebaseManager {
       }
 
       // 5 + 6. Poll Firebase SMS inbox & verify OTP (with stray/invalid OTP retry loop!)
-      // Adaptive budget: a source that already delivered fast does not deserve
-      // the full 60s wait on every number. If this source's best observed OTP
-      // latency is known, wait ~30s more than that (min 30s) — failures on such
-      // a source are far more likely to be dead devices than slow ones.
+      // Adaptive budget, from cheapest evidence to strongest:
+      //   • this source has delivered before  -> wait best latency + 20s
+      //   • this DEVICE has delivered before  -> wait its latency + 20s
+      //   • nothing proven yet                -> probe budget (short), and only
+      //     a FULL budget once a code actually landed here at least once
+      // Rationale: a panel that does not forward SMS never suddenly starts
+      // after 60s. Waiting the full 60s on every unknown device is what made
+      // the run look like "everything times out" while burning an hour per
+      // handful of numbers.
       const baseOtpBudgetMs = Math.max(5_000, Number(cfg.firebaseOtpTimeoutMs) || 60_000);
-      const knownLatencyMs = Number(source?.otpBestLatencyMs) || 0;
-      const adaptiveBudgetMs = knownLatencyMs > 0
-        ? Math.min(baseOtpBudgetMs, Math.max(30_000, knownLatencyMs + 30_000))
-        : baseOtpBudgetMs;
-      const otpBudgetMs = Math.max(5_000, adaptiveBudgetMs);
+      const sourceLatencyMs = Number(source?.otpBestLatencyMs) || 0;
+      const deviceLatencyMs = entry?.deviceId
+        ? Number(this.db.getFirebaseDeviceStat(source, entry.deviceId)?.lastOkLatencyMs) || 0
+        : 0;
+      const provenLatencyMs = sourceLatencyMs || deviceLatencyMs;
+      const probeBudgetMs = Math.max(
+        12_000,
+        Math.min(baseOtpBudgetMs, Number(cfg.firebaseOtpProbeMs) || 25_000)
+      );
+      const otpBudgetMs = provenLatencyMs > 0
+        ? Math.min(baseOtpBudgetMs, Math.max(probeBudgetMs, provenLatencyMs + 20_000))
+        : probeBudgetMs;
       const otpStartedAt = Date.now();
       const otpDeadline = otpStartedAt + otpBudgetMs;
       const rejectedCodes = new Set();
@@ -685,6 +764,7 @@ export class FirebaseManager {
           this.otpTimeoutsInRun += 1;
           laneState.fails += 1;
           this._recordSourceOtpOutcome(source, false, { deviceId: entry?.deviceId || '' });
+          this._queueSourceRetry(source);
           this.db.recordMetric(laneSlotId, 'otp_timeout', Date.now() - cycleStart);
           const coolMin = Number(cfg.otpTimeoutCooldownMin ?? 10);
           if (coolMin > 0) {
@@ -730,6 +810,7 @@ export class FirebaseManager {
           this.otpTimeoutsInRun += 1;
           laneState.fails += 1;
           this._recordSourceOtpOutcome(source, false, { deviceId: entry?.deviceId || '' });
+          this._queueSourceRetry(source);
           this.db.recordMetric(laneSlotId, 'otp_timeout', Date.now() - cycleStart);
           const coolMin = Number(cfg.otpTimeoutCooldownMin ?? 10);
           if (coolMin > 0) {

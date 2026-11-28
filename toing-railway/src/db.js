@@ -209,6 +209,7 @@ export class ToingDb {
         fail_streak INTEGER NOT NULL DEFAULT 0,
         last_ok_at INTEGER NOT NULL DEFAULT 0,
         last_fail_at INTEGER NOT NULL DEFAULT 0,
+        last_ok_latency_ms INTEGER NOT NULL DEFAULT 0,
         quarantined_until INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (source_key, device_id)
       );
@@ -230,6 +231,7 @@ export class ToingDb {
     addColumn('firebase_sources', 'otp_last_ok_at', 'otp_last_ok_at INTEGER NOT NULL DEFAULT 0');
     addColumn('firebase_sources', 'otp_quarantined_until', 'otp_quarantined_until INTEGER NOT NULL DEFAULT 0');
     addColumn('firebase_sources', 'otp_best_latency_ms', 'otp_best_latency_ms INTEGER NOT NULL DEFAULT 0');
+    addColumn('firebase_devices', 'last_ok_latency_ms', 'last_ok_latency_ms INTEGER NOT NULL DEFAULT 0');
   }
 
   withTransaction(fn) {
@@ -1607,12 +1609,14 @@ export class ToingDb {
       let lastOk = Number(dev?.last_ok_at || 0);
       let lastFail = Number(dev?.last_fail_at || 0);
       let quar = Number(dev?.quarantined_until || 0);
+      let devLatency = Number(dev?.last_ok_latency_ms || 0);
 
       if (ok) {
         okCount += 1;
         streak = 0;
         lastOk = now;
         quar = 0;
+        if (Number(latencyMs) > 0) devLatency = Math.round(Number(latencyMs));
       } else {
         failCount += 1;
         streak += 1;
@@ -1625,16 +1629,37 @@ export class ToingDb {
 
       this.db.prepare(`
         INSERT INTO firebase_devices
-          (source_key, device_id, otp_ok, otp_fail, fail_streak, last_ok_at, last_fail_at, quarantined_until)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          (source_key, device_id, otp_ok, otp_fail, fail_streak, last_ok_at, last_fail_at,
+           last_ok_latency_ms, quarantined_until)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(source_key, device_id) DO UPDATE SET
           otp_ok = excluded.otp_ok, otp_fail = excluded.otp_fail, fail_streak = excluded.fail_streak,
           last_ok_at = excluded.last_ok_at, last_fail_at = excluded.last_fail_at,
+          last_ok_latency_ms = excluded.last_ok_latency_ms,
           quarantined_until = excluded.quarantined_until
-      `).run(key, String(deviceId), okCount, failCount, streak, lastOk, lastFail, quar);
+      `).run(key, String(deviceId), okCount, failCount, streak, lastOk, lastFail, devLatency, quar);
     }
 
     return id ? this.getFirebaseSource(id) : null;
+  }
+
+  getFirebaseDeviceStat(sourceOrUrl, deviceId) {
+    const key = normalizeSourceUrl(typeof sourceOrUrl === 'string' ? sourceOrUrl : sourceOrUrl?.url);
+    if (!key || !deviceId) return null;
+    const row = this.db.prepare(
+      'SELECT * FROM firebase_devices WHERE source_key = ? AND device_id = ?'
+    ).get(key, String(deviceId));
+    if (!row) return null;
+    return {
+      deviceId: String(row.device_id),
+      otpOk: Number(row.otp_ok || 0),
+      otpFail: Number(row.otp_fail || 0),
+      failStreak: Number(row.fail_streak || 0),
+      lastOkAt: Number(row.last_ok_at || 0),
+      lastFailAt: Number(row.last_fail_at || 0),
+      lastOkLatencyMs: Number(row.last_ok_latency_ms || 0),
+      quarantinedUntil: Number(row.quarantined_until || 0),
+    };
   }
 
   // Devices whose inbox has repeatedly failed to deliver -> skip them entirely.

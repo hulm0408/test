@@ -472,7 +472,7 @@ export function registerBotUi({ bot, db, slotManager, firebaseManager = null, to
       ``,
       `🔘 <b>Firebase Mode:</b> <b>${fbMode ? 'ON ✅ (Active)' : 'OFF (Telegram OTP Bots Active)'}</b>`,
       `🚫 <b>Already-Registered Rule:</b> <b>Hamesha SKIP ✅</b> (sirf FRESH <code>is_new=true</code> par OTP &amp; signup)`,
-      `⚡ <b>Engine:</b> <b>${fbSnap.desiredRunning ? `RUNNING (${fbSnap.activeLanes}/${cfg.firebaseConcurrency} lanes)` : 'STOPPED'}</b> · <b>FB OTP Timeout:</b> <code>${Math.round(cfg.firebaseOtpTimeoutMs / 1000)}s</code>`,
+      `⚡ <b>Engine:</b> <b>${fbSnap.desiredRunning ? `RUNNING (${fbSnap.activeLanes}/${cfg.firebaseConcurrency} lanes)` : 'STOPPED'}</b> · <b>FB OTP:</b> <code>${Math.round((cfg.firebaseOtpProbeMs ?? 25_000) / 1000)}s probe</code> → <code>${Math.round(cfg.firebaseOtpTimeoutMs / 1000)}s</code> (jo DB OTP de chuka hai uske liye full wait)`,
       stageStr ? `🔄 <b>Stages:</b> <code>${esc(stageStr)}</code>` : '',
       `📊 <b>This Run:</b> ✅ Fresh Created <code>${fbSnap.createdInRun}</code> · 🚫 Reg Skipped <code>${fbSnap.skippedRegisteredInRun}</code> · ⏱ Timeout <code>${fbSnap.otpTimeoutsInRun}</code>`,
       ``,
