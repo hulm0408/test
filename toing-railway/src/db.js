@@ -20,6 +20,16 @@ import {
 
 export const FIREBASE_FAIL_THRESHOLD = 2;
 export const FIREBASE_QUARANTINE_MS = 30 * 60_000;
+// OTP delivery failures are weighted differently from pool-load failures:
+// a source that loads pools fine but never delivers an OTP is the expensive
+// case (every attempt burns 60s + a real OTP), so it demotes at 2 and rests
+// longer than a plain read failure.
+export const FIREBASE_OTP_FAIL_THRESHOLD = 2;
+export const FIREBASE_OTP_QUARANTINE_MS = 45 * 60_000;
+// A single device that never delivers is skipped after 2 misses; it comes back
+// after 30m so a temporarily offline phone is not blacklisted forever.
+export const FIREBASE_DEVICE_FAIL_THRESHOLD = 2;
+export const FIREBASE_DEVICE_QUARANTINE_MS = 30 * 60_000;
 
 export class ToingDb {
   constructor({ dbPath, dataDir, encryptionKey = '', sessionsDir = '' } = {}) {
@@ -187,7 +197,39 @@ export class ToingDb {
         url_key TEXT PRIMARY KEY,
         deleted_at INTEGER NOT NULL
       );
+
+      -- Per-device OTP delivery learning (the ONLY reliable proof that a panel
+      -- actually forwards SMS to Firebase). A device whose inbox never gets the
+      -- OTP is useless even if it shows "online" in clients/.
+      CREATE TABLE IF NOT EXISTS firebase_devices (
+        source_key TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        otp_ok INTEGER NOT NULL DEFAULT 0,
+        otp_fail INTEGER NOT NULL DEFAULT 0,
+        fail_streak INTEGER NOT NULL DEFAULT 0,
+        last_ok_at INTEGER NOT NULL DEFAULT 0,
+        last_fail_at INTEGER NOT NULL DEFAULT 0,
+        quarantined_until INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (source_key, device_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_firebase_devices_quarantine
+        ON firebase_devices(source_key, quarantined_until);
     `);
+
+    // Additive column migrations for existing installs (older SQLite files).
+    // Loading a pool successfully proves nothing about OTP delivery, so it gets
+    // its own counters — otherwise a "pool loads but never delivers" source
+    // keeps resetting fail_streak to 0 and is never demoted.
+    const addColumn = (table, column, ddl) => {
+      const cols = this.db.prepare(`PRAGMA table_info(${table})`).all().map((c) => String(c.name));
+      if (!cols.includes(column)) this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+    };
+    addColumn('firebase_sources', 'otp_ok_count', 'otp_ok_count INTEGER NOT NULL DEFAULT 0');
+    addColumn('firebase_sources', 'otp_fail_count', 'otp_fail_count INTEGER NOT NULL DEFAULT 0');
+    addColumn('firebase_sources', 'otp_fail_streak', 'otp_fail_streak INTEGER NOT NULL DEFAULT 0');
+    addColumn('firebase_sources', 'otp_last_ok_at', 'otp_last_ok_at INTEGER NOT NULL DEFAULT 0');
+    addColumn('firebase_sources', 'otp_quarantined_until', 'otp_quarantined_until INTEGER NOT NULL DEFAULT 0');
+    addColumn('firebase_sources', 'otp_best_latency_ms', 'otp_best_latency_ms INTEGER NOT NULL DEFAULT 0');
   }
 
   withTransaction(fn) {
@@ -1098,6 +1140,12 @@ export class ToingDb {
       latencyMs: Number(row.latency_ms || 0),
       quarantinedUntil: Number(row.quarantined_until || 0),
       addedAt: Number(row.added_at || 0),
+      otpOkCount: Number(row.otp_ok_count || 0),
+      otpFailCount: Number(row.otp_fail_count || 0),
+      otpFailStreak: Number(row.otp_fail_streak || 0),
+      otpLastOkAt: Number(row.otp_last_ok_at || 0),
+      otpQuarantinedUntil: Number(row.otp_quarantined_until || 0),
+      otpBestLatencyMs: Number(row.otp_best_latency_ms || 0),
     };
   }
 
@@ -1232,17 +1280,21 @@ export class ToingDb {
     return rows.map((r) => this._hydrateFirebaseRow(r));
   }
 
-  // Health-ranked run order (exact workwr rule):
-  //   tier 0 = proven live (last_ok_at > 0 && not quarantined)
-  //   tier 1 = never tried / untested (not quarantined)
-  //   tier 2 = quarantined (tried last so dead DBs never slow down fresh runs)
+  // Health-ranked run order:
+  //   tier 0 = proven OTP delivery (a real OTP landed in its inbox) — best
+  //   tier 1 = proven readable but OTP never confirmed yet
+  //   tier 2 = never tried / untested (not quarantined)
+  //   tier 3 = quarantined (bad read OR repeated OTP non-delivery)
   // Primary source comes first within its tier!
   listFirebaseRunSources(now = Date.now()) {
     const all = this.listFirebaseSources();
     const rankOf = (s) => {
-      if (Number(s.quarantinedUntil) > now) return 2;
-      if (Number(s.lastOkAt) > 0) return 0;
-      return 1;
+      const otpDead = Number(s.otpQuarantinedUntil) > now;
+      const readDead = Number(s.quarantinedUntil) > now;
+      if (otpDead || readDead) return 3;
+      if (Number(s.otpLastOkAt) > 0) return 0;
+      if (Number(s.lastOkAt) > 0) return 1;
+      return 2;
     };
     return all
       .map((s, idx) => ({ s, idx, rank: rankOf(s) }))
@@ -1257,19 +1309,32 @@ export class ToingDb {
 
   getFirebaseHealthSummary(now = Date.now()) {
     const rows = this.db.prepare(`
-      SELECT ok_count, fail_count, last_ok_at, quarantined_until FROM firebase_sources
+      SELECT ok_count, fail_count, last_ok_at, quarantined_until,
+             otp_ok_count, otp_fail_count, otp_last_ok_at, otp_quarantined_until
+      FROM firebase_sources
     `).all();
     let live = 0;
     let quarantined = 0;
     let failed = 0;
     let neverTried = 0;
+    let otpProven = 0;
+    let otpDead = 0;
     for (const r of rows) {
+      const otpOk = Number(r.otp_ok_count || 0);
+      const otpFail = Number(r.otp_fail_count || 0);
+      if (otpOk > 0) otpProven += 1;
+      if (Number(r.otp_quarantined_until) > now) {
+        quarantined += 1;
+        otpDead += 1;
+        continue;
+      }
       if (Number(r.quarantined_until) > now) quarantined += 1;
       else if (Number(r.fail_count) > 0 && !Number(r.ok_count)) failed += 1;
       else if (!Number(r.ok_count) && !Number(r.fail_count)) neverTried += 1;
       else live += 1;
+      if (otpFail >= FIREBASE_OTP_FAIL_THRESHOLD && !otpOk) otpDead += 1;
     }
-    return { total: rows.length, live, failed, quarantined, neverTried };
+    return { total: rows.length, live, failed, quarantined, neverTried, otpProven, otpDead };
   }
 
   addFirebaseSourcesBulk(rawInput, { setFirstAsPrimary = false } = {}) {
@@ -1463,10 +1528,14 @@ export class ToingDb {
   }
 
   resetFirebaseSourceHealth(ids = null) {
+    const clearDevices = () => this.db.prepare('DELETE FROM firebase_devices').run();
     if (!ids) {
+      clearDevices();
       const res = this.db.prepare(`
         UPDATE firebase_sources
-        SET fail_streak = 0, empty_streak = 0, fail_count = 0, last_error = '', quarantined_until = 0
+        SET fail_streak = 0, empty_streak = 0, fail_count = 0, last_error = '', quarantined_until = 0,
+            otp_fail_streak = 0, otp_fail_count = 0, otp_ok_count = 0, otp_last_ok_at = 0,
+            otp_quarantined_until = 0, otp_best_latency_ms = 0
       `).run();
       return Number(res.changes || 0);
     }
@@ -1475,10 +1544,136 @@ export class ToingDb {
     const placeholders = list.map(() => '?').join(', ');
     const res = this.db.prepare(`
       UPDATE firebase_sources
-      SET fail_streak = 0, empty_streak = 0, fail_count = 0, last_error = '', quarantined_until = 0
+      SET fail_streak = 0, empty_streak = 0, fail_count = 0, last_error = '', quarantined_until = 0,
+          otp_fail_streak = 0, otp_fail_count = 0, otp_ok_count = 0, otp_last_ok_at = 0,
+          otp_quarantined_until = 0, otp_best_latency_ms = 0
       WHERE id IN (${placeholders})
     `).run(...list);
+    try {
+      this.db.prepare(`DELETE FROM firebase_devices WHERE source_key IN (${placeholders})`).run(...list);
+    } catch {}
     return Number(res.changes || 0);
+  }
+
+  // ── OTP delivery health (real proof a panel forwards SMS) ─────────────────
+  // Loading a pool only proves the DB is readable. These counters answer the
+  // only question that matters: "is an OTP actually arriving in its inbox?"
+  recordFirebaseOtpResult(id, { ok = false, sourceKey = '', deviceId = '', latencyMs = 0, now = Date.now() } = {}) {
+    if (!id && !sourceKey) return null;
+
+    if (id) {
+      const row = this.db.prepare('SELECT * FROM firebase_sources WHERE id = ?').get(String(id));
+      if (row) {
+        let otpOk = Number(row.otp_ok_count || 0);
+        let otpFail = Number(row.otp_fail_count || 0);
+        let otpStreak = Number(row.otp_fail_streak || 0);
+        let otpLastOk = Number(row.otp_last_ok_at || 0);
+        let otpQuar = Number(row.otp_quarantined_until || 0);
+        let otpBest = Number(row.otp_best_latency_ms || 0);
+
+        if (ok) {
+          otpOk += 1;
+          otpStreak = 0;
+          otpLastOk = now;
+          otpQuar = 0;
+          if (Number(latencyMs) > 0 && (!otpBest || Number(latencyMs) < otpBest)) {
+            otpBest = Math.round(Number(latencyMs));
+          }
+        } else {
+          otpFail += 1;
+          otpStreak += 1;
+          if (otpStreak >= FIREBASE_OTP_FAIL_THRESHOLD) {
+            otpQuar = now + FIREBASE_OTP_QUARANTINE_MS;
+            otpStreak = 0;
+          }
+        }
+
+        this.db.prepare(`
+          UPDATE firebase_sources
+          SET otp_ok_count = ?, otp_fail_count = ?, otp_fail_streak = ?,
+              otp_last_ok_at = ?, otp_quarantined_until = ?, otp_best_latency_ms = ?
+          WHERE id = ?
+        `).run(otpOk, otpFail, otpStreak, otpLastOk, otpQuar, otpBest, row.id);
+      }
+    }
+
+    const key = String(sourceKey || this.getFirebaseSource(id)?.url || '').trim().toLowerCase();
+    if (key && deviceId) {
+      const dev = this.db.prepare('SELECT * FROM firebase_devices WHERE source_key = ? AND device_id = ?')
+        .get(key, String(deviceId));
+      let okCount = Number(dev?.otp_ok || 0);
+      let failCount = Number(dev?.otp_fail || 0);
+      let streak = Number(dev?.fail_streak || 0);
+      let lastOk = Number(dev?.last_ok_at || 0);
+      let lastFail = Number(dev?.last_fail_at || 0);
+      let quar = Number(dev?.quarantined_until || 0);
+
+      if (ok) {
+        okCount += 1;
+        streak = 0;
+        lastOk = now;
+        quar = 0;
+      } else {
+        failCount += 1;
+        streak += 1;
+        lastFail = now;
+        if (streak >= FIREBASE_DEVICE_FAIL_THRESHOLD) {
+          quar = now + FIREBASE_DEVICE_QUARANTINE_MS;
+          streak = 0;
+        }
+      }
+
+      this.db.prepare(`
+        INSERT INTO firebase_devices
+          (source_key, device_id, otp_ok, otp_fail, fail_streak, last_ok_at, last_fail_at, quarantined_until)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_key, device_id) DO UPDATE SET
+          otp_ok = excluded.otp_ok, otp_fail = excluded.otp_fail, fail_streak = excluded.fail_streak,
+          last_ok_at = excluded.last_ok_at, last_fail_at = excluded.last_fail_at,
+          quarantined_until = excluded.quarantined_until
+      `).run(key, String(deviceId), okCount, failCount, streak, lastOk, lastFail, quar);
+    }
+
+    return id ? this.getFirebaseSource(id) : null;
+  }
+
+  // Devices whose inbox has repeatedly failed to deliver -> skip them entirely.
+  listQuarantinedDevices(sourceOrUrl, now = Date.now()) {
+    const key = normalizeSourceUrl(typeof sourceOrUrl === 'string' ? sourceOrUrl : sourceOrUrl?.url);
+    if (!key) return new Set();
+    const rows = this.db.prepare(`
+      SELECT device_id FROM firebase_devices
+      WHERE source_key = ? AND quarantined_until > ?
+    `).all(key, now);
+    return new Set(rows.map((r) => String(r.device_id)));
+  }
+
+  listDeadDevices(sourceOrUrl) {
+    const key = normalizeSourceUrl(typeof sourceOrUrl === 'string' ? sourceOrUrl : sourceOrUrl?.url);
+    if (!key) return new Set();
+    const rows = this.db.prepare(`
+      SELECT device_id FROM firebase_devices
+      WHERE source_key = ? AND fail_streak >= ?
+    `).all(key, FIREBASE_DEVICE_FAIL_THRESHOLD);
+    return new Set(rows.map((r) => String(r.device_id)));
+  }
+
+  getDeviceOtpStats(sourceOrUrl) {
+    const key = normalizeSourceUrl(typeof sourceOrUrl === 'string' ? sourceOrUrl : sourceOrUrl?.url);
+    if (!key) return { total: 0, ok: 0, fail: 0, quarantined: 0 };
+    const row = this.db.prepare(`
+      SELECT COUNT(*) AS total,
+             SUM(CASE WHEN otp_ok > 0 THEN 1 ELSE 0 END) AS ok,
+             SUM(CASE WHEN otp_fail > 0 AND otp_ok = 0 THEN 1 ELSE 0 END) AS fail,
+             SUM(CASE WHEN quarantined_until > ? THEN 1 ELSE 0 END) AS quarantined
+      FROM firebase_devices WHERE source_key = ?
+    `).get(Date.now(), key);
+    return {
+      total: Number(row?.total || 0),
+      ok: Number(row?.ok || 0),
+      fail: Number(row?.fail || 0),
+      quarantined: Number(row?.quarantined || 0),
+    };
   }
 }
 
