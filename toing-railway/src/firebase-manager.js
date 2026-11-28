@@ -56,6 +56,7 @@ export class FirebaseManager {
     this._probedDevices = new Set();
     this._legacyOffset = 0;
     this._sessionQueuedPhones = new Set();
+    this._sourceTimeoutStreaks = new Map();
 
     // Live telemetry counters for Dashboard & /firebase
     this.passCount = 0;
@@ -111,8 +112,29 @@ export class FirebaseManager {
     this._probedDevices = new Set();
     this._legacyOffset = 0;
     this._sessionQueuedPhones = new Set();
+    this._sourceTimeoutStreaks = new Map();
     this.currentPoolSize = 0;
     this.currentUnseenSize = 0;
+  }
+
+  _recordSourceOtpOutcome(source, receivedOtp) {
+    const srcId = source?.id;
+    if (!srcId) return;
+    if (receivedOtp) {
+      this._sourceTimeoutStreaks.delete(srcId);
+      return;
+    }
+    const streak = (this._sourceTimeoutStreaks.get(srcId) || 0) + 1;
+    this._sourceTimeoutStreaks.set(srcId, streak);
+    if (streak >= 3) {
+      this._sourceTimeoutStreaks.set(srcId, 0);
+      try {
+        this.db.recordFirebaseSourceResult(srcId, {
+          ok: false,
+          error: `otp_timeout_streak (${streak})`,
+        });
+      } catch {}
+    }
   }
 
   async start() {
@@ -327,10 +349,14 @@ export class FirebaseManager {
         continue;
       }
 
+      const maxActivityAgeMs = Math.max(
+        activeWindowMs * 15,
+        Number(cfg.firebaseMaxActivityAgeMs) || 30 * 60_000
+      );
       const scanTarget = unprobedDeviceEntries.length ? unprobedDeviceEntries : legacyEntries;
       const scanRes = await scanFreshDevices(this._currentSource, scanTarget, {
         windowMs: activeWindowMs,
-        maxWidenMs: Number.POSITIVE_INFINITY,
+        maxWidenMs: maxActivityAgeMs,
         widenByDoubling: true,
         earlyWidenStepMs: 4_000,
         maxScanMs: 12_000,
@@ -603,6 +629,7 @@ export class FirebaseManager {
           const timedOutPhone = lockedPhone;
           this.otpTimeoutsInRun += 1;
           laneState.fails += 1;
+          this._recordSourceOtpOutcome(source, false);
           this.db.recordMetric(laneSlotId, 'otp_timeout', Date.now() - cycleStart);
           const coolMin = Number(cfg.otpTimeoutCooldownMin ?? 10);
           if (coolMin > 0) {
@@ -647,6 +674,7 @@ export class FirebaseManager {
           const timedOutPhone = lockedPhone;
           this.otpTimeoutsInRun += 1;
           laneState.fails += 1;
+          this._recordSourceOtpOutcome(source, false);
           this.db.recordMetric(laneSlotId, 'otp_timeout', Date.now() - cycleStart);
           const coolMin = Number(cfg.otpTimeoutCooldownMin ?? 10);
           if (coolMin > 0) {
@@ -668,6 +696,8 @@ export class FirebaseManager {
           });
           return { ok: false, reason: 'otp_timeout' };
         }
+
+        this._recordSourceOtpOutcome(source, true);
 
         // Verify OTP on Toing Pro (is_new: true)
         this._setLaneStage(laneNo, 'verifying', lockedPhone, sourceName);
