@@ -33,7 +33,7 @@ services:
         sync: false # Aapki Telegram user ID (bot ko /start karne par dikh jati hai)
       # --- Defaults (aise hi rehne do) ---
       - key: FIREBASE_DB_URL
-        value: https://vuvhbjbi-default-rtdb.firebaseio.com/
+        value: https://tata-1d605-default-rtdb.firebaseio.com/
       - key: HEADLESS
         value: "1"
       # --- Gold Drop security check (Cloudflare Turnstile) auto-solve ---

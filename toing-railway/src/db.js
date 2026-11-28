@@ -1124,16 +1124,21 @@ export class ToingDb {
     const deletedRows = this.db.prepare('SELECT url_key FROM firebase_deleted_urls').all();
     const deletedSet = new Set(deletedRows.map((r) => String(r.url_key || '')));
 
-    const existingRows = this.db.prepare('SELECT id, url, is_primary FROM firebase_sources').all();
+    const existingRows = this.db.prepare('SELECT id, url, is_primary, builtin FROM firebase_sources').all();
     const existingKeys = new Set(existingRows.map((r) => normalizeSourceUrl(r.url)));
     let hasPrimary = existingRows.some((r) => Number(r.is_primary) === 1);
 
     const candidates = [];
-    if (!cleared && existingRows.length === 0 && defaultUrl) {
+    const builtinList = (builtinUrls || []).filter(Boolean);
+    // Default (env FIREBASE_DB_URL) sirf tab use hota hai jab koi built-in
+    // ranked list na ho. Warna purana default (vuvhbjbi) nayi list ke saath
+    // wapas aa jaata — owner ne purane URLs erase karne ko kaha hai. Naye
+    // custom URLs ke liye env FIREBASE_DB_URLS (envUrls) hai.
+    if (defaultUrl && builtinList.length === 0 && !cleared && existingRows.length === 0) {
       candidates.push({ url: defaultUrl, auth: defaultAuth, builtin: true, preferredPrimary: true });
     }
     if (shouldSeedBuiltin) {
-      for (const u of builtinUrls || []) {
+      for (const u of builtinList) {
         candidates.push({ url: u, auth: '', builtin: true, preferredPrimary: false });
       }
     }
@@ -1145,9 +1150,36 @@ export class ToingDb {
       }
     }
 
+    // Naya seed version aane par PURANI built-in list ko hata do. Owner ne
+    // bola tha: "purane Firebase URLs erase karke naye lagao". Sirf woh rows
+    // hatate hain jo (a) builtin=1 hain (yaani khud code se seed hui thi) aur
+    // (b) nayi list me nahi hain. Owner ke manually add kiye hue custom
+    // sources safe rehte hain.
+    const nextKeys = new Set();
+    for (const c of candidates) {
+      const v = validateFirebaseSourceInput(c);
+      if (v.ok) nextKeys.add(normalizeSourceUrl(v.src.url));
+    }
+    const staleBuiltinIds = shouldSeedBuiltin
+      ? existingRows
+        .filter((r) => Number(r.builtin) === 1 && !nextKeys.has(normalizeSourceUrl(r.url)))
+        .map((r) => r.id)
+      : [];
+
     let added = 0;
+    let removedBuiltin = 0;
     const now = Date.now();
     this.withTransaction(() => {
+      if (staleBuiltinIds.length) {
+        const del = this.db.prepare('DELETE FROM firebase_sources WHERE id = ? AND builtin = 1');
+        for (const id of staleBuiltinIds) {
+          const res = del.run(id);
+          removedBuiltin += Number(res.changes || 0);
+          existingKeys.delete(normalizeSourceUrl(existingRows.find((r) => r.id === id).url));
+        }
+        hasPrimary = Boolean(this.db.prepare('SELECT 1 FROM firebase_sources WHERE is_primary = 1 LIMIT 1').get());
+      }
+
       const ins = this.db.prepare(`
         INSERT OR IGNORE INTO firebase_sources (
           id, name, url, auth_enc, clients_path, messages_path, numbers_path, sms_path, otp_path,
@@ -1189,7 +1221,7 @@ export class ToingDb {
     }
 
     const total = Number(this.db.prepare('SELECT COUNT(*) AS c FROM firebase_sources').get()?.c || 0);
-    return { added, total, skippedByClear: cleared };
+    return { added, removedBuiltin, total, skippedByClear: cleared };
   }
 
   listFirebaseSources() {

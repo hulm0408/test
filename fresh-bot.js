@@ -20,7 +20,7 @@
 // Setup (sirf 2 cheezein):
 //   .env → BOT_TOKEN=<BotFather ka token>   (AUTOPILOT_BOT_TOKEN bhi chalega)
 //          OWNER_IDS=<aapka Telegram id>    (warna store boss + fallback)
-//   FIREBASE_DB_URL ki zaroorat NAHI — default hi vuvhbjbi Firebase hai.
+//   FIREBASE_DB_URL ki zaroorat NAHI — default hi ranked #1 Firebase hai.
 //
 // Chalao:  node fresh-bot.js   (ya npm start)
 
@@ -28,7 +28,7 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 // OTP + numbers dono ISI Firebase se aate hain (premium/firebase koi third source nahi)
-process.env.FIREBASE_DB_URL ||= 'https://vuvhbjbi-default-rtdb.firebaseio.com/';
+process.env.FIREBASE_DB_URL ||= 'https://tata-1d605-default-rtdb.firebaseio.com/';
 
 // Dynamic import — defaults set karne KE BAAD hi modules load ho, warna
 // firebase-numbers.js env ko call-time par hi padhta hai, phir bhi safe side.

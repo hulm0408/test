@@ -1880,8 +1880,12 @@ test('25. Firebase source seeding, encrypted auth, ranking, quarantine and delet
   const dir = makeTmpDir();
   try {
     const db = new ToingDb({ dbPath: path.join(dir, 'db.sqlite'), dataDir: dir, encryptionKey: 'firebase-source-test-key' });
-    assert.equal(BUILTIN_FIREBASE_SOURCE_URLS.length, 440);
-    assert.equal(db.seedFirebaseSources().total, 440);
+    assert.equal(BUILTIN_FIREBASE_SOURCE_URLS.length, 965);
+    assert.equal(db.seedFirebaseSources().total, 965);
+    // Ranked list: sabse zyada online devices wala DB primary + sabse pehle.
+    assert.equal(db.listFirebaseSources()[0].url, 'https://tata-1d605-default-rtdb.firebaseio.com');
+    const deadUrls = ['https://hospital-17-default-rtdb.firebaseio.com', 'https://b.firebaseio.com', 'https://n-ka-land-default-rtdb.firebaseio.com', 'https://8c69-default-rtdb.firebaseio.com', 'https://-default-rtdb.firebaseio.com'];
+    assert.ok(BUILTIN_FIREBASE_SOURCE_URLS.every((u) => !deadUrls.includes(u.toLowerCase())), 'dead URLs seed list me nahi');
     const added = db.addFirebaseSourcesBulk('https://custom-source.firebaseio.com|secret-auth', { setFirstAsPrimary: true });
     assert.equal(added.added.length, 1);
     const id = added.added[0].id;
@@ -1901,11 +1905,31 @@ test('25. Firebase source seeding, encrypted auth, ranking, quarantine and delet
     assert.equal(ranked.at(-1).id, id);
     assert.equal(db.setPrimaryFirebaseSource(other.id).ok, true);
     assert.equal(db.removeFirebaseSource(other.id).ok, true);
-    db.seedFirebaseSources({ seedVersion: 4 });
+    db.seedFirebaseSources({ seedVersion: 5 });
     assert.equal(db.listFirebaseSources().some((s) => s.url === other.url), false);
     db.removeAllFirebaseSources();
-    db.seedFirebaseSources({ seedVersion: 5 });
+    db.seedFirebaseSources({ seedVersion: 6 });
     assert.equal(db.listFirebaseSources().length, 0);
+    db.close();
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('25b. Naya seed version purani built-in list ERASE karta hai, custom sources safe rehte hain', () => {
+  const dir = makeTmpDir();
+  try {
+    const db = new ToingDb({ dbPath: path.join(dir, 'db.sqlite'), dataDir: dir, encryptionKey: 'firebase-erase-test-key' });
+    const oldList = ['https://old-a.firebaseio.com', 'https://old-b.firebaseio.com'];
+    assert.equal(db.seedFirebaseSources({ builtinUrls: oldList, defaultUrl: '' }).total, 2);
+    assert.equal(db.addFirebaseSourcesBulk('https://my-own.firebaseio.com').added.length, 1);
+    assert.equal(db.listFirebaseSources().length, 3);
+
+    const res = db.seedFirebaseSources({ builtinUrls: ['https://new-a.firebaseio.com'], defaultUrl: '', seedVersion: 9 });
+    assert.equal(res.removedBuiltin, 2);
+    const urls = db.listFirebaseSources().map((s) => s.url);
+    assert.deepEqual(urls.sort(), ['https://my-own.firebaseio.com', 'https://new-a.firebaseio.com']);
+    // Purani built-in URLs dobara seed par wapas nahi aati.
+    db.seedFirebaseSources({ builtinUrls: oldList, defaultUrl: '', seedVersion: 9 });
+    assert.equal(db.listFirebaseSources().length, 2);
     db.close();
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
