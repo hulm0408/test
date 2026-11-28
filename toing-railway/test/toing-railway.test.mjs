@@ -2135,3 +2135,94 @@ test('30. scanFreshDevices skips devices that are known non-deliverers', async (
   assert.equal(probes.some((u) => u.includes('/messages/dead.json')), false, 'dead device is never probed');
   assert.deepEqual(res.fresh.map((f) => f.entry.phone), ['9222222222']);
 });
+
+test('31. Unproven sources get a short probe budget instead of the full OTP wait', async () => {
+  const dir = makeTmpDir();
+  try {
+    const db = new ToingDb({ dbPath: path.join(dir, 'db.sqlite'), dataDir: dir, encryptionKey: 'probe-budget-key' });
+    const source = { id: 'p', name: 'unproven', url: 'https://unproven.firebaseio.com', otpBestLatencyMs: 0 };
+    const started = Date.now();
+    const manager = new FirebaseManager({
+      db, logger: {}, otpInitialWaitMs: 0, otpPollMs: 50,
+      // Firebase OTP timeout is 60s, but nothing has ever proven delivery here.
+      getRuntimeConfig: () => ({
+        usedCooldownDays: 30, claimLockTtlMs: 60_000, firebaseOtpTimeoutMs: 60_000,
+        firebaseOtpProbeMs: 8_000, deliveryChatId: '1',
+      }),
+      fetchImpl: async () => ({ ok: true, async json() { return null; }, async text() { return ''; } }),
+      toingClient: {
+        async checkMobile() { return { ok: true, registered: false }; },
+        async sendOtp() { return { ok: true, sid: 's', tid: 't' }; },
+        async verifyOtp() { return { ok: true }; },
+        async exportAccount(m) { return { exportObj: { mobile: m, token: 't' } }; },
+      },
+    });
+    manager.desiredRunning = true;
+    const res = await manager._processCandidate(1, { entry: { phone: '9000000001', deviceId: 'd1' }, source });
+    const tookMs = Date.now() - started;
+    assert.equal(res.reason, 'otp_timeout');
+    assert.ok(tookMs < 20_000, `unproven source must not burn the full 60s (took ${tookMs}ms)`);
+    // The failing source is queued for a later sweep rather than being dropped.
+    assert.ok(manager._retrySources.some((s) => s.id === source.id), 'timed-out source is queued for re-sweep');
+
+    // And the failure is remembered per device so the next attempt skips it.
+    assert.equal(db.listQuarantinedDevices(source).has('d1'), false, 'one miss is not yet a quarantine');
+    db.recordFirebaseOtpResult(source.id, { ok: false, sourceKey: source.url, deviceId: 'd1' });
+    assert.equal(db.listQuarantinedDevices(source).has('d1'), true, 'second miss quarantines the device');
+    db.close();
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('32. A proven source waits only its measured latency + margin, not the full timeout', async () => {
+  const dir = makeTmpDir();
+  try {
+    const db = new ToingDb({ dbPath: path.join(dir, 'db.sqlite'), dataDir: dir, encryptionKey: 'proven-budget-key' });
+    const source = { id: 'q', name: 'fast', url: 'https://fast.firebaseio.com', otpBestLatencyMs: 3_000 };
+    const started = Date.now();
+    const manager = new FirebaseManager({
+      db, logger: {}, otpInitialWaitMs: 0, otpPollMs: 50,
+      getRuntimeConfig: () => ({
+        usedCooldownDays: 30, claimLockTtlMs: 60_000, firebaseOtpTimeoutMs: 60_000,
+        firebaseOtpProbeMs: 25_000, deliveryChatId: '1',
+      }),
+      fetchImpl: async () => ({ ok: true, async json() { return null; }, async text() { return ''; } }),
+      toingClient: {
+        async checkMobile() { return { ok: true, registered: false }; },
+        async sendOtp() { return { ok: true, sid: 's', tid: 't' }; },
+        async verifyOtp() { return { ok: true }; },
+        async exportAccount(m) { return { exportObj: { mobile: m, token: 't' } }; },
+      },
+    });
+    manager.desiredRunning = true;
+    const res = await manager._processCandidate(1, { entry: { phone: '9000000002', deviceId: 'd2' }, source });
+    const tookMs = Date.now() - started;
+    assert.equal(res.reason, 'otp_timeout');
+    assert.ok(tookMs < 30_000, `3s-latency source should stop early (took ${tookMs}ms)`);
+    db.close();
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('33. A source quarantined mid-pass stops feeding candidates immediately', async () => {
+  const dir = makeTmpDir();
+  try {
+    const db = new ToingDb({ dbPath: path.join(dir, 'db.sqlite'), dataDir: dir, encryptionKey: 'drop-live-key' });
+    const manager = new FirebaseManager({
+      db, logger: {}, fetchImpl: async () => ({ ok: true, async json() { return null; }, async text() { return ''; } }),
+      getRuntimeConfig: () => ({ firebaseConcurrency: 2, deliveryChatId: '1' }),
+    });
+    const dead = {
+      id: 'dead', uuid: 'dead', name: 'dead-panel', url: 'https://dead.firebaseio.com',
+      otpQuarantinedUntil: Date.now() + 45 * 60_000,
+    };
+    const live = { id: 'live', name: 'live-panel', url: 'https://live.firebaseio.com', otpQuarantinedUntil: 0 };
+    manager._runSources = [dead, live];
+    manager._hotQueue = [
+      { entry: { phone: '9000000010' }, source: dead },
+      { entry: { phone: '9000000011' }, source: live },
+    ];
+    const first = await manager._pullCandidate();
+    assert.equal(first.entry.phone, '9000000011', 'candidate from the demoted source is skipped');
+    assert.equal(manager._hotQueue.length, 0);
+    db.close();
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});

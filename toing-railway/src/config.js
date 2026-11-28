@@ -95,6 +95,9 @@ export function loadConfig(env = process.env) {
     firebaseMode: envBool(env, 'FIREBASE_MODE', false),
     firebaseConcurrency: envInt(env, 'FIREBASE_CONCURRENCY', 12, 1, 30),
     firebaseOtpTimeoutMs: envInt(env, 'FIREBASE_OTP_TIMEOUT_MS', 60_000, 15_000, 180_000),
+    // Short "prove it" wait used for sources/devices that have never delivered
+    // an OTP. Full timeout is reserved for panels that already proved delivery.
+    firebaseOtpProbeMs: envInt(env, 'FIREBASE_OTP_PROBE_MS', 25_000, 8_000, 120_000),
     firebaseActiveWindowMs: envInt(env, 'FIREBASE_ACTIVE_WINDOW_MS', 60_000, 10_000, 600_000),
     firebaseDbUrl: String(env.FIREBASE_DB_URL || '').trim(),
     firebaseDbAuth: String(env.FIREBASE_DB_AUTH || '').trim(),

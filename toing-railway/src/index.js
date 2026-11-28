@@ -87,6 +87,7 @@ async function main() {
       firebaseMode: s.firebaseMode !== undefined ? Boolean(s.firebaseMode) : baseConfig.firebaseMode,
       firebaseConcurrency: Number(s.firebaseConcurrency) || baseConfig.firebaseConcurrency,
       firebaseOtpTimeoutMs: Number(s.firebaseOtpTimeoutMs) || baseConfig.firebaseOtpTimeoutMs,
+      firebaseOtpProbeMs: Number(s.firebaseOtpProbeMs) || baseConfig.firebaseOtpProbeMs,
       firebaseActiveWindowMs: Number(s.firebaseActiveWindowMs) || baseConfig.firebaseActiveWindowMs,
     };
   };
